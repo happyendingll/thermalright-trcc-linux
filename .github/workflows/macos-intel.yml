@@ -81,6 +81,12 @@ jobs:
             --noconfirm \
             src/trcc/__main__.py
 
+      - name: Hide app from the Dock
+        run: |
+          plist=dist/TRCC.app/Contents/Info.plist
+          plutil -replace LSUIElement -bool YES "$plist"
+          test "$(plutil -extract LSUIElement raw "$plist")" = true
+
       - name: Log PyInstaller output
         run: |
           echo "=== dist/ top-level ==="
