@@ -63,6 +63,11 @@ jobs:
 
       - name: Build app with PyInstaller
         run: |
+          cat > "$RUNNER_TEMP/trcc_ssl_hook.py" <<'PY'
+          import os
+          import sys
+          os.environ["SSL_CERT_FILE"] = os.path.join(sys._MEIPASS, "certifi", "cacert.pem")
+          PY
           pyinstaller \
             --name "TRCC" \
             --onedir \
@@ -70,6 +75,8 @@ jobs:
             --icon src/trcc/assets/icons/app.icns \
             --add-data "src/trcc/assets:trcc/assets" \
             --add-data "src/trcc/ui/gui/assets:trcc/ui/gui/assets" \
+            --add-data "$(python -c 'import certifi; print(certifi.where())'):certifi" \
+            --runtime-hook "$RUNNER_TEMP/trcc_ssl_hook.py" \
             --hidden-import PySide6.QtSvg \
             --hidden-import pynvml \
             --collect-submodules trcc \
@@ -140,6 +147,7 @@ jobs:
           fi
           [ -f "dist/TRCC.app/Contents/MacOS/7z" ] && echo "  7z: OK" || missing+=("7z")
           [ -f "dist/TRCC.app/Contents/MacOS/ffmpeg" ] && echo "  ffmpeg: OK" || missing+=("ffmpeg")
+          [ -f "dist/TRCC.app/Contents/Frameworks/certifi/cacert.pem" ] && echo "  CA bundle: OK" || missing+=("certifi/cacert.pem")
           # libusb could be in Frameworks (PyInstaller) or copied there by us
           if find -L dist/TRCC.app/Contents/Frameworks -name "libusb*" -type f 2>/dev/null | grep -q .; then
             echo "  libusb: OK"
