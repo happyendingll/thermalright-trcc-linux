@@ -14,8 +14,6 @@ jobs:
     name: Build macOS Intel app
     runs-on: macos-15-intel
     env:
-      HOMEBREW_CORE_GIT_REMOTE: https://github.com/${{ github.repository_owner }}/homebrew-core
-      HOMEBREW_NO_INSTALL_FROM_API: '1'
       HOMEBREW_NO_ANALYTICS: '1'
       HOMEBREW_NO_ASK: '1'
       HOMEBREW_NO_ENV_HINTS: '1'
@@ -31,9 +29,7 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          brew tap --force --custom-remote homebrew/core "$HOMEBREW_CORE_GIT_REMOTE"
-          brew trust homebrew/core
-          test "$(git -C "$(brew --repository homebrew/core)" remote get-url origin)" = "$HOMEBREW_CORE_GIT_REMOTE"
+          source <(printf '%s\n' 'export HOMEBREW_NO_INSTALL_FROM_API=1' 'export HOMEBREW_CORE_GIT_REMOTE=https://github.com/happyendingll/homebrew-core')
           brew install libusb create-dmg p7zip ffmpeg
 
       - name: Install Python dependencies
