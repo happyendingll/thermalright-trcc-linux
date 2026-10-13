@@ -31,6 +31,9 @@ jobs:
 
       - name: Install system dependencies
         run: |
+          brew tap --force --custom-remote homebrew/core "$HOMEBREW_CORE_GIT_REMOTE"
+          brew trust homebrew/core
+          test "$(git -C "$(brew --repository homebrew/core)" remote get-url origin)" = "$HOMEBREW_CORE_GIT_REMOTE"
           brew install libusb create-dmg p7zip ffmpeg
 
       - name: Install Python dependencies
