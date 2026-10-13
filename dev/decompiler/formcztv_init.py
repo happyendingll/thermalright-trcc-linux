@@ -2,7 +2,8 @@
 """FormCZTVInit branch tracer — run a device fingerprint through the C#.
 
 A line-cited transcription of the C# device-onboarding function
-``FormCZTVInit`` (**TRCC 2.1.6**, ``TRCC.CZTV/FormCZTV.cs:858``) plus the
+``FormCZTVInit`` (the oracle release, ``core.csharp.ORACLE_RELEASE``;
+``TRCC.CZTV/FormCZTV.cs:858``) plus the
 catalog selector it calls at the end, ``SetThemeInfo_ThemeML`` (``:1247``).
 Given a handshake fingerprint ``(fbl, mode, pm, pmSub)`` it walks the SAME
 branches the C# walks, prints every one it hits, and returns the resulting
@@ -26,8 +27,8 @@ tests ``fbl == 49``.
 A stale oracle is worse than no oracle: it manufactures agreement.  Verify the
 tree before trusting a citation::
 
-    grep -rh AssemblyVersion ~/Downloads/TRCC_2.1.6_decompiled/Properties/*.cs
-    # -> [assembly: AssemblyVersion("2.1.6.0")]
+    grep -rh AssemblyVersion "$TRCC_DECOMPILE"/Properties/*.cs
+    # -> must equal core.csharp.ORACLE_VERSION (tests/test_oracle_version.py)
 
 Run::
 
@@ -39,6 +40,8 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, field
+
+from core.csharp import ORACLE_RELEASE
 
 # The display angle FormCZTVInit passes down when the device has no saved one.
 # `themeDirection == -1` is the C#'s "first boot" sentinel, and it is the only
@@ -127,6 +130,18 @@ class CztvState:
         if self.myDevicePingMu == 5:
             return (320, 240)
         return (240, 320)
+
+    @property
+    def models_geometry(self) -> bool:
+        """Did ``FormCZTVInit`` resolve a panel, or leave the header default?
+
+        With no resolution flag set (and not the pm 5 branch), ``resolution``
+        is the 20-byte header's hardcoded 240x320 (FormCZTV.cs:4205 writes
+        ``240, 0, 64, 1``) -- a WIRE CONSTANT, not a panel size, so nothing
+        can be compared to it.
+        """
+        return (self.myDevicePingMu == 5
+                or any(getattr(self, flag) for flag, _ in _FLAG_RESOLUTIONS))
 
 
 # Flag -> geometry, in the order the C# header table tests them.
@@ -258,10 +273,16 @@ def form_cztv_init(
         st.hit(1006, "mode==3 && pm==100 && fbl==58 -> pm = 101 "
                      "(gates the frame-skip logic)")
     elif st.myDeviceMode == 3 and st.myDevicePingMu == 100 and fbl == 54:
-        st.isFanLcd = True
-        st.myDeviceMode = 2
-        st.hit(1010, "mode==3 && pm==100 && fbl==54 -> isFanLcd, mode = 2 "
-                     "(so the fan hub encodes JPEG)")
+        # REWORKED IN 2.1.8 (:1019).  Through 2.1.6 every fan hub was isFanLcd
+        # and mode 2 (JPEG).  Now isFanLcd is SUB 1 only, mySubMode is
+        # assigned, and SUB 4 stays mode 3 — so it encodes RGB565.
+        st.isFanLcd = st.pmSub == 1
+        st.mySubMode = st.pmSub
+        if st.pmSub != 4:
+            st.myDeviceMode = 2
+        st.hit(1019, f"mode==3 && pm==100 && fbl==54 -> isFanLcd="
+                     f"{st.isFanLcd}, mySubMode = pmSub = {st.pmSub}, "
+                     f"mode = {st.myDeviceMode}")
     elif st.myDeviceMode == 3 and st.myDevicePingMu == 100 and fbl == 128:
         st.myDeviceMode = 2
         st.isBiliPingmu = st.is1280x480 = True
@@ -275,7 +296,9 @@ def form_cztv_init(
     elif st.myDeviceMode == 3 and st.myDevicePingMu == 100 and fbl == 59:
         st.is640x172 = True
         st.fbl = fbl = 224
-        st.hit(1036, "mode==3 && pm==100 && fbl==59 -> is640x172, fbl = 224")
+        st.mySubMode = st.pmSub
+        st.hit(1052, "mode==3 && pm==100 && fbl==59 -> is640x172, fbl = 224")
+        st.hit(1056, f"  mySubMode = pmSub = {st.pmSub}   (new in 2.1.8)")
     elif st.myDeviceMode == 3 and st.myDevicePingMu == 100 and fbl == 60:
         st.is176x320 = True
         st.fbl = fbl = 224
@@ -365,6 +388,9 @@ def set_theme_info_theme_ml(st: CztvState) -> None:
 
     for flag, token in _SQUARE_TOKENS:
         if getattr(st, flag):
+            # 2.1.8 (:1270): a 360x360 hub off SUB 1 takes the `360360m` catalog.
+            if flag == "is360x360" and st.pmSub != 1:
+                token = f"{token}m"
             st.ThemeML = f"{token}\\"
             st.hit(1249, f"{flag} -> ThemeML = {st.ThemeML!r} "
                          f"(squares ignore orientation)")
@@ -442,7 +468,7 @@ def main() -> int:
     st = form_cztv_init(args.fbl, m=args.mode, pm=args.pm, pmSub=args.sub,
                         themeDirection=args.angle)
     print(f"\nFormCZTVInit(fbl={args.fbl}, mode={args.mode}, pm={args.pm}, "
-          f"pmSub={args.sub})  —  TRCC 2.1.6\n")
+          f"pmSub={args.sub})  —  TRCC {ORACLE_RELEASE}\n")
     for row in st.trace:
         print(row)
     w, h = st.resolution

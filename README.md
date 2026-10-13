@@ -17,8 +17,8 @@
 [![Platform](https://img.shields.io/badge/platform-Linux-FCC624?logo=linux&logoColor=black)](https://github.com/Lexonight1/thermalright-trcc-linux)
 
 [![CI](https://github.com/Lexonight1/thermalright-trcc-linux/actions/workflows/ci.yml/badge.svg)](https://github.com/Lexonight1/thermalright-trcc-linux/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/badge/tests-6414_passed-brightgreen.svg)](https://github.com/Lexonight1/thermalright-trcc-linux/actions/workflows/ci.yml)
-[![Coverage](https://img.shields.io/badge/coverage-8%25-brightgreen.svg)](https://github.com/Lexonight1/thermalright-trcc-linux/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-29511_passed-brightgreen.svg)](https://github.com/Lexonight1/thermalright-trcc-linux/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/badge/coverage-0%25-brightgreen.svg)](https://github.com/Lexonight1/thermalright-trcc-linux/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://python.org)
 [![Code Style](https://img.shields.io/badge/code_style-ruff-D7FF64?logo=ruff&logoColor=black)](https://docs.astral.sh/ruff/)
 [![Type Check](https://img.shields.io/badge/type_check-pyright-blue?logo=python&logoColor=white)](https://microsoft.github.io/pyright/)
@@ -32,7 +32,6 @@
 **Packages:**
 
 [![Fedora](https://img.shields.io/badge/Fedora-RPM-51A2DA?logo=fedora&logoColor=white)](https://github.com/Lexonight1/thermalright-trcc-linux/releases/latest)
-[![openSUSE](https://img.shields.io/badge/openSUSE-RPM-73BA25?logo=opensuse&logoColor=white)](https://github.com/Lexonight1/thermalright-trcc-linux/releases/latest)
 
 [![Ubuntu](https://img.shields.io/badge/Ubuntu-DEB-E95420?logo=ubuntu&logoColor=white)](https://github.com/Lexonight1/thermalright-trcc-linux/releases/latest)
 [![Debian](https://img.shields.io/badge/Debian-DEB-A81D33?logo=debian&logoColor=white)](https://github.com/Lexonight1/thermalright-trcc-linux/releases/latest)
@@ -42,7 +41,6 @@
 [![Manjaro](https://img.shields.io/badge/Manjaro-pkg.tar.zst-35BF5C?logo=manjaro&logoColor=white)](https://github.com/Lexonight1/thermalright-trcc-linux/releases/latest)
 
 [![NixOS](https://img.shields.io/badge/NixOS-flake-5277C3?logo=nixos&logoColor=white)](https://github.com/Lexonight1/thermalright-trcc-linux/blob/main/flake.nix)
-[![Gentoo](https://img.shields.io/badge/Gentoo-ebuild-54487A?logo=gentoo&logoColor=white)](https://github.com/Lexonight1/thermalright-trcc-linux/tree/main/packaging/gentoo)
 
 [![Buy Me a Beer](https://img.shields.io/badge/Buy_Me_a_Beer-🍺-FF5F5F?style=flat)](https://buymeacoffee.com/Lexonight1)
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-☕-FF5E5B?style=flat&logo=kofi&logoColor=white)](https://ko-fi.com/lexonight1)
@@ -67,10 +65,11 @@ Pre-built packages are available for every major distro. No pip, no venv, no PEP
 
 | Distro | Install Guide |
 |--------|--------------|
-| Fedora / Nobara / openSUSE | [Fedora](doc/GUIDE_INSTALL.md#fedora--nobara) |
+| Fedora 43+ / Nobara | [Fedora](doc/GUIDE_INSTALL.md#fedora--nobara) |
+| openSUSE Tumbleweed / Leap | [openSUSE (pipx)](doc/GUIDE_INSTALL.md#opensuse-pip) |
 | Bazzite / Bluefin / Aurora / Universal Blue | [Immutable Fedora](doc/GUIDE_INSTALL.md#bazzite--aurora--bluefin--fedora-atomic) |
-| Ubuntu 24.04+ / Debian 13+ / Mint 22+ / Pop!_OS / Zorin | [Ubuntu / Debian](doc/GUIDE_INSTALL.md#ubuntu--debian--mint--pop_os--zorin) |
-| Ubuntu 22.04 / Mint 21.x / Debian 12 (older) | [Legacy DEB](doc/GUIDE_INSTALL.md#ubuntu-2204--mint-21x--debian-12-legacy-deb) |
+| Ubuntu 25.10+ / Debian 13+ | [Ubuntu / Debian](doc/GUIDE_INSTALL.md#ubuntu--debian--mint--pop_os--zorin) |
+| Ubuntu 22.04 / 24.04 / Mint 21–22 / Pop!_OS / Zorin / Debian 12 | [Legacy DEB](doc/GUIDE_INSTALL.md#ubuntu-2204--2404--mint-21x--22x--debian-12-legacy-deb) |
 | Arch / CachyOS / Manjaro / EndeavourOS / Garuda | [Arch](doc/GUIDE_INSTALL.md#arch--cachyos--manjaro--endeavouros--garuda) |
 | NixOS | [NixOS](doc/GUIDE_INSTALL.md#nixos) |
 | Gentoo | [Gentoo](doc/GUIDE_INSTALL.md#gentoo) |
@@ -94,7 +93,7 @@ If you see `OK` next to your package — it's clean. Source code is GPL-3.0, ful
 
 ### PyPI
 
-Best option for very old distros (Ubuntu 20.04, Debian 11) or if you prefer Python packaging. For Ubuntu 22.04 / Mint 21.x / Debian 12, the [Legacy DEB](doc/GUIDE_INSTALL.md#ubuntu-2204--mint-21x--debian-12-legacy-deb) is easier.
+Best option for very old distros (Ubuntu 20.04, Debian 11) or if you prefer Python packaging. For Ubuntu 22.04 / 24.04, Mint 21.x / 22.x and Debian 12, the [Legacy DEB](doc/GUIDE_INSTALL.md#ubuntu-2204--2404--mint-21x--22x--debian-12-legacy-deb) is easier.
 
 ```bash
 # Install system dependencies first
@@ -180,7 +179,7 @@ trcc serve --host 0.0.0.0     # Listen on all interfaces (LAN access)
 trcc serve --token SECRET     # Require a bearer token (see `trcc api --token`)
 ```
 
-127 endpoints covering devices, display, LED, themes, and system metrics — every one listed in the **[API reference](doc/REFERENCE_API.md)**, or browse them live at `/docs` while the server runs.
+Endpoints covering devices, display, LED, themes, and system metrics — every one listed in the **[API reference](doc/REFERENCE_API.md)**, or browse them live at `/docs` while the server runs.
 
 Devices are addressed by **key** — the `vid:pid` string the CLI also uses.
 
@@ -207,7 +206,7 @@ Set the angle to **90°** (or 270°) in the GUI, then open **Cloud Themes** — 
 | [Install Guide](doc/GUIDE_INSTALL.md) | Installation for all major distros |
 | [CLI Reference](doc/REFERENCE_CLI.md) | All CLI commands with options and examples |
 | [User Guide](doc/GUIDE_USER.md) | How to use everything — GUI, themes, overlays, media, LED |
-| [API Reference](doc/REFERENCE_API.md) | All 78 REST API endpoints with request/response models |
+| [API Reference](doc/REFERENCE_API.md) | Every REST API endpoint with request/response models |
 | [Troubleshooting](doc/GUIDE_TROUBLESHOOTING.md) | Common issues and fixes |
 | [New to Linux](doc/GUIDE_NEW_TO_LINUX.md) | Guide for Linux beginners |
 | [Changelog](doc/CHANGELOG.md) | Version history |
@@ -230,8 +229,8 @@ Set the angle to **90°** (or 270°) in the GUI, then open **Cloud Themes** — 
 | Category | What you get |
 |----------|-------------|
 | **GUI** | Full PySide6 desktop app — theme browser, video player, overlay editor, LED control panel, 38 languages |
-| **CLI** | `trcc gui`, `trcc send`, `trcc video`, `trcc led-color`, `trcc screencast`, `trcc shell`, and more |
-| **REST API** | 78 endpoints — control everything remotely, build integrations, automate your setup |
+| **CLI** | `trcc gui`, `trcc display send-image`, `trcc display play-video`, `trcc led color`, `trcc display screencast`, `trcc shell`, and more |
+| **REST API** | Control everything remotely, build integrations, automate your setup |
 | **Themes** | Local, cloud, and masks — carousel mode, export/import as `.tr` files, custom mask upload with X/Y positioning, 5 starters + 120 masks per resolution |
 | **Media** | Video/GIF playback on LCD, video trimmer, image cropper, screen cast (X11 + Wayland), mic audio visualization |
 | **Overlay Editor** | Text, sensors, date/time overlays — font picker, dynamic scaling, color picker |
@@ -246,7 +245,7 @@ Set the angle to **90°** (or 270°) in the GUI, then open **Cloud Themes** — 
 ### What we do better than Windows TRCC
 
 - **38 languages** — Windows has 10 (baked into PNGs). We render text at runtime, community can add more
-- **CLI + REST API** — Windows is GUI-only. We have full CLI and 49 API endpoints for automation
+- **CLI + REST API** — Windows is GUI-only. We have a full CLI and REST API for automation
 - **Custom mask upload** — upload your own PNG overlay, position with X/Y controls, saved to `~/.trcc-user/`
 - **No admin required** — udev rules handle permissions. Windows needs "Run as Administrator"
 - **Open source** — read the code, fix bugs, add features. Windows TRCC is closed-source .NET
@@ -276,7 +275,7 @@ Run `lsusb` to find your USB ID (`xxxx:xxxx` after `ID`), then match it below.
 **Bulk USB devices** — raw USB protocol:
 | USB ID | Devices |
 |--------|---------|
-| `87AD:70DB` | GrandVision 360 AIO, Mjolnir Vision 360, Wonder Vision Pro 360, Frozen Warframe Pro |
+| `87AD:70DB` | GrandVision 360 AIO, Mjolnir Vision 360, Wonder Vision Pro 360, Frozen Warframe Pro, Phantom Spirit 120 Vision EVO |
 
 **LY USB devices** — chunked bulk protocol:
 | USB ID | Devices |
@@ -307,12 +306,12 @@ src/trcc/
 ├── adapters/       # USB device protocols (SCSI, HID, Bulk, LY, LED)
 ├── ui/
 │   ├── gui/        # PySide6 GUI — themes, video, overlay, LED, sensors
-│   ├── cli/        # Typer CLI — 144 commands across 8 modules
-│   ├── api/        # FastAPI REST API — 127 endpoints across 9 modules
+│   ├── cli/        # Typer CLI — every command in doc/REFERENCE_CLI.md
+│   ├── api/        # FastAPI REST API — every route in doc/REFERENCE_API.md
 │   └── presentation/ # Toolkit-free models shared by the graphical UIs
 ├── app.py          # The App — owns devices, services, the bus, dispatch()
-├── _boot.py        # Composition root — returns App, or AppProxy in daemon mode
-├── daemon.py       # Optional singleton daemon mode (TRCC_DAEMON=1)
+├── _boot.py        # Composition root — the shared App's proxy, or an in-process App
+├── daemon.py       # The shared App every UI finds or starts (TRCC_DAEMON=0 opts out)
 ├── ipc.py          # Command dispatch over a Unix socket
 └── assets/         # GUI images, desktop entry, polkit policy, systemd service
 ```
@@ -342,6 +341,21 @@ If a probe goes `BAD`, that's the bug — fix in `src/`, re-run, see `PASS`. Eve
 | LY | pyusb bulk (chunked) | Trofeo Vision 9.16 LCD |
 | LED | pyusb HID | All LED segment display devices (13 styles) |
 
+## Built on the Work of
+
+TRCC Linux stands on other people's open-source work. Credit where it is due — every project here is one whose code, documentation or research we use, ported from, or learned from:
+
+- **[Thermalright TRCC](https://www.thermalright.com/)** (Windows) — the reference for how every device behaves. This project is an independent reimplementation and is not affiliated with Thermalright.
+- **[LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)** (MPL-2.0) — the Windows build ships it and reads CPU and GPU sensors from its WMI namespace.
+- **[HWiNFO](https://www.hwinfo.com/)** — when it runs with Shared Memory Support, TRCC reads its sensors; the shared-memory layout comes from **[namazso's notes](https://gist.github.com/namazso/0c37be5a53863954c8c8279f66cfb1cc)**.
+- **[iSMC](https://github.com/dkorunic/iSMC)** (GPL-3.0) — the Apple Silicon temperature reading on macOS is ported from its `hid/get.go`.
+- **[macmon](https://github.com/vladkens/macmon)** and **[Stats](https://github.com/exelban/stats)** — how macOS sensors are read; we learned from both.
+- **[libusb-package](https://github.com/pyocd/libusb-package)** (pyOCD) — gives pip installs on Windows a working USB backend.
+- **[FFmpeg](https://ffmpeg.org/)** — video trimming, decoding and thumbnails; the Windows and macOS builds ship it.
+- **[7-Zip](https://www.7-zip.org/)** — unpacks the theme archives; the Windows and macOS builds ship it.
+- **[Qt for Python (PySide6)](https://www.qt.io/qt-for-python)** — both windows and the frame renderer.
+- **[OpenRGB](https://gitlab.com/CalcProgrammer1/OpenRGB)** (GPL-2.0-or-later) — TRCC's OpenRGB support (your OpenRGB devices follow the cooler's colours) speaks OpenRGB's SDK protocol, learned from and ported from its SDK documentation and client code; and Corsair RGB RAM following the cooler directly is adapted from OpenRGB's Corsair DRAM controller (Adam Honse and Erik Gilling) — its detection, device-info check, colour packet, device list, and the built-in effects (their bytes, the checked save, and each effect's controls); and driving an ASUS Aura motherboard's RGB headers directly is adapted from OpenRGB's ASUS Aura USB controller (Martin Hartl and Adam Honse) — its firmware and config-table requests, the order of its channels, and the packets that switch a channel to direct colour and send it.
+
 ## Code Contributors
 
 These folks didn't just report a problem — they opened the editor and sent a fix. On a solo project, a merged pull request is about the most generous thing you can do, and every one of these shipped to every user:
@@ -349,6 +363,8 @@ These folks didn't just report a problem — they opened the editor and sent a f
 - **[@jphilipb](https://github.com/jphilipb)** — [#215](https://github.com/Lexonight1/thermalright-trcc-linux/pull/215): reverse-engineered and hardware-validated the Thermalright Magic Qube (65-LED segment display) — a device that doesn't even exist in the Windows app — and wired up full support from scratch.
 - **[@Hythera](https://github.com/Hythera)** — [#209](https://github.com/Lexonight1/thermalright-trcc-linux/pull/209): had the flake read its version straight from `pyproject.toml`, killing an entire place I used to have to bump by hand every release.
 - **[@elsiedotcafe](https://github.com/elsiedotcafe)** — [#123](https://github.com/Lexonight1/thermalright-trcc-linux/pull/123): pinned the PySide6 package to a stable source so the build stops breaking.
+- **[@PourrezJ](https://github.com/PourrezJ)** — [#313](https://github.com/Lexonight1/thermalright-trcc-linux/pull/313): found, on his own 320x240 panel, that SCSI FBL 51 panels take big-endian colour — the same fix, made independently, that shipped in v9.10.5.
+- **[@alan7383](https://github.com/alan7383)** — [#271](https://github.com/Lexonight1/thermalright-trcc-linux/pull/271): confirmed the Phantom Spirit 120 Vision EVO, and found the bulk-panel screencast, video-override and reboot-surviving `.zt` fixes that shipped from his PR.
 
 Thank you all — genuinely. PRs are always welcome, and you'll land right here.
 
@@ -422,6 +438,10 @@ software for hardware plenty of us run Linux on; the more good answers to that, 
   Thermalright USB displays with live CPU/GPU monitoring, written from scratch on top of
   this project's protocol reverse engineering. GPL-3.0, and
   [on the AUR](https://aur.archlinux.org/packages/openthermalright).
+- **[retro-aio](https://github.com/lFiziXl/retro-aio-thermalright-hypervision-360)** by
+  [lFiziXl](https://github.com/lFiziXl) — a lightweight Rust daemon for the Hyper Vision 360
+  that draws a pixel mascot over a Matrix-style rain, both reacting to live CPU/GPU load.
+  Built on this project's protocol findings; GPL-3.0 ([#304](https://github.com/Lexonight1/thermalright-trcc-linux/issues/304)).
 
 Built something? Open an issue and I'll add it.
 

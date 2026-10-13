@@ -19,7 +19,6 @@ from ...core.commands import (
     DiscoverDevices,
     EnableOverlay,
     ExportVideoClip,
-    FlashOverlayElement,
     KeepAliveLoop,
     LcdSnapshot,
     ListMasks,
@@ -31,8 +30,8 @@ from ...core.commands import (
     PlayVideo,
     ProbeVideoDuration,
     RenderDcStandalone,
+    ResolveOverlay,
     RestoreDeviceState,
-    RestoreLastTheme,
     SeekVideo,
     SendColor,
     SendImage,
@@ -40,20 +39,18 @@ from ...core.commands import (
     SetBackgroundMode,
     SetBrightness,
     SetFitMode,
+    SetGameMode,
     SetMaskPosition,
     SetMaskVisible,
     SetMediaPlayer,
     SetOrientation,
     SetOverlayBackground,
+    SetScreencastRegion,
     SetSlideshow,
     SetSplitMode,
     SleepDevice,
     StartScreencast,
-    StartScreencastDriver,
-    StartSlideshowDriver,
     StopScreencast,
-    StopScreencastDriver,
-    StopSlideshowDriver,
     StopVideo,
     TickDisplay,
     ToggleVideo,
@@ -62,13 +59,16 @@ from ...core.commands import (
     UploadCustomMask,
     VideoStatus,
 )
-from ...core.models import MEDIA, FitMode, MediaKind
+from ...core.errors import TrccError
+from ...core.models import CUTTER_DEFAULT_FPS, MEDIA, FitMode, MediaKind
+from ..presentation.display_source import describe_game_mode, describe_source
 from ._ctx import (
+    daemon_owns_the_panels,
     dispatch_echo,
     emit_json,
-    ensure_connected,
     get_app,
     parse_on_off,
+    recover_or_exit,
     resolution_for,
 )
 
@@ -133,7 +133,6 @@ def color(
         raise typer.Exit(code=2)
     r, g, b = rgb
     app_obj = get_app()
-    ensure_connected(app_obj, key)
     result = app_obj.dispatch(SendColor(key=key, r=r, g=g, b=b))
     typer.echo(result.message)
     if not result.ok:
@@ -181,7 +180,6 @@ def apply_mask(
     """Override the active theme's mask with a user-supplied image."""
     log.info("cli display apply-mask: key=%s path=%s", key, path)
     app_obj = get_app()
-    ensure_connected(app_obj, key)
     result = app_obj.dispatch(ApplyMask(key=key, path=path))
     typer.echo(result.message)
     if not result.ok:
@@ -227,6 +225,26 @@ def split_mode(
     dispatch_echo(SetSplitMode(key=key, mode=mode))
 
 
+@app.command("game")
+def game(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    state: str | None = typer.Argument(
+        None, help="'on' / 'off'; omit to change only the threshold"),
+    threshold: int | None = typer.Option(
+        None, "--threshold", min=0, max=99,
+        help="CPU usage % above which game mode takes the panel (0-99)"),
+) -> None:
+    """Game mode: while CPU usage stays above the threshold for 11 seconds,
+    the panel shows only its overlay, on black, until it falls back."""
+    log.info("cli display game: key=%s state=%s threshold=%s",
+             key, state, threshold)
+    if state is not None and state.lower() not in ("on", "off"):
+        raise typer.BadParameter(f"state must be 'on' or 'off', got {state!r}")
+    dispatch_echo(SetGameMode(
+        key=key, enabled=None if state is None else state.lower() == "on",
+        threshold=threshold))
+
+
 @app.command("load-image")
 def load_image(
     key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
@@ -245,7 +263,6 @@ def load_image(
     # LoadImage → LoadTheme renders on the wire; attach the device first so a
     # fresh CLI process doesn't fail "not connected".  Idempotent.  (#150)
     app_obj = get_app()
-    ensure_connected(app_obj, key)
     result = app_obj.dispatch(LoadImage(key=key, path=path))
     typer.echo(result.message)
     if not result.ok:
@@ -261,11 +278,11 @@ def load_video(
     ),
     start_ms: int = typer.Option(
         0, "--start", "-s", min=0,
-        help="Clip start in milliseconds (default: 0).",
+        help="Cut from here, in milliseconds (default: 0).",
     ),
     end_ms: int = typer.Option(
         None, "--end", "-e", min=1,
-        help="Clip end in milliseconds (default: probe duration, fallback 10s).",
+        help="Cut to here, in milliseconds (default: the file's end).",
     ),
     rotation: int = typer.Option(
         0, "--rotation", "-r",
@@ -274,10 +291,11 @@ def load_video(
 ) -> None:
     """Play a video on the LCD as a single-video theme.
 
-    Transcodes the source to a ``Theme.zt`` matching the device's native
-    resolution (.zt inputs are copied as-is), stages a one-file theme,
-    then dispatches LoadTheme.  Device must be attached so we know the
-    target resolution.
+    The file plays as it is, with the device's fit (``display
+    set-fit-mode``) applied live.  Any of --start / --end / --rotation cuts
+    it instead: that clip is baked into a ``Theme.zt`` at the panel's size
+    and the current fit, as the Windows trimmer does (.zt inputs always go
+    in as they are).  Device must be attached so we know the panel's size.
     """
     log.info(
         "cli display load-video: key=%s path=%s start_ms=%s end_ms=%s "
@@ -319,6 +337,10 @@ def export_video(
              "auto fit -- scale inside the panel, never crop.  A .zt is "
              "encoded AT canvas size, so this is baked in.",
     ),
+    fps: int = typer.Option(
+        CUTTER_DEFAULT_FPS, "--fps",
+        help="Frames per second: 15 (default, as the Windows app) or 24.",
+    ),
     wait: bool = typer.Option(
         True, "--wait/--no-wait",
         help="Follow progress until the encode finishes (default), or "
@@ -333,13 +355,13 @@ def export_video(
 
     The encode runs in the background and reports on the event bus, so
     ``--wait`` follows it and ``--no-wait`` returns immediately with the
-    token.  Under ``TRCC_DAEMON=1`` the work happens in the daemon and
-    this terminal is simply watching it, which is why the progress can be
-    followed from a process that is not doing the encoding.
+    token.  The work happens in the shared App and this terminal only
+    watches it, which is why the progress can be followed from a process
+    that is not doing the encoding.
     """
     log.info("cli display export-video: key=%s path=%s start_ms=%s end_ms=%s "
-             "rotation=%s wait=%s", key, path, start_ms, end_ms, rotation,
-             wait)
+             "rotation=%s fps=%s wait=%s", key, path, start_ms, end_ms,
+             rotation, fps, wait)
     app_obj = get_app()
     # Subscribe BEFORE dispatching: a fast encode can finish between the
     # dispatch returning and a later subscribe, and the finished event is
@@ -366,7 +388,7 @@ def export_video(
 
     result = app_obj.dispatch(ExportVideoClip(
         key=key, path=path, start_ms=start_ms, end_ms=end_ms,
-        rotation=rotation, fit_mode=fit,
+        rotation=rotation, fit_mode=fit, fps=fps,
     ))
     if not result.ok:
         typer.echo(result.message, err=True)
@@ -416,7 +438,6 @@ def load_theme(
     """Load a theme: parse, persist, render+send if device is connected."""
     log.info("cli display load-theme: key=%s path=%s", key, path)
     app_obj = get_app()
-    ensure_connected(app_obj, key)
     result = app_obj.dispatch(LoadTheme(key=key, path=path))
     typer.echo(result.message)
     if not result.ok:
@@ -441,7 +462,6 @@ def play_video(
     """
     log.info("cli display play-video: key=%s path=%s fps=%s", key, path, fps)
     app_obj = get_app()
-    ensure_connected(app_obj, key)
     # PlayVideo persists the background path itself — reaching for
     # app_obj.settings here crashed under TRCC_DAEMON=1, where AppProxy
     # exposes dispatch() only (#249).
@@ -459,56 +479,6 @@ def stop_video(
     log.info("cli display stop-video: key=%s", key)
     result = get_app().dispatch(StopVideo(key=key))
     typer.echo(result.message)
-
-
-@app.command("slideshow-run")
-def slideshow_run(
-    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
-    themes_dir: Path = typer.Argument(
-        ..., help="Directory containing theme subdirectories",
-        exists=True, file_okay=False, dir_okay=True,
-    ),
-    interval: float = typer.Option(
-        30.0, "--interval", "-i",
-        help="Seconds between theme switches (default: 30.0)",
-    ),
-) -> None:
-    """Foreground slideshow over a directory of themes.
-
-    Different from ``slideshow`` / ``configure-slideshow`` (which persist
-    state).  This is a one-shot loop: blocks until Ctrl-C, swaps to the
-    next theme each tick.  Useful for demos + smoke tests; the persisted
-    flow is what production users want.
-    """
-    log.info(
-        "cli display slideshow-run: key=%s themes_dir=%s interval=%s",
-        key, themes_dir, interval,
-    )
-    import time
-
-    app_obj = get_app()
-    ensure_connected(app_obj, key)   # once, before the slideshow loop
-    themes = sorted(p for p in themes_dir.iterdir() if p.is_dir())
-    if not themes:
-        typer.echo(f"No theme subdirectories under {themes_dir}", err=True)
-        raise typer.Exit(code=1)
-
-    interval_s = max(1.0, interval)
-    typer.echo(f"Slideshow on {key}: {len(themes)} themes, "
-               f"{interval_s:.1f}s between switches (Ctrl-C to stop)…")
-    idx = 0
-    try:
-        while True:
-            theme_path = themes[idx]
-            result = app_obj.dispatch(LoadTheme(key=key, path=theme_path))
-            if result.ok:
-                typer.echo(f"  → {theme_path.name}")
-            else:
-                typer.echo(f"  ! {theme_path.name}: {result.message}", err=True)
-            idx = (idx + 1) % len(themes)
-            time.sleep(interval_s)
-    except KeyboardInterrupt:
-        typer.echo("\nSlideshow stopped.")
 
 
 @app.command("boot-anim")
@@ -549,7 +519,6 @@ def boot_anim(
     typer.echo(f"Uploading {len(frame_paths)} boot-animation frames to {key} "
                f"({delay_ds * 0.1:.1f}s each)…")
     app_obj = get_app()
-    ensure_connected(app_obj, key)
     result = app_obj.dispatch(UploadBootAnimation(
         key=key, frame_paths=frame_paths, delays_ds=delays,
     ))
@@ -577,14 +546,22 @@ def play(
     import time
 
     app_obj = get_app()
-    ensure_connected(app_obj, key)   # once, before the loop (not per tick)
     # Self-prime: a fresh CLI process holds no in-memory theme, so RenderAndSend
-    # would fail "No active theme".  Restore the device's persisted display
-    # state (theme + background) the way the GUI does on connect.  (#150)
+    # would fail "No active theme".  The restore also connects the device
+    # (USES_DEVICE) and fails with the reason when it cannot.  (#150)
+    # Unconditional on purpose, unlike keepalive: "play" asks for the SAVED
+    # display, so it replaces a push; keepalive keeps whatever is showing.
     restore = app_obj.dispatch(RestoreDeviceState(key=key))
     if not restore.ok:
         typer.echo(restore.message, err=True)
         raise typer.Exit(code=1)
+    if daemon_owns_the_panels(app_obj):
+        # The daemon runs the session loops: its VideoLoop paces video and its
+        # MetricsLoop refreshes the rest.  Ticking here as well would advance
+        # every video frame twice (#249).
+        log.info("cli display play: %s is driven by the daemon — not ticking", key)
+        typer.echo(f"The daemon is playing {key} — it keeps the panel updated.")
+        return
     if interval is not None:
         tick_s = interval
     else:
@@ -605,10 +582,15 @@ def play(
             # dispatch() only (#249).  The Result carries the cursor and the
             # per-frame interval, so the loop paces itself off the video when
             # one is playing and off the metrics interval otherwise.
-            result = app_obj.dispatch(TickDisplay(key=key))
+            try:
+                result = app_obj.dispatch(TickDisplay(key=key))
+            except TrccError as e:
+                recover_or_exit(app_obj, key, str(e))
+                continue
             if not result.ok:
-                typer.echo(f"  tick failed: {result.message}", err=True)
-                raise typer.Exit(code=1)
+                # A lost panel is reconnected, not the end of the command (#270).
+                recover_or_exit(app_obj, key, result.message)
+                continue
             if result.frame_count is not None:
                 typer.echo(
                     f"  sent {result.bytes_sent} bytes (theme={result.theme_name!r}"
@@ -729,6 +711,36 @@ def list_masks(
         typer.echo(f"  {entry.name:30} {entry.path}")
 
 
+@app.command("overlay-list")
+def overlay_list(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+) -> None:
+    """Show what is currently drawn on the device's screen.
+
+    The read half of overlay.  ``overlay-update`` / ``overlay-delete`` /
+    ``overlay-flash`` all take an element id, and until this existed the only
+    source of one was the line ``overlay-add`` printed when you created it —
+    so the ids were unrecoverable the moment the terminal scrolled.
+    """
+    log.info("cli display overlay-list: key=%s", key)
+    result = get_app().dispatch(ResolveOverlay(key=key))
+    typer.echo(
+        f"{len(result.elements)} element(s) from the {result.source or 'theme'} "
+        f"layer, overlay {'on' if result.enabled else 'OFF'}"
+        + (f" — {result.theme_name}" if result.theme_name else ""),
+    )
+    for element in result.elements:
+        payload = (
+            repr(element.text) if element.type == "text"
+            else element.metric or element.source
+        )
+        typer.echo(
+            f"  {element.id:14} {element.type:6} "
+            f"({element.x:>4},{element.y:>4})  {payload}  "
+            f"size={element.size} {element.color}",
+        )
+
+
 @app.command("overlay-add")
 def overlay_add(
     key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
@@ -837,28 +849,6 @@ def overlay_delete(
         raise typer.Exit(code=1)
 
 
-@app.command("overlay-flash")
-def overlay_flash(
-    key: str = typer.Argument(...),
-    element_id: str = typer.Argument(...),
-    duration_ms: int = typer.Option(
-        1500, "--duration", "-d", min=100, max=10000,
-        help="Flash duration in milliseconds",
-    ),
-) -> None:
-    """Briefly highlight an overlay element in the GUI."""
-    log.info(
-        "cli display overlay-flash: key=%s element_id=%s duration_ms=%s",
-        key, element_id, duration_ms,
-    )
-    result = get_app().dispatch(FlashOverlayElement(
-        key=key, element_id=element_id, duration_ms=duration_ms,
-    ))
-    typer.echo(result.message)
-    if not result.ok:
-        raise typer.Exit(code=1)
-
-
 @app.command("slideshow")
 def slideshow(
     key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
@@ -891,36 +881,7 @@ def background(
     survives a theme change until cleared.
     """
     log.info("cli display background: key=%s path=%s", key, path)
-    app_obj = get_app()
-    ensure_connected(app_obj, key)
     dispatch_echo(SetBackground(key=key, path=path))
-
-
-@app.command("slideshow-drive")
-def slideshow_drive(
-    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
-    stop: bool = typer.Option(
-        False, "--stop", help="Stop driving instead of starting",
-    ),
-) -> None:
-    """Actually rotate the configured slideshow, until stopped.
-
-    ``slideshow on`` and ``configure-slideshow`` only PERSIST the slideshow.
-    Nothing advanced it outside the gui — the gui runs its own timer, so a
-    slideshow set up here was saved, reported back correctly, and never
-    switched a theme.  This registers the driver that rotates it.
-
-    Unlike ``slideshow-run`` (a foreground demo loop over a directory), this
-    uses the persisted config and returns immediately; the rotation continues
-    in the background for as long as the app or daemon is alive.
-    """
-    log.info("cli display slideshow-drive: key=%s stop=%s", key, stop)
-    app_obj = get_app()
-    if stop:
-        dispatch_echo(StopSlideshowDriver(key=key))
-        return
-    ensure_connected(app_obj, key)
-    dispatch_echo(StartSlideshowDriver(key=key))
 
 
 @app.command("configure-slideshow")
@@ -989,13 +950,8 @@ def keepalive(
             f"(metric refresh every {metric_interval:.1f}s, Ctrl-C to stop)…"
         )
     app_obj = get_app()
-    ensure_connected(app_obj, key)
-    # Self-prime persisted display state so a rendered frame exists to resend
-    # — closes the "No cached frame — render at least once first" gap.  (#150)
-    restore = app_obj.dispatch(RestoreDeviceState(key=key))
-    if not restore.ok:
-        typer.echo(restore.message, err=True)
-        raise typer.Exit(code=1)
+    # One Command, like the API: KeepAliveLoop shows the saved display itself
+    # when there is nothing to resend, and keeps a push when there is (#267).
     result = app_obj.dispatch(KeepAliveLoop(
         key=key, count=count,
         interval_s=interval, metric_interval_s=metric_interval,
@@ -1037,9 +993,9 @@ def overlay_background(
 def restore_theme(
     key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
 ) -> None:
-    """Reload the device's persisted theme — convenience after restart."""
+    """Restore the device's saved display (theme + background; Theme1 if none)."""
     log.info("cli display restore-theme: key=%s", key)
-    dispatch_echo(RestoreLastTheme(key=key))
+    dispatch_echo(RestoreDeviceState(key=key))
 
 
 @app.command("resume")
@@ -1064,30 +1020,29 @@ def resume(
     import time
 
     app_obj = get_app()
-    products: list = []
+    keys: list[str] = []
     for attempt in range(1, retries + 1):
         result = app_obj.dispatch(DiscoverDevices())
         if result.ok and result.products:
-            products = result.products
+            keys = [key for key, _ in result.units()]
             break
         typer.echo(
             f"Waiting for device... ({attempt}/{retries})", err=True,
         )
         time.sleep(2)
 
-    if not products:
+    if not keys:
         typer.echo("No compatible TRCC device detected.", err=True)
         raise typer.Exit(code=1)
 
     sent = 0
-    for product in products:
-        key = f"{product.vid:04x}:{product.pid:04x}"
+    for key in keys:
         connect_result = app_obj.dispatch(ConnectDevice(key=key))
         if not connect_result.ok:
             typer.echo(f"  [{key}] connect failed: {connect_result.message}",
                        err=True)
             continue
-        theme_result = app_obj.dispatch(RestoreLastTheme(key=key))
+        theme_result = app_obj.dispatch(RestoreDeviceState(key=key))
         if not theme_result.ok:
             typer.echo(f"  [{key}] {theme_result.message}", err=True)
             continue
@@ -1121,7 +1076,6 @@ def test(
     import time
 
     app_obj = get_app()
-    ensure_connected(app_obj, key)
     sequence = (
         ("red",   (0xFF, 0x00, 0x00)),
         ("green", (0x00, 0xFF, 0x00)),
@@ -1150,7 +1104,6 @@ def sleep(
     """
     log.info("cli display sleep: key=%s", key)
     app_obj = get_app()
-    ensure_connected(app_obj, key)
     result = app_obj.dispatch(SleepDevice(key=key))
     typer.echo(result.message)
     if not result.ok:
@@ -1202,7 +1155,6 @@ def send_image(
     """
     log.info("cli display send-image: key=%s path=%s", key, path)
     app_obj = get_app()
-    ensure_connected(app_obj, key)
     result = app_obj.dispatch(SendImage(key=key, path=path))
     typer.echo(result.message)
     if not result.ok:
@@ -1248,10 +1200,11 @@ def overlay_render(
 @app.command("screencast")
 def screencast(
     key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
-    x: int = typer.Argument(..., help="Top-left X coordinate of capture region (px)"),
-    y: int = typer.Argument(..., help="Top-left Y coordinate of capture region (px)"),
-    w: int = typer.Argument(..., min=1, help="Capture region width (px)"),
-    h: int = typer.Argument(..., min=1, help="Capture region height (px)"),
+    x: int = typer.Argument(0, min=0, help="Top-left X of the capture region (px)"),
+    y: int = typer.Argument(0, min=0, help="Top-left Y of the capture region (px)"),
+    w: int = typer.Argument(
+        0, min=0, help="Capture region width (px); 0 0 0 0 casts the stored region"),
+    h: int = typer.Argument(0, min=0, help="Capture region height (px)"),
     audio: bool = typer.Option(
         False, "--audio/--no-audio",
         help="Pipe system audio alongside the video feed (Linux: PipeWire)",
@@ -1259,9 +1212,10 @@ def screencast(
 ) -> None:
     """Stream a screen region to the LCD until interrupted.
 
-    Wraps :class:`StartScreencast` — the GUI ``ScreencastHandler``
-    subscriber drives the per-frame Qt capture timer.  Ctrl-C calls
-    :class:`StopScreencast` for clean teardown.
+    Wraps :class:`StartScreencast`, which starts capturing.  Ctrl-C calls
+    :class:`StopScreencast` for clean teardown.  Without a region it casts the
+    device's stored one (``screencast-region``, or the loaded theme's); a given
+    region is stored as the device's.
     """
     log.info(
         "cli display screencast: key=%s x=%s y=%s w=%s h=%s audio=%s",
@@ -1270,22 +1224,11 @@ def screencast(
     import signal
 
     app_obj = get_app()
-    ensure_connected(app_obj, key)
     result = app_obj.dispatch(StartScreencast(
         key=key, x=x, y=y, w=w, h=h, audio=audio,
     ))
     typer.echo(result.message)
     if not result.ok:
-        raise typer.Exit(code=1)
-
-    # ``StartScreencast`` only publishes ``ScreencastStarted``; the GUI's
-    # handler is what subscribes and runs a timer.  Without a driver this
-    # command printed "Capturing on …" and then captured NOTHING for as long
-    # as you left it running.
-    drive = app_obj.dispatch(StartScreencastDriver(key=key))
-    if not drive.ok:
-        typer.echo(drive.message)
-        app_obj.dispatch(StopScreencast(key=key))
         raise typer.Exit(code=1)
 
     typer.echo(f"Capturing on {key} — Ctrl-C to stop.")
@@ -1300,11 +1243,29 @@ def screencast(
     while not stopped["flag"]:
         signal.pause()
 
-    app_obj.dispatch(StopScreencastDriver(key=key))
     stop_result = app_obj.dispatch(StopScreencast(key=key))
     typer.echo(stop_result.message)
     if not stop_result.ok:
         raise typer.Exit(code=1)
+
+
+@app.command("screencast-region")
+def screencast_region(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    x: int = typer.Argument(..., min=0, max=9999, help="Top-left X on screen (px)"),
+    y: int = typer.Argument(..., min=0, max=9999, help="Top-left Y on screen (px)"),
+    w: int = typer.Argument(..., min=0, max=9999, help="Region width (px)"),
+    h: int = typer.Argument(..., min=0, max=9999, help="Region height (px)"),
+    hide_border: bool | None = typer.Option(
+        None, "--hide-border/--show-border",
+        help="Hide the on-screen border around the region (default: unchanged)",
+    ),
+) -> None:
+    """Set the device's screen-cast region; a running cast follows it."""
+    log.info("cli display screencast-region: key=%s (%d,%d %dx%d) hide_border=%s",
+             key, x, y, w, h, hide_border)
+    dispatch_echo(SetScreencastRegion(
+        key=key, x=x, y=y, w=w, h=h, hide_border=hide_border))
 
 
 @app.command("stop-screencast")
@@ -1326,13 +1287,11 @@ def media_player(
     """Set the media-player source — a local file or a web URL/stream.
 
     Wraps :class:`SetMediaPlayer`: a local file plays through the video
-    pipeline; a web URL is referenced (persisted so ``theme save`` captures it).
+    pipeline; a web URL (http, https, rtsp) plays as a live stream.
     An empty URI clears the source.
     """
     log.info("cli display media-player: key=%s uri=%s", key, uri)
     app_obj = get_app()
-    if uri:
-        ensure_connected(app_obj, key)
     result = app_obj.dispatch(SetMediaPlayer(key=key, uri=uri))
     typer.echo(result.message)
     if not result.ok:
@@ -1364,6 +1323,9 @@ def snapshot(
     typer.echo(f"  mask_position    {result.mask_position}")
     typer.echo(f"  fit_mode         {result.fit_mode}")
     typer.echo(f"  split_mode       {result.split_mode}")
+    typer.echo(f"  game_mode        {describe_game_mode(result.game_enabled, result.game_threshold)}")
     typer.echo(f"  time_format      {result.time_format}")
     typer.echo(f"  date_format      {result.date_format}")
     typer.echo(f"  temp_unit        {result.temp_unit}")
+    typer.echo(f"  background_mode  {result.background_mode}")
+    typer.echo(f"  showing          {describe_source(result.display_source, result.background_mode, result.media_player_uri)}")

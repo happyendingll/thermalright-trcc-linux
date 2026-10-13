@@ -46,8 +46,9 @@ from .....core.commands import (
     SetLedZoneSyncZones,
     ToggleLed,
 )
-from .....core.led_models import LEDMode
+from .....core.led_models import LEDMode, zone_sync_ticks, zone_sync_units
 from .....core.results import LedSnapshotResult
+from ....presentation.led_display import LedSelector, led_display_for
 from ._base import LedTabBase
 
 log = logging.getLogger(__name__)
@@ -92,7 +93,9 @@ class _ZoneRow(QWidget):
         self._brightness.setRange(0, 100)
         self._brightness.setValue(65)
         self._brightness.setSuffix("%")
-        self._brightness.editingFinished.connect(self._on_brightness_edited)
+        # Finished AND changed only -- editingFinished fired on focus alone.
+        self._brightness.setKeyboardTracking(False)
+        self._brightness.valueChanged.connect(self._on_brightness_edited)
 
         self._swatch = QLabel(self)
         self._swatch.setFixedSize(40, 22)
@@ -180,6 +183,14 @@ class _ZoneRow(QWidget):
         self._on_brightness(self._index, self._brightness.value())
 
 
+_ZONES_INTRO = ("Each zone holds its own colour.  Pick the active zone "
+                "with the radio button on the left; the global colour tab "
+                "still drives the default for STATIC mode.")
+_PAGES_INTRO = ("This display shows one reading at a time.  Pick the one it "
+                "shows, or turn the carousel on and tick the ones it cycles "
+                "through.")
+
+
 class ZoneTab(LedTabBase):
     """Per-zone colour + sync carousel."""
 
@@ -188,6 +199,10 @@ class ZoneTab(LedTabBase):
         super().__init__(app, key_provider, parent)
         self._zone_widgets: list[_ZoneRow] = []
         self._placeholder_visible = True
+        #: The metric pages of a PAGE-style display (AX120, AK120, LF8, ...),
+        #: from ``apply_style``; empty on zone and no-selector styles.
+        self._pages: tuple[str, ...] = ()
+        self._participation_labels: tuple[str, ...] = ()
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -196,33 +211,31 @@ class ZoneTab(LedTabBase):
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
 
-        intro = QLabel(
-            "Each zone holds its own colour.  Pick the active zone "
-            "with the radio button on the left; the global colour tab "
-            "still drives the default for STATIC mode.",
-            self,
-        )
-        intro.setWordWrap(True)
-        intro.setStyleSheet("color: #aaa;")
-        root.addWidget(intro)
+        self._intro = QLabel(_ZONES_INTRO, self)
+        self._intro.setWordWrap(True)
+        self._intro.setStyleSheet("color: #aaa;")
+        root.addWidget(self._intro)
 
         self._zones_box = QGroupBox("Zones", self)
         self._zones_layout = QVBoxLayout(self._zones_box)
         root.addWidget(self._zones_box)
 
-        sync_box = QGroupBox("Carousel", self)
+        self._sync_box = sync_box = QGroupBox("Carousel", self)
         sync_form = QFormLayout(sync_box)
         self._sync_check = QCheckBox(
             "Enable zone-sync carousel", self,
         )
         self._sync_check.toggled.connect(self._on_sync_toggled)
         self._interval_spin = QSpinBox(self)
-        self._interval_spin.setRange(1, 600)
-        self._interval_spin.setValue(13)
-        self._interval_spin.setSuffix(" ticks")
-        self._interval_spin.editingFinished.connect(self._on_interval_changed)
+        # The C#'s unit and range: textBoxTimer, MaxLength 2, default "2".
+        self._interval_spin.setRange(1, 99)
+        self._interval_spin.setValue(2)
+        self._interval_spin.setSuffix(" s")
+        self._interval_spin.setKeyboardTracking(False)
+        self._interval_spin.valueChanged.connect(self._on_interval_changed)
         sync_form.addRow(self._sync_check)
-        sync_form.addRow("Rotation interval:", self._interval_spin)
+        self._interval_label = QLabel("Rotation interval:", sync_box)
+        sync_form.addRow(self._interval_label, self._interval_spin)
         # WHICH zones the carousel visits.  Without this mask it stays empty
         # and ``next_sync_zone`` is stuck on page 0 -- the carousel never
         # advances however the user sets the switch above, so the feature
@@ -231,7 +244,8 @@ class ZoneTab(LedTabBase):
         self._participation_layout = QHBoxLayout(self._participation)
         self._participation_layout.setContentsMargins(0, 0, 0, 0)
         self._participation_checks: list[QCheckBox] = []
-        sync_form.addRow("Rotate through:", self._participation)
+        self._participation_label = QLabel("Rotate through:", sync_box)
+        sync_form.addRow(self._participation_label, self._participation)
         root.addWidget(sync_box)
 
         self._placeholder = QLabel(
@@ -247,18 +261,42 @@ class ZoneTab(LedTabBase):
 
     # ── Public ────────────────────────────────────────────────────────
 
+    def apply_style(self, style_id: int | None) -> None:
+        """Know the device's LED style -- a PAGE style has no zones, but its
+        pages are picked here, as the gui's selector buttons pick them."""
+        display = led_display_for(style_id or 0)
+        self._pages = (display.page_labels
+                       if display.selector is LedSelector.PAGE else ())
+        # PA120 / LF10: the switch selects EVERY zone for an edit and nothing
+        # rotates -- the C#'s panel reads "Select all" there and hides its
+        # timer (FormLED.cs:1669, :1724).  "Carousel" said otherwise.
+        select_all = display.selector is LedSelector.ZONE
+        self._sync_box.setTitle("Select all" if select_all else "Carousel")
+        self._sync_check.setText("Edit every zone at once" if select_all
+                                 else "Enable zone-sync carousel")
+        for widget in (self._interval_label, self._interval_spin,
+                       self._participation_label, self._participation):
+            widget.setVisible(not select_all)
+        log.info("apply_style: style=%s pages=%s select_all=%s",
+                 style_id, self._pages, select_all)
+
     def refresh_from(self, snapshot: LedSnapshotResult | None) -> None:
         log.debug("refresh_from")
         if snapshot is None:
             self._show_placeholder(True)
             return
         zone_count = len(snapshot.zones)
-        if zone_count <= 1:
+        pages = self._pages if zone_count <= 1 else ()
+        if zone_count <= 1 and not pages:
             self._show_placeholder(True)
             self._rebuild_zone_rows(0)
             return
         self._show_placeholder(False)
-        self._rebuild_zone_rows(zone_count)
+        self._zones_box.setVisible(not pages)
+        self._intro.setText(_PAGES_INTRO if pages else _ZONES_INTRO)
+        self._rebuild_zone_rows(0 if pages else zone_count)
+        if pages:
+            self._rebuild_participation(pages)
         for i, zone in enumerate(snapshot.zones):
             row = self._zone_widgets[i]
             row.set_color(*zone.color)
@@ -274,16 +312,21 @@ class ZoneTab(LedTabBase):
         self._sync_check.blockSignals(False)
 
         self._interval_spin.blockSignals(True)
-        self._interval_spin.setValue(snapshot.zone_sync_interval_ticks)
+        self._interval_spin.setValue(
+            zone_sync_units(snapshot.zone_sync_interval_ticks))
         self._interval_spin.blockSignals(False)
 
-        # An empty mask is the "never configured" state, and it is the one that
-        # silently disables the carousel -- show it as every zone participating
-        # so the switch above tells the truth about what it will do.
+        # The zones the App actually uses: a missing entry is off, and with
+        # none on it falls back to zone 0 -- ``_edit_zones`` for edits,
+        # ``next_sync_zone`` for the carousel, and the C#'s default
+        # (``LunBo1`` only).  This showed a missing entry as ON, so a fresh
+        # device read "every zone" while the App drove zone 0 alone.
         mask = snapshot.zone_sync_zones or ()
+        used = {i for i, on in enumerate(mask) if on} or {0}
+        log.debug("refresh_from: zone mask %s -> showing %s", list(mask), sorted(used))
         for i, box in enumerate(self._participation_checks):
             box.blockSignals(True)
-            box.setChecked(mask[i] if i < len(mask) else True)
+            box.setChecked(i in used)
             box.blockSignals(False)
 
     # ── Internals ─────────────────────────────────────────────────────
@@ -319,11 +362,14 @@ class ZoneTab(LedTabBase):
             )
             self._zones_layout.addWidget(row)
             self._zone_widgets.append(row)
-        self._rebuild_participation(count)
+        self._rebuild_participation(tuple(str(i + 1) for i in range(count)))
 
-    def _rebuild_participation(self, count: int) -> None:
-        """One checkbox per zone — the carousel's mask, rebuilt with the rows."""
-        log.debug("_rebuild_participation: count=%d", count)
+    def _rebuild_participation(self, labels: tuple[str, ...]) -> None:
+        """One checkbox per zone or page -- the carousel's mask."""
+        log.debug("_rebuild_participation: %s", labels)
+        if labels == self._participation_labels:
+            return
+        self._participation_labels = labels
         while self._participation_layout.count():
             item = self._participation_layout.takeAt(0)
             if item is None:
@@ -332,8 +378,8 @@ class ZoneTab(LedTabBase):
             if w is not None:
                 w.deleteLater()
         self._participation_checks = []
-        for i in range(count):
-            box = QCheckBox(str(i + 1), self._participation)
+        for label in labels:
+            box = QCheckBox(label, self._participation)
             box.toggled.connect(self._on_participation_changed)
             self._participation_layout.addWidget(box)
             self._participation_checks.append(box)
@@ -382,13 +428,33 @@ class ZoneTab(LedTabBase):
         log.info("_on_zone_brightness: zone=%d percent=%d", zone, percent)
         self._dispatch(SetLedZoneBrightness(key=key, zone=zone, percent=percent))
 
-    def _on_participation_changed(self, _checked: bool) -> None:
-        """Send the WHOLE mask — ``SetLedZoneSyncZones`` replaces it wholesale."""
+    def _on_participation_changed(self, checked: bool) -> None:
+        """Send the WHOLE mask — ``SetLedZoneSyncZones`` replaces it wholesale.
+
+        Except on a page display with the carousel off: there a click picks
+        exactly that page (FormLED :2812, ``SelectZone``), and the shown page
+        cannot be un-picked -- the C#'s last selection cannot be deselected.
+        """
         mask = tuple(b.isChecked() for b in self._participation_checks)
-        log.info("_on_participation_changed: mask=%s", mask)
         key = self.current_key()
-        if key:
+        picking = bool(self._pages) and not self._sync_check.isChecked()
+        log.info("_on_participation_changed: mask=%s picking=%s", mask, picking)
+        if not key:
+            return
+        if not picking:
             self._dispatch(SetLedZoneSyncZones(key=key, zones=mask))
+            return
+        box = self.sender()
+        if not isinstance(box, QCheckBox) or box not in self._participation_checks:
+            log.warning("_on_participation_changed: unknown sender %r", box)
+            return
+        if not checked:                      # the page shown stays shown
+            box.blockSignals(True)
+            box.setChecked(True)
+            box.blockSignals(False)
+            return
+        self._dispatch(SelectZone(key=key,
+                                  zone=self._participation_checks.index(box)))
 
     def _on_sync_toggled(self, checked: bool) -> None:
         log.info("_on_sync_toggled: checked=%s", checked)
@@ -402,5 +468,5 @@ class ZoneTab(LedTabBase):
         if not key:
             return
         self._dispatch(SetLedZoneSyncInterval(
-            key=key, ticks=self._interval_spin.value(),
+            key=key, ticks=zone_sync_ticks(self._interval_spin.value()),
         ))

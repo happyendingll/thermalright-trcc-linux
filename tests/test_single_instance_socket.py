@@ -76,6 +76,39 @@ def test_a_second_launch_raises_the_running_window() -> None:
         inst.close()
 
 
+def test_a_hidden_launch_leaves_the_running_window_alone() -> None:
+    """``trcc gui --resume`` is autostart and session restore: a second one
+    must exit quietly, not pop the window the first one is keeping hidden.
+    MUTATION CHECK: send the raise whatever *raise_peer* says -> fails.
+    """
+    _needs_af_unix()
+    raised = threading.Event()
+    inst = _instance("gate-quiet")
+    inst.on_raise = raised.set
+    try:
+        assert SingleInstance("gate-quiet", raise_peer=False) is None
+        assert not raised.wait(0.5), "a hidden launch raised the window"
+        assert SingleInstance("gate-quiet") is None
+        assert raised.wait(3.0), "an ordinary second launch must still raise"
+    finally:
+        inst.close()
+
+
+def test_gui_resume_against_a_running_gui_raises_nothing() -> None:
+    """The UI half: ``GuiUI(start_hidden=True)`` asks for no raise."""
+    _needs_af_unix()
+    from trcc.ui._uis import GuiUI
+
+    raised = threading.Event()
+    inst = _instance("gui")
+    inst.on_raise = raised.set
+    try:
+        assert GuiUI(start_hidden=True).preflight() == 0
+        assert not raised.wait(0.5), "--resume popped the running window"
+    finally:
+        inst.close()
+
+
 def test_malformed_traffic_does_not_deafen_the_loop() -> None:
     """A bad peer must not cost every LATER launch its window-raise.
 
@@ -136,6 +169,55 @@ def test_the_socket_is_per_ui_flavour() -> None:
     assert _instance_socket_path("gui") != _instance_socket_path("qtgui")
     assert _instance_socket_path("gui").parent.name == SingleInstance._DIR_NAME
     assert os.environ["XDG_RUNTIME_DIR"] in str(_instance_socket_path("gui"))
+
+
+def test_without_xdg_runtime_dir_no_socket_goes_to_tmp(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """``/tmp`` is shared by every account — another user could bind
+    ``/tmp/trcc.sock`` first and every TRCC UI would dispatch to THEIR process
+    — and systemd-tmpfiles ages it out under a running App.  macOS never sets
+    ``XDG_RUNTIME_DIR``, so this is every Mac session."""
+    from trcc import ipc
+
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    assert ipc.socket_path() == tmp_path / ".cache" / "trcc.sock"
+    assert _instance_socket_path("gui") == tmp_path / ".cache" / "trcc" / "gui.sock"
+    assert not str(ipc.socket_path()).startswith("/tmp/trcc")
+
+
+def test_with_xdg_runtime_dir_the_paths_are_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Byte-identical to every release so far, so a UI still finds an App
+    that an older install started."""
+    from trcc import ipc
+
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+
+    assert ipc.socket_path() == tmp_path / "trcc.sock"
+    assert _instance_socket_path("gui") == tmp_path / "trcc" / "gui.sock"
+
+
+def test_root_has_one_socket_whatever_its_session_says(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A root ssh login gets XDG_RUNTIME_DIR=/run/user/0 from pam_systemd; a
+    root service gets none.  Honouring it put a root client and the root App
+    a service started on different sockets (#246)."""
+    from trcc import ipc
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/0")
+    login = ipc.socket_path()
+    monkeypatch.delenv("XDG_RUNTIME_DIR")
+
+    assert login == ipc.socket_path() == tmp_path / ".cache" / "trcc.sock"
 
 
 def test_only_a_raise_request_raises() -> None:

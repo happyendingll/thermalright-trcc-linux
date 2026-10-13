@@ -18,22 +18,18 @@ slot is PM and which is SUB.  See doc/PROTOCOL_USBLCDNEW.md.
 """
 from __future__ import annotations
 
-import dataclasses
 import logging
 import struct
+import time
 
 from ...core.errors import (
     HandshakeError,
 )
-from ...core.logs import per_frame
+from ...core.logs import Blob, per_frame
 from ...core.models import HandshakeResult, ProductInfo, Wire
 from ...core.ports import BulkTransport
-from ...core.protocol import (
-    get_profile,
-    pm_to_fbl,
-    resolve_encode_rotation,
-)
 from ._base import BaseBulkDevice
+from .bulk_lcd import bulk_profile
 
 log = logging.getLogger(__name__)
 frame_log = per_frame(__name__)
@@ -54,6 +50,17 @@ _HANDSHAKE_READ_SIZE = 512
 _HANDSHAKE_TIMEOUT_MS = 1000
 _WRITE_TIMEOUT_MS = 5000
 _READ_TIMEOUT_MS = 1000
+#: The C#'s ACK read timeout (DCReadWriteAsync.cs ThreadSendDeviceDataLY:
+#: ``Read(first, 0, 512, 100, …)``).  A miss there tears the device down and
+#: re-handshakes; ours waits 1000 ms and never looks at the ACK.  Not adopted
+#: blind (Linux USB timing is unmeasured on a real LY panel, #251) -- it is the
+#: line an ACK is WARNED against, so a report shows when it is crossed.
+_CSHARP_ACK_TIMEOUT_MS = 100
+#: Distinct ACK contents logged at INFO.  The C# never reads the ACK's bytes,
+#: so nothing says they are constant -- a per-frame counter in them would make
+#: an every-change line a per-frame line.  A few distinct ones are what a
+#: report needs to show a freeze answering differently (#251).
+_ACK_CONTENTS_LOGGED = 4
 
 # NOTE: the JPEG size ceiling that used to live here as `_MAX_FRAME_BYTES =
 # 512 * 1024` is gone — `DeviceProfile.max_frame_bytes` now carries the C#'s
@@ -95,6 +102,11 @@ class LyLcd(BaseBulkDevice, wire=Wire.LY):
         self._sub: int = 0
         # LY uses chunk header byte[8]=1, LY1 uses byte[8]=2
         self._chunk_cmd: int = 1 if info.pid == _PID_LY else 2
+        # ACK health, for #251's freeze: None until the first ACK is seen,
+        # then whether ACKs are currently slower than the C#'s timeout.
+        self._ack_slow: bool | None = None
+        # The distinct ACK heads seen, up to _ACK_CONTENTS_LOGGED.
+        self._ack_heads: set[str] = set()
 
     # ── Device ABC ────────────────────────────────────────────────────
 
@@ -141,11 +153,12 @@ class LyLcd(BaseBulkDevice, wire=Wire.LY):
             #     captioned "Trofeo Vision LCD 9.16"; 4 gives A1LD11, "Trofeo
             #     Vision LCD_9.16 ARGB" — a different SKU.
             #   * For 1920x462 the encode base is 180 at sub 5 and 0 at sub 4.
-            #     180 is what every release has shipped for this panel, and
-            #     that reporter filed six detailed issues about it (blur
-            #     measured by photo-FFT, dropped frames, reconnect, black
+            #     That reporter filed six detailed issues about this panel
+            #     (blur measured by photo-FFT, dropped frames, reconnect, black
             #     canvas, docs, video) without ever reporting an upside-down
-            #     image.
+            #     image.  This said "180 is what every release has shipped";
+            #     it is not -- v9.9.3, the build #248 measured, sent a
+            #     462x1920 portrait JPEG at 0° (emulated, 2026-10-07).
             #
             # So resp[22] + 1 reproduces the C#'s pmSub, and this panel's
             # rotation is unchanged by the sub-aware encode table.
@@ -172,26 +185,15 @@ class LyLcd(BaseBulkDevice, wire=Wire.LY):
             self._pm = 49 + resp[20]
             self._sub = raw_sub
 
-        fbl = pm_to_fbl(self._pm, self._sub)
-        # Resolve the wire rotation now that resolution, encoder and SUB are
-        # all known, so the render path reads a value and branches on nothing.
-        # The C# varies the base by SUB in six families (its ``mySubMode``
-        # arms); 1920x462 — this wire's panel — takes base 0 at SUB 2/3/4 and
-        # base 180 everywhere else.
-        base = get_profile(fbl, self._pm)
-        rotation = resolve_encode_rotation(
-            base.resolution, base.jpeg, self._sub)
-        log.info(
-            "LyLcd %s: %dx%d jpeg=%s raw resp[22]=%d → sub=%d → encode "
-            "base %d° invert=%s",
-            self.info.key, base.width, base.height, base.jpeg, raw_sub,
-            self._sub, rotation.base, rotation.invert)
-
-        self._profile = dataclasses.replace(
-            base,
-            encode_base=rotation.base,
-            encode_invert=rotation.invert,
-        )
+        # The C# hands LY to the SAME call as bulk -- FormCZTVInit(72, 2, pm,
+        # sub) at Form1.cs:1071 -- so LY resolves through the same function.
+        # It used to carry its own copy, which echoed an unknown PM as an FBL
+        # (PM 70 → FBL 70 → 320x320 RGB565 where the C# says 480x480 JPEG)
+        # and never set the portrait mount.
+        log.info("LyLcd %s: raw resp[20]=%d resp[22]=%d → PM=%d SUB=%d",
+                 self.info.key, resp[20], raw_sub, self._pm, self._sub)
+        fbl, self._profile = bulk_profile(self._pm, self._sub, self.info.key)
+        self._note_reply_timing(resp)
 
         return HandshakeResult(
             resolution=self._profile.resolution,
@@ -202,9 +204,36 @@ class LyLcd(BaseBulkDevice, wire=Wire.LY):
             raw_response=bytes(resp),
         )
 
+    def _note_reply_timing(self, resp: bytes) -> None:
+        """Log what bytes 24-31 and 44 say -- for the record, never obeyed.
+
+        The C# never reads them: the canvas comes from PM/SUB alone
+        (``is1920x462`` from the PM, FormCZTV.cs:902-905) and LY frames carry
+        no size.  #248 read them as the panel's 1920x480 and asked for that
+        canvas, but on its own fingerprint (PM 65 SUB 5, #207) they say
+        1920x**599**.  What holds on every reply we have (#129 SUB 3, #207,
+        #289) is OBSERVED, not documented: u32@28 minus byte 44 is the C#
+        height.  A panel where it is not gets a WARNING asking for a report.
+        """
+        if len(resp) < 45 or not (width := int.from_bytes(resp[24:28], "little")):
+            log.debug("LyLcd %s: reply carries no timing fields", self.info.key)
+            return
+        height = int.from_bytes(resp[28:32], "little")
+        derived = (width, height - resp[44])
+        canvas = self._profile.resolution if self._profile else None
+        log.info("LyLcd %s: reply says %dx%d, byte 44=%d -> %dx%d; the canvas "
+                 "is %s from PM/SUB, as the Windows app", self.info.key, width,
+                 height, resp[44], *derived, canvas)
+        if derived != canvas:
+            log.warning("LyLcd %s: the reply's %dx%d does not match the %s "
+                        "canvas -- a pattern every known panel follows.  "
+                        "Please open an issue with `trcc report` (#248).",
+                        self.info.key, *derived, canvas)
+
     def _handshake_detail(self, result: HandshakeResult) -> str:
         """The PID picks the variant (LY vs LY1) — worth having on the record."""
-        log.debug("_handshake_detail: result=%s", result)
+        log.debug("_handshake_detail: result=%s raw=%s",
+                  result, Blob(result.raw_response))
         return f" (pid=0x{self.info.pid:04x})"
 
     def _prepare_frame(self, payload: bytes) -> bytes:
@@ -249,7 +278,7 @@ class LyLcd(BaseBulkDevice, wire=Wire.LY):
 
     def _write_frame(self, frame: bytes) -> bool:
         """4096-byte USB writes over the chunk buffer, then the 512-byte ACK."""
-        log.debug("_write_frame: frame=%s", frame)
+        frame_log.debug("_write_frame: frame=%s", Blob(frame))
         total_bytes = len(frame)
         pos = 0
         while pos < total_bytes:
@@ -262,6 +291,57 @@ class LyLcd(BaseBulkDevice, wire=Wire.LY):
                 self._EP_WRITE, frame[pos:pos + write_size], _WRITE_TIMEOUT_MS,
             )
             pos += _USB_WRITE_SIZE
-        # ACK read
-        self._transport.read(self._EP_READ, _HANDSHAKE_READ_SIZE, _READ_TIMEOUT_MS)
+        # ACK read -- timed, because #251's freeze kept "succeeding" host-side
+        # and nothing recorded what the ACK looked like while it did.
+        started = time.monotonic()
+        ack = self._transport.read(self._EP_READ, _HANDSHAKE_READ_SIZE,
+                                   _READ_TIMEOUT_MS)
+        self._note_ack((time.monotonic() - started) * 1000, ack)
         return True
+
+    def _note_ack(self, ms: float, ack: bytes) -> None:
+        """Record an ACK so a report can show what a frozen panel answers.
+
+        Per frame at ``-vvv``; otherwise only the first ACK (the baseline) and
+        each change between within and beyond the C#'s 100 ms timeout -- the
+        lines a default ``trcc report`` log keeps.  First 8 bytes only: a
+        record must not grow with its payload.
+        """
+        head = ack[:8].hex(" ")
+        frame_log.debug("LyLcd %s: ACK %d byte(s) in %.1f ms [%s]",
+                        self.info.key, len(ack), ms, head)
+        self._note_ack_content(head, len(ack))
+        slow = ms > _CSHARP_ACK_TIMEOUT_MS
+        if slow == self._ack_slow:
+            return
+        if self._ack_slow is None and not slow:
+            log.info("LyLcd %s: first ACK %d byte(s) in %.1f ms [%s]",
+                     self.info.key, len(ack), ms, head)
+        elif slow:
+            log.warning("LyLcd %s: ACK took %.1f ms, past the C#'s %d ms "
+                        "timeout (the C# would re-handshake here) [%s] (#251)",
+                        self.info.key, ms, _CSHARP_ACK_TIMEOUT_MS, head)
+        else:
+            log.info("LyLcd %s: ACKs back under %d ms (%.1f ms) [%s]",
+                     self.info.key, _CSHARP_ACK_TIMEOUT_MS, ms, head)
+        self._ack_slow = slow
+
+    def _note_ack_content(self, head: str, size: int) -> None:
+        """Log each ACK content not seen before, up to a few (#251).
+
+        The first is the baseline; a later one is the panel answering
+        differently, which the timing lines alone cannot show.
+        """
+        if (head in self._ack_heads
+                or len(self._ack_heads) >= _ACK_CONTENTS_LOGGED):
+            return
+        self._ack_heads.add(head)
+        if len(self._ack_heads) == 1:
+            log.debug("LyLcd %s: ACK content baseline [%s]", self.info.key, head)
+            return
+        log.info("LyLcd %s: ACK content changed to [%s] (%d byte(s); "
+                 "distinct contents %d of %d logged%s) (#251)",
+                 self.info.key, head, size, len(self._ack_heads),
+                 _ACK_CONTENTS_LOGGED,
+                 "; further changes only at -vvv"
+                 if len(self._ack_heads) == _ACK_CONTENTS_LOGGED else "")

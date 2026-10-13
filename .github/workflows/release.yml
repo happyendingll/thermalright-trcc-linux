@@ -19,6 +19,10 @@ jobs:
   build-and-publish:
     name: Build and publish release artifacts
     runs-on: ubuntu-latest
+    # A ceiling, not a target: ~2-3x the slowest run measured 2026-10-01, and
+    # above that day's slow-mirror outlier.  Without one a hang holds the
+    # runner for GitHub's 6-hour default.
+    timeout-minutes: 15
     environment: pypi
     steps:
       - name: Checkout repository
@@ -71,6 +75,10 @@ jobs:
   distro-packages:
     name: Build distro packages
     runs-on: ubuntu-latest
+    # A ceiling, not a target: ~2-3x the slowest run measured 2026-10-01, and
+    # above that day's slow-mirror outlier.  Without one a hang holds the
+    # runner for GitHub's 6-hour default.
+    timeout-minutes: 30
     needs: build-and-publish
     steps:
       - name: Checkout repository
@@ -123,9 +131,12 @@ jobs:
           # to claim — sounddevice.py, _sounddevice.py, their __pycache__
           # entries and the dist-info.  Two packages owning one file is an RPM
           # file conflict, so installing the RPM FAILED for any user who
-          # already had python3-sounddevice for another reason.  We depend on
-          # it now; dev/tools/check_program_deps.py found this, and it is the
-          # only thing that could have.
+          # already had python3-sounddevice for another reason.
+          # It is a Recommends, not a Requires (2026-10-09): Fedora 43 has no
+          # python3-sounddevice, and requiring it -- by hand AND through the
+          # python3.Xdist requirement rpm generates from the wheel -- made the
+          # RPM uninstallable there.  It only drives the audio visualizer,
+          # which says so when it is missing.
           pip install --root="$PKG" --prefix=/usr --no-deps nvidia-ml-py
           rm -f "$PKG"/usr/lib/python*/site-packages/example.py \
                 "$PKG"/usr/lib/python*/site-packages/__pycache__/example.*
@@ -133,10 +144,14 @@ jobs:
           install -Dm644 /src/packaging/udev/99-trcc-lcd.rules "$PKG/etc/udev/rules.d/99-trcc-lcd.rules"
           install -Dm644 /src/packaging/modprobe/trcc-lcd.conf "$PKG/etc/modprobe.d/trcc-lcd.conf"
           install -Dm644 /src/packaging/modprobe/trcc-sg.conf "$PKG/etc/modules-load.d/trcc-sg.conf"
+          install -Dm644 /src/packaging/modprobe/trcc-rapl.conf "$PKG/etc/modules-load.d/trcc-rapl.conf"
           install -Dm644 /src/src/trcc/assets/trcc-linux.desktop "$PKG/usr/share/applications/trcc-linux.desktop"
           for m in /src/man/man1/*.1; do install -Dm644 "$m" "$PKG/usr/share/man/man1/$(basename "$m")"; done
           install -Dm644 /src/src/trcc/assets/com.github.lexonight1.trcc.policy "$PKG/usr/share/polkit-1/actions/com.github.lexonight1.trcc.policy"
           install -Dm755 /src/src/trcc/assets/trcc-imc "$PKG/usr/bin/trcc-imc"
+          install -Dm755 /src/src/trcc/assets/trcc-dmi "$PKG/usr/bin/trcc-dmi"
+          install -Dm755 /src/src/trcc/assets/trcc-ram-access "$PKG/usr/bin/trcc-ram-access"
+          install -Dm755 /src/src/trcc/assets/trcc-ram-access-off "$PKG/usr/bin/trcc-ram-access-off"
           install -Dm644 /src/src/trcc/assets/trcc-quirk-fix.service "$PKG/usr/lib/systemd/system/trcc-quirk-fix.service"
           for size in 256 128 64 48 32 24 16; do
             install -Dm644 /src/src/trcc/assets/icons/trcc_${size}x${size}.png "$PKG/usr/share/icons/hicolor/${size}x${size}/apps/trcc.png"
@@ -154,6 +169,7 @@ jobs:
           SITELIB="/usr/lib/python${PYVER}/site-packages"
 
           cat > /tmp/trcc.spec << SPEC
+          %global __requires_exclude ^python3[.][0-9]+dist[(]sounddevice[)]
           Name:       trcc-linux
           Version:    ${VER}
           Release:    1%{?dist}
@@ -170,22 +186,26 @@ jobs:
           Requires:   python3-click
           Requires:   python3-typer
           Requires:   python3-fastapi
+          Requires:   python3-cryptography
           Requires:   python3-uvicorn
+          Requires:   python3-python-multipart
           Requires:   python3-prompt-toolkit
           Requires:   portaudio
-          Requires:   python3-sounddevice
           Requires:   libusb1
           Requires:   sg3_utils
           Requires:   python3-hidapi
           Recommends: p7zip
           Recommends: ffmpeg
           Recommends: python3-dbus
+          Recommends: dmidecode
+          Recommends: python3-sounddevice
           %description
           Controls LCD displays and LED segment displays on Thermalright CPU coolers.
           %files
           /etc/udev/rules.d/99-trcc-lcd.rules
           /etc/modprobe.d/trcc-lcd.conf
           /etc/modules-load.d/trcc-sg.conf
+          /etc/modules-load.d/trcc-rapl.conf
           /usr/share/applications/trcc-linux.desktop
           %{_mandir}/man1/trcc*.1*
           /usr/share/icons/hicolor/*/apps/trcc.png
@@ -201,6 +221,9 @@ jobs:
           /usr/bin/trcc-gui
           /usr/bin/trcc-lcd
           /usr/bin/trcc-imc
+          /usr/bin/trcc-dmi
+          /usr/bin/trcc-ram-access
+          /usr/bin/trcc-ram-access-off
           %post
           udevadm control --reload-rules 2>/dev/null || :
           udevadm trigger 2>/dev/null || :
@@ -208,6 +231,11 @@ jobs:
           if command -v semodule >/dev/null 2>&1 && selinuxenabled 2>/dev/null; then
               semodule -i /usr/share/selinux/packages/trcc_usb/trcc_usb.pp 2>/dev/null || :
           fi
+          # The rule older releases wrote: YES for dmidecode/smartctl in any session.
+          grep -qs com.github.lexonight1.trcc /etc/polkit-1/rules.d/50-trcc.rules && rm -f /etc/polkit-1/rules.d/50-trcc.rules || :
+          %preun
+          # Uninstall, not upgrade: take back the RAM-lighting grant, if any.
+          if [ \$1 -eq 0 ]; then /usr/bin/trcc-ram-access disable >/dev/null 2>&1 || :; fi
           %postun
           if [ \$1 -eq 0 ] && command -v semodule >/dev/null 2>&1 && selinuxenabled 2>/dev/null; then
               semodule -r trcc_usb 2>/dev/null || :
@@ -247,8 +275,10 @@ jobs:
           # (modern Fedora/Ubuntu ship only python3 by default). #157
           find "$PKG" -name "trcc*" -path "*/bin/*" -exec sed -i "1s|^#\!.*/python[0-9.]*|#!/usr/bin/python3|" {} +
 
-          # Bundle sounddevice (not in Ubuntu/Debian repos)
-          pip install --root="$PKG" --prefix=/usr --no-deps sounddevice
+          # sounddevice is NOT bundled: Ubuntu 26.04 ships python3-sounddevice,
+          # and a bundled copy overwrote its files, so dpkg refused the deb
+          # (rc 100) for anyone who had it.  A Recommends below instead; Debian
+          # 13 has no package, and only the audio visualizer needs it.
 
           # Relocate the installed modules to the version-agnostic
           # /usr/lib/python3/dist-packages. installer + pip land them under a
@@ -276,6 +306,7 @@ jobs:
           install -Dm644 /src/packaging/udev/99-trcc-lcd.rules "$PKG/lib/udev/rules.d/99-trcc-lcd.rules"
           install -Dm644 /src/packaging/modprobe/trcc-lcd.conf "$PKG/etc/modprobe.d/trcc-lcd.conf"
           install -Dm644 /src/packaging/modprobe/trcc-sg.conf "$PKG/etc/modules-load.d/trcc-sg.conf"
+          install -Dm644 /src/packaging/modprobe/trcc-rapl.conf "$PKG/etc/modules-load.d/trcc-rapl.conf"
           install -Dm644 /src/src/trcc/assets/trcc-linux.desktop "$PKG/usr/share/applications/trcc-linux.desktop"
           for m in /src/man/man1/*.1; do install -Dm644 "$m" "$PKG/usr/share/man/man1/$(basename "$m")"; done
           for size in 256 128 64 48 32 24 16; do
@@ -283,6 +314,9 @@ jobs:
           done
           install -Dm644 /src/src/trcc/assets/com.github.lexonight1.trcc.policy "$PKG/usr/share/polkit-1/actions/com.github.lexonight1.trcc.policy"
           install -Dm755 /src/src/trcc/assets/trcc-imc "$PKG/usr/bin/trcc-imc"
+          install -Dm755 /src/src/trcc/assets/trcc-dmi "$PKG/usr/bin/trcc-dmi"
+          install -Dm755 /src/src/trcc/assets/trcc-ram-access "$PKG/usr/bin/trcc-ram-access"
+          install -Dm755 /src/src/trcc/assets/trcc-ram-access-off "$PKG/usr/bin/trcc-ram-access-off"
           install -Dm644 /src/src/trcc/assets/trcc-quirk-fix.service "$PKG/lib/systemd/system/trcc-quirk-fix.service"
 
           # python3-pynvml stays a Recommends below, NOT a Depends: it pulls
@@ -298,17 +332,17 @@ jobs:
           Section: utils
           Priority: optional
           Architecture: all
-          Depends: python3 (>= 3.9), python3-pyside6.qtcore, python3-pyside6.qtgui, python3-pyside6.qtwidgets, python3-numpy, python3-psutil, python3-usb, python3-pyudev, python3-hid, python3-click, python3-typer, python3-fastapi, python3-uvicorn, python3-prompt-toolkit, libportaudio2, libusb-1.0-0, sg3-utils
-          Recommends: p7zip-full, ffmpeg, python3-pynvml, python3-dbus
+          Depends: python3 (>= 3.9), python3-pyside6.qtcore, python3-pyside6.qtgui, python3-pyside6.qtwidgets, python3-numpy, python3-psutil, python3-usb, python3-pyudev, python3-hid, python3-click, python3-typer, python3-fastapi, python3-cryptography, python3-uvicorn, python3-websockets, python3-python-multipart | python3-multipart (<< 0.1), python3-prompt-toolkit, libportaudio2, libusb-1.0-0, sg3-utils
+          Recommends: p7zip-full, ffmpeg, python3-pynvml, python3-dbus, dmidecode, python3-sounddevice
           Maintainer: TRCC Linux Contributors <siembabdavid@gmail.com>
           Homepage: https://github.com/Lexonight1/thermalright-trcc-linux
           Description: Thermalright LCD/LED Control Center for Linux
            Controls LCD displays and LED segment displays on Thermalright CPU coolers
            and AIO liquid coolers. GUI, CLI, and REST API interfaces.
            Depends on the apt-split python3-pyside6.* modules — suitable for
-           Ubuntu 24.04+ and Debian 13+ and any distro packaging PySide6 as a
-           system package. Use the legacy .deb only on releases without
-           python3-pyside6 in apt.
+           Ubuntu 25.10+ and Debian 13+ and any distro packaging PySide6 as a
+           system package. Ubuntu 24.04 has none: use the legacy .deb there
+           and on any release without python3-pyside6 in apt.
           CTRL
 
           cat > "$PKG/DEBIAN/postinst" << POST
@@ -317,8 +351,17 @@ jobs:
           udevadm control --reload-rules 2>/dev/null || true
           udevadm trigger 2>/dev/null || true
           modprobe sg 2>/dev/null || true
+          grep -qs com.github.lexonight1.trcc /etc/polkit-1/rules.d/50-trcc.rules && rm -f /etc/polkit-1/rules.d/50-trcc.rules || true
           POST
           chmod 755 "$PKG/DEBIAN/postinst"
+
+          # Uninstall, not upgrade: take back the RAM-lighting grant, if any.
+          cat > "$PKG/DEBIAN/prerm" << PRERM
+          #!/bin/sh
+          set -e
+          if [ "\$1" = remove ]; then /usr/bin/trcc-ram-access disable >/dev/null 2>&1 || true; fi
+          PRERM
+          chmod 755 "$PKG/DEBIAN/prerm"
 
           dpkg-deb --build "$PKG" "/output/trcc-linux_${VER}-1_all.deb"
           echo "=== DEB Verification ==="
@@ -328,7 +371,7 @@ jobs:
           echo "DEB build PASSED"
           '
 
-      - name: Build DEB legacy (Ubuntu 22.04 and older)
+      - name: Build DEB legacy (Ubuntu 22.04 / 24.04, Debian 12)
         run: |
           docker run --rm \
             -v "${{ github.workspace }}:/src" \
@@ -348,6 +391,7 @@ jobs:
           install -Dm644 /src/packaging/udev/99-trcc-lcd.rules "$PKG/lib/udev/rules.d/99-trcc-lcd.rules"
           install -Dm644 /src/packaging/modprobe/trcc-lcd.conf "$PKG/etc/modprobe.d/trcc-lcd.conf"
           install -Dm644 /src/packaging/modprobe/trcc-sg.conf "$PKG/etc/modules-load.d/trcc-sg.conf"
+          install -Dm644 /src/packaging/modprobe/trcc-rapl.conf "$PKG/etc/modules-load.d/trcc-rapl.conf"
           install -Dm644 /src/src/trcc/assets/trcc-linux.desktop "$PKG/usr/share/applications/trcc-linux.desktop"
           for m in /src/man/man1/*.1; do install -Dm644 "$m" "$PKG/usr/share/man/man1/$(basename "$m")"; done
           for size in 256 128 64 48 32 24 16; do
@@ -355,6 +399,9 @@ jobs:
           done
           install -Dm644 /src/src/trcc/assets/com.github.lexonight1.trcc.policy "$PKG/usr/share/polkit-1/actions/com.github.lexonight1.trcc.policy"
           install -Dm755 /src/src/trcc/assets/trcc-imc "$PKG/usr/bin/trcc-imc"
+          install -Dm755 /src/src/trcc/assets/trcc-dmi "$PKG/usr/bin/trcc-dmi"
+          install -Dm755 /src/src/trcc/assets/trcc-ram-access "$PKG/usr/bin/trcc-ram-access"
+          install -Dm755 /src/src/trcc/assets/trcc-ram-access-off "$PKG/usr/bin/trcc-ram-access-off"
           install -Dm644 /src/src/trcc/assets/trcc-quirk-fix.service "$PKG/lib/systemd/system/trcc-quirk-fix.service"
 
           cat > "$PKG/DEBIAN/control" << CTRL
@@ -363,8 +410,8 @@ jobs:
           Section: utils
           Priority: optional
           Architecture: all
-          Depends: python3 (>= 3.9), python3-pip, python3-venv, libportaudio2, libusb-1.0-0, sg3-utils, libxcb-cursor0
-          Recommends: p7zip-full, ffmpeg, python3-dbus, python3-gi
+          Depends: python3 (>= 3.9), python3-pip, python3-venv, libportaudio2, libusb-1.0-0, sg3-utils, libxcb-cursor0, libegl1
+          Recommends: p7zip-full, ffmpeg, python3-dbus, python3-gi, dmidecode
           Maintainer: TRCC Linux Contributors <siembabdavid@gmail.com>
           Homepage: https://github.com/Lexonight1/thermalright-trcc-linux
           Description: Thermalright LCD/LED Control Center for Linux
@@ -392,12 +439,15 @@ jobs:
           udevadm control --reload-rules 2>/dev/null || true
           udevadm trigger 2>/dev/null || true
           modprobe sg 2>/dev/null || true
+          grep -qs com.github.lexonight1.trcc /etc/polkit-1/rules.d/50-trcc.rules && rm -f /etc/polkit-1/rules.d/50-trcc.rules || true
           POST
           chmod 755 "$PKG/DEBIAN/postinst"
 
           cat > "$PKG/DEBIAN/prerm" << PRERM
           #!/bin/sh
           set -e
+          # Uninstall, not upgrade: take back the RAM-lighting grant, if any.
+          if [ "\$1" = remove ]; then /usr/bin/trcc-ram-access disable >/dev/null 2>&1 || true; fi
           for cmd in trcc trcc-gui trcc-lcd; do
             rm -f /usr/bin/\$cmd
           done
@@ -420,7 +470,7 @@ jobs:
             -v "${{ github.workspace }}/packages:/output" \
             archlinux bash -c '
           set -e
-          pacman -Sy --noconfirm python python-pip python-installer python-packaging zstd >/dev/null 2>&1
+          pacman -Syu --noconfirm python python-pip python-installer python-packaging zstd >/dev/null 2>&1
           echo "=== Arch Build Environment ==="
           echo "Arch: $(cat /etc/arch-release 2>/dev/null || echo rolling)"
           echo "Python: $(python --version)"
@@ -435,12 +485,15 @@ jobs:
           # (modern Fedora/Ubuntu ship only python3 by default). #157
           find "$PKG" -name "trcc*" -path "*/bin/*" -exec sed -i "1s|^#\!.*/python[0-9.]*|#!/usr/bin/python3|" {} +
 
-          # Bundle uvicorn + sounddevice (not in official Arch repos)
-          pip install --root="$PKG" --prefix=/usr --no-deps uvicorn sounddevice
+          # Bundle sounddevice (not in the official Arch repos).  uvicorn is NOT
+          # bundled: Arch ships it, and the --no-deps copy came without h11 or
+          # websockets, so trcc api could not start (measured 2026-10-09).
+          pip install --root="$PKG" --prefix=/usr --no-deps sounddevice
 
           install -Dm644 /src/packaging/udev/99-trcc-lcd.rules "$PKG/usr/lib/udev/rules.d/99-trcc-lcd.rules"
           install -Dm644 /src/packaging/modprobe/trcc-lcd.conf "$PKG/usr/lib/modprobe.d/trcc-lcd.conf"
           install -Dm644 /src/packaging/modprobe/trcc-sg.conf "$PKG/usr/lib/modules-load.d/trcc-sg.conf"
+          install -Dm644 /src/packaging/modprobe/trcc-rapl.conf "$PKG/usr/lib/modules-load.d/trcc-rapl.conf"
           install -Dm644 /src/src/trcc/assets/trcc-linux.desktop "$PKG/usr/share/applications/trcc-linux.desktop"
           for m in /src/man/man1/*.1; do install -Dm644 "$m" "$PKG/usr/share/man/man1/$(basename "$m")"; done
           for size in 256 128 64 48 32 24 16; do
@@ -448,6 +501,9 @@ jobs:
           done
           install -Dm644 /src/src/trcc/assets/com.github.lexonight1.trcc.policy "$PKG/usr/share/polkit-1/actions/com.github.lexonight1.trcc.policy"
           install -Dm755 /src/src/trcc/assets/trcc-imc "$PKG/usr/bin/trcc-imc"
+          install -Dm755 /src/src/trcc/assets/trcc-dmi "$PKG/usr/bin/trcc-dmi"
+          install -Dm755 /src/src/trcc/assets/trcc-ram-access "$PKG/usr/bin/trcc-ram-access"
+          install -Dm755 /src/src/trcc/assets/trcc-ram-access-off "$PKG/usr/bin/trcc-ram-access-off"
           install -Dm644 /src/src/trcc/assets/trcc-quirk-fix.service "$PKG/usr/lib/systemd/system/trcc-quirk-fix.service"
           install -Dm644 /src/LICENSE "$PKG/usr/share/licenses/trcc-linux/LICENSE"
 
@@ -475,12 +531,16 @@ jobs:
           depend = python-click
           depend = python-typer
           depend = python-fastapi
+          depend = uvicorn
+          depend = python-websockets
+          depend = python-cryptography
           depend = python-prompt_toolkit
-          depend = python-multipart
+          depend = python-python-multipart
           depend = python-certifi
           depend = portaudio
           depend = libusb
           depend = sg3_utils
+          depend = dmidecode
           # DO NOT make this a hard depend. python-nvidia-ml-py depends on
           # nvidia-utils -- ~938 MB of driver + EGL stack on an AMD-only
           # machine (#216). It was changed to a hard depend once, shipped in
@@ -504,8 +564,26 @@ jobs:
           optdepend = python-gobject: Wayland session support
           INFO
 
+          # pacman runs these as root on install/upgrade: remove the rule older
+          # releases wrote (YES for dmidecode/smartctl in any session).
+          cat > "$PKG/.INSTALL" << INST
+          post_install() {
+            grep -qs com.github.lexonight1.trcc /etc/polkit-1/rules.d/50-trcc.rules && rm -f /etc/polkit-1/rules.d/50-trcc.rules
+            return 0
+          }
+          post_upgrade() {
+            post_install
+          }
+          # Uninstall (pacman runs no pre_remove on upgrade): take back the
+          # RAM-lighting grant, if any.
+          pre_remove() {
+            /usr/bin/trcc-ram-access disable >/dev/null 2>&1
+            return 0
+          }
+          INST
+
           cd "$PKG"
-          tar -cf - .PKGINFO * | zstd -o "/output/trcc-linux-${VER}-1-any.pkg.tar.zst"
+          tar -cf - .PKGINFO .INSTALL * | zstd -o "/output/trcc-linux-${VER}-1-any.pkg.tar.zst"
           echo "=== Arch Verification ==="
           ARCHPKG="/output/trcc-linux-${VER}-1-any.pkg.tar.zst"
           echo "  Package: $ARCHPKG ($(du -h "$ARCHPKG" | cut -f1))"
@@ -515,6 +593,52 @@ jobs:
 
       - name: Fix package directory permissions
         run: sudo chown -R "$(id -u):$(id -g)" packages/
+
+      - name: Install-test the packages in clean containers
+        # Each package goes into the distro it is built for and must import what
+        # the GUI and trcc api need, BEFORE anything is uploaded.  Measured
+        # 2026-10-09: packages that built green still failed here -- the RPM on
+        # Fedora 43, the deb beside python3-sounddevice on Ubuntu 26.04, and the
+        # Arch and deb packages without websockets.  Imports and --version only:
+        # a CI container has no USB device.
+        run: |
+          set -e
+          P="${{ github.workspace }}/packages"
+          IMPORTS="import trcc, trcc.ui.api.main, uvicorn.protocols.http.h11_impl, websockets, PySide6.QtWidgets"
+          for img in fedora:43 fedora:latest; do
+            echo "=== RPM on $img"
+            docker run --rm -v "$P:/p:ro" -e IMPORTS="$IMPORTS" "$img" bash -c '
+              set -e
+              dnf install -y -q /p/noarch/*.rpm
+              python3 -c "$IMPORTS"
+              trcc --version'
+          done
+          for img in debian:trixie ubuntu:26.04; do
+            echo "=== DEB on $img (with the distro sounddevice where it exists)"
+            docker run --rm -v "$P:/p:ro" -e IMPORTS="$IMPORTS" "$img" bash -c '
+              set -e
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y -qq python3-sounddevice || true
+              apt-get install -y -qq /p/trcc-linux_*-1_all.deb
+              python3 -c "$IMPORTS"
+              trcc --version'
+          done
+          echo "=== legacy DEB on ubuntu:24.04"
+          docker run --rm -v "$P:/p:ro" -e IMPORTS="$IMPORTS" ubuntu:24.04 bash -c '
+            set -e
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq
+            apt-get install -y -qq /p/trcc-linux_*.legacy_all.deb
+            /opt/trcc-linux/bin/python -c "$IMPORTS"
+            trcc --version'
+          echo "=== Arch"
+          docker run --rm -v "$P:/p:ro" -e IMPORTS="$IMPORTS" archlinux:latest bash -c '
+            set -e
+            pacman -Syu --noconfirm >/dev/null
+            pacman -U --noconfirm /p/trcc-linux-*-any.pkg.tar.zst
+            python -c "$IMPORTS"
+            trcc --version'
 
       - name: Generate SHA256 checksums
         run: |

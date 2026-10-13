@@ -1,4 +1,4 @@
-.TH "TRCC\-LED" "1" "" "trcc\-linux 9.10.2" "TRCC Manual"
+.TH "TRCC\-LED" "1" "" "trcc\-linux 9.10.8" "TRCC Manual"
 .SH NAME
 trcc\-led \- RGB LED control
 .SH SYNOPSIS
@@ -232,7 +232,7 @@ Show this command's help and exit.
 .PP
 \fBtrcc led select\-zone\fR \fIKEY\fR \fIZONE\fR
 .PP
-Set the currently\-selected zone (UI state).
+Select exactly this zone: the page a page\-style cooler shows, or the one zone a PA120/LF10 edit reaches.
 .PP
 Arguments:
 .RS 4
@@ -384,31 +384,6 @@ Options:
 .TP
 \fB\-\-zone, \-z \fIZONE\fR\fR
 Toggle a single zone (omit for global toggle)
-.TP
-\fB\-\-help\fR
-Show this command's help and exit.
-.RE
-.SS toggle\-segment
-.PP
-\fBtrcc led toggle\-segment\fR \fIKEY\fR \fIINDEX\fR \fISTATE\fR
-.PP
-Flip one segment on/off (segment\-display devices).
-.PP
-Arguments:
-.RS 4
-.TP
-\fBKEY\fR
-LED device key
-.TP
-\fBINDEX\fR
-Segment index
-.TP
-\fBSTATE\fR
-\&'on' or 'off'
-.RE
-.PP
-Options:
-.RS 4
 .TP
 \fB\-\-help\fR
 Show this command's help and exit.

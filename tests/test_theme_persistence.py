@@ -7,6 +7,7 @@ called out.
 from __future__ import annotations
 
 import json
+import subprocess
 import zipfile
 from pathlib import Path
 
@@ -14,19 +15,28 @@ import pytest
 
 from trcc.adapters.theme.filesystem import FileContentStore
 from trcc.app import App
+from trcc.core import toolchain
 from trcc.core.commands import (
+    ExportCurrentTheme,
     ExportTheme,
     ImportTheme,
     LoadTheme,
-    RestoreLastTheme,
+    RestoreDeviceState,
     SaveTheme,
 )
 from trcc.core.errors import ThemeError
 from trcc.core.events import ThemeExported, ThemeImported, ThemeSaved
-from trcc.core.models import Theme
+from trcc.core.models import (
+    CAPABILITIES_BY_KIND,
+    MEDIA,
+    FitMode,
+    Kind,
+    MediaKind,
+    Theme,
+)
 from trcc.services.settings import Settings
 
-from .conftest import FakePlatform
+from .conftest import FakeMic, FakePlatform
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -105,7 +115,7 @@ def user_theme_dir(app: App) -> Path:
 
 def test_export_writes_zip_with_expected_members(tmp_home: Path) -> None:
     theme_dir = _write_self_contained_theme(tmp_home, "demo")
-    archive = tmp_home / "demo.tr"
+    archive = tmp_home / "demo.zip"
 
     FileContentStore().export(theme_dir, archive)
 
@@ -144,7 +154,7 @@ def test_export_self_contained_theme_produces_importable_archive(
     assert not (saved / "01.png").exists()
 
     # Export → archive must be self-contained, with refs stripped.
-    archive = tmp_home / "ref.tr"
+    archive = tmp_home / "ref.zip"
     app.themes.export(saved, archive)
     with zipfile.ZipFile(archive) as zf:
         names = set(zf.namelist())
@@ -164,7 +174,7 @@ def test_export_self_contained_theme_produces_importable_archive(
 
 def test_export_rejects_missing_source(tmp_home: Path) -> None:
     missing = tmp_home / "nope"
-    archive = tmp_home / "out.tr"
+    archive = tmp_home / "out.zip"
 
     with pytest.raises(ThemeError, match="does not exist"):
         FileContentStore().export(missing, archive)
@@ -175,7 +185,7 @@ def test_export_rejects_non_directory_source(tmp_home: Path) -> None:
     file_path.write_text("x")
 
     with pytest.raises(ThemeError, match="not a directory"):
-        FileContentStore().export(file_path, tmp_home / "out.tr")
+        FileContentStore().export(file_path, tmp_home / "out.zip")
 
 
 # NB: export no longer preserves arbitrary subdirectory files — Phase E
@@ -191,7 +201,7 @@ def test_export_rejects_non_directory_source(tmp_home: Path) -> None:
 
 def test_import_unpacks_a_round_tripped_archive(tmp_home: Path) -> None:
     source = _write_self_contained_theme(tmp_home / "src", "demo")
-    archive = tmp_home / "demo.tr"
+    archive = tmp_home / "demo.zip"
     FileContentStore().export(source, archive)
 
     target = tmp_home / "imported"
@@ -205,12 +215,12 @@ def test_import_unpacks_a_round_tripped_archive(tmp_home: Path) -> None:
 
 def test_import_rejects_missing_archive(tmp_home: Path) -> None:
     with pytest.raises(ThemeError, match="does not exist"):
-        FileContentStore().import_(tmp_home / "nope.tr", tmp_home / "out")
+        FileContentStore().import_(tmp_home / "nope.zip", tmp_home / "out")
 
 
 def test_import_rejects_existing_target(tmp_home: Path) -> None:
     source = _write_theme(tmp_home / "src", "demo")
-    archive = tmp_home / "demo.tr"
+    archive = tmp_home / "demo.zip"
     FileContentStore().export(source, archive)
 
     target = tmp_home / "already_there"
@@ -221,11 +231,11 @@ def test_import_rejects_existing_target(tmp_home: Path) -> None:
 
 
 def test_import_rejects_invalid_zip(tmp_home: Path) -> None:
-    bogus = tmp_home / "garbage.tr"
+    bogus = tmp_home / "garbage.zip"
     bogus.write_bytes(b"not a zip file")
     target = tmp_home / "out"
 
-    with pytest.raises(ThemeError, match="Not a valid zip"):
+    with pytest.raises(ThemeError, match="Not a Windows .tr theme or a zip archive"):
         FileContentStore().import_(bogus, target)
 
     # Failed extraction must clean up the half-created target.
@@ -234,7 +244,7 @@ def test_import_rejects_invalid_zip(tmp_home: Path) -> None:
 
 def test_import_skips_zip_slip_members(tmp_home: Path) -> None:
     """Members with ``..`` or absolute paths are filtered out silently."""
-    archive = tmp_home / "malicious.tr"
+    archive = tmp_home / "malicious.zip"
 
     # Build a zip with a valid file + a zip-slip attempt + an absolute path.
     # Also include a valid theme config so .load() succeeds.
@@ -263,7 +273,7 @@ def test_import_cleans_up_when_archive_has_no_theme_config(
     tmp_home: Path,
 ) -> None:
     """Archive that extracts but isn't a valid theme deletes the target."""
-    archive = tmp_home / "empty.tr"
+    archive = tmp_home / "empty.zip"
     with zipfile.ZipFile(archive, "w") as zf:
         zf.writestr("random.txt", b"not a theme")
 
@@ -683,7 +693,7 @@ def test_explicit_load_clears_user_edits_restore_preserves(
     """Source-change semantics for the single overlay-layout model.
 
     An explicit ``LoadTheme`` (the user picking a theme) drops live edits so
-    the new theme shows its own layout.  ``RestoreLastTheme`` (reconnect /
+    the new theme shows its own layout.  ``RestoreDeviceState`` (reconnect /
     restart) re-runs LoadTheme with ``reset_overrides=False`` and must PRESERVE
     the persisted edits — legacy restored the saved overlay config on connect.
 
@@ -721,10 +731,10 @@ def test_explicit_load_clears_user_edits_restore_preserves(
     )
     before = list(app.settings.for_device(
         _TEST_DEVICE_KEY).user_overlay_elements)
-    app.dispatch(RestoreLastTheme(key=_TEST_DEVICE_KEY))
+    app.dispatch(RestoreDeviceState(key=_TEST_DEVICE_KEY))
     preserved = app.settings.for_device(_TEST_DEVICE_KEY).user_overlay_elements
     assert "edit2" in [e.id for e in preserved], (
-        "RestoreLastTheme (reconnect) must keep the user's persisted edits"
+        "RestoreDeviceState (reconnect) must keep the user's persisted edits"
     )
     assert [e.id for e in preserved] == [e.id for e in before], (
         "a restore must leave the working layer exactly as it found it"
@@ -738,7 +748,7 @@ def test_restore_keeps_cloud_background_explicit_load_clears_it(
     background; an explicit LoadTheme reverts to the theme's bundled one.
 
     Reported 2026-06-05: switching to the System-Info tab reverted the chosen
-    background.  The view-switch ran RestoreLastTheme → LoadTheme → StopVideo,
+    background.  The view-switch ran RestoreDeviceState → LoadTheme → StopVideo,
     which cleared background_path.  StopVideo now runs only on an explicit load
     (reset_overrides=True).
     """
@@ -748,10 +758,10 @@ def test_restore_keeps_cloud_background_explicit_load_clears_it(
     app.settings.set_background_path(_TEST_DEVICE_KEY, "/some/cloud/a078.mp4")
 
     # Restore (reset_overrides=False) — the cloud background survives.
-    app.dispatch(RestoreLastTheme(key=_TEST_DEVICE_KEY))
+    app.dispatch(RestoreDeviceState(key=_TEST_DEVICE_KEY))
     assert (app.settings.for_device(_TEST_DEVICE_KEY).background_path
             == "/some/cloud/a078.mp4"), (
-        "RestoreLastTheme must NOT clear the user's cloud background"
+        "RestoreDeviceState must NOT clear the user's cloud background"
     )
 
     # Explicit load (default reset_overrides=True) reverts to the theme's bg.
@@ -894,6 +904,42 @@ def test_save_theme_references_cloud_video_from_library(
     assert resolved.is_relative_to(app.platform.paths().user_background_dir(w, h))
     assert resolved.read_bytes() == fake_mp4_bytes
 
+
+def test_save_theme_copies_a_video_out_of_the_cloud_library(
+    app: App, tmp_home: Path, user_theme_dir: Path,
+) -> None:
+    """A video picked from the REAL cloud library is copied, not referenced.
+
+    Cloud videos are per-click downloads (``CloudThemeService.materialise``
+    writes ``cloud_theme_dir/<id>.mp4``), and no data install ever puts one
+    back.  A ref into ``~/.trcc`` therefore loaded BLACK after a wipe or a
+    reinstall.  The test above uses a loose ``cloud_pool`` file, which takes
+    the copy branch whatever the cloud roots say, so it never saw this.
+
+    MUTATION CHECK -- give videos the cloud roots again in
+    ``_store_background`` and this fails.
+    """
+    import shutil
+
+    source = _write_theme_with_real_pngs(tmp_home, "src")
+    app.active_themes[_TEST_DEVICE_KEY] = FileContentStore().load(source)
+
+    w, h = _TEST_RES
+    cloud_dir = app.platform.paths().cloud_theme_dir(w, h)
+    cloud_dir.mkdir(parents=True, exist_ok=True)
+    cloud_video = cloud_dir / "a077.mp4"
+    video_bytes = b"\x00\x00\x00\x20ftypisom..." * 100
+    cloud_video.write_bytes(video_bytes)
+    app.settings.set_background_path(_TEST_DEVICE_KEY, str(cloud_video))
+
+    assert app.dispatch(SaveTheme(key=_TEST_DEVICE_KEY, name="cloudvid")).ok
+    saved = user_theme_dir / "cloudvid"
+
+    shutil.rmtree(cloud_dir)                       # ~/.trcc wiped
+    resolved = app.themes.video_path(app.themes.load(saved))
+    assert resolved is not None and resolved.is_file()
+    assert resolved.is_relative_to(app.platform.paths().user_background_dir(w, h))
+    assert resolved.read_bytes() == video_bytes
 
 def test_resave_onto_self_keeps_referenced_background(
     app: App, tmp_home: Path, user_theme_dir: Path,
@@ -1113,6 +1159,66 @@ def test_saved_theme_video_background_plays_via_reference(
     assert vp.read_bytes() == video_bytes
 
 
+# .zt is TRCC's own container: its bytes are a real archive the reload
+# decodes, and it saved before this fix; the formats that did not are here.
+@pytest.mark.parametrize("ext", sorted(MEDIA.exts(MediaKind.ANIMATED) - {".zt"}))
+def test_every_animated_background_saves_and_reloads(
+    app: App, tmp_home: Path, user_theme_dir: Path, ext: str,
+) -> None:
+    """A .gif, .mkv or .avi background played and then failed to save:
+    "unsupported background extension" (#261).  The store's list was a
+    hand copy of four formats while MEDIA declared seven."""
+    import json as _json
+
+    source = _write_theme_with_real_pngs(tmp_home, "src")
+    app.active_themes[_TEST_DEVICE_KEY] = FileContentStore().load(source)
+    picked = tmp_home / "picked" / f"clip{ext}"
+    picked.parent.mkdir(parents=True, exist_ok=True)
+    picked.write_bytes(b"ANIMATED" * 64)
+    app.settings.set_background_path(_TEST_DEVICE_KEY, str(picked))
+
+    saved = app.dispatch(SaveTheme(key=_TEST_DEVICE_KEY, name="anim"))
+
+    assert saved.ok, saved.message
+    manifest = _json.loads(
+        (user_theme_dir / "anim" / "trcc.json").read_text(encoding="utf-8"))
+    assert manifest["background"].endswith(ext)
+    vp = app.themes.video_path(app.themes.load(user_theme_dir / "anim"))
+    assert vp is not None and vp.read_bytes() == b"ANIMATED" * 64
+
+
+def test_the_store_accepts_every_animated_format_media_declares() -> None:
+    """One authority: a format added to MEDIA saves without a second edit."""
+    from trcc.adapters.theme import filesystem
+
+    assert MEDIA.exts(MediaKind.ANIMATED) == filesystem._VIDEO_EXTS  # pyright: ignore[reportPrivateUsage]
+
+
+def test_a_zip_export_never_writes_an_animation_as_00_png(
+    app: App, tmp_home: Path, user_theme_dir: Path,
+) -> None:
+    """The zip named a .gif background ``00.png``: a GIF89a file under a PNG
+    name, reported ok=True (2026-10-07)."""
+    import zipfile
+
+    source = _write_theme_with_real_pngs(tmp_home, "src")
+    app.active_themes[_TEST_DEVICE_KEY] = FileContentStore().load(source)
+    picked = tmp_home / "picked" / "clip.gif"
+    picked.parent.mkdir(parents=True, exist_ok=True)
+    picked.write_bytes(b"GIF89a" + b"\0" * 64)
+    app.settings.set_background_path(_TEST_DEVICE_KEY, str(picked))
+    assert app.dispatch(SaveTheme(key=_TEST_DEVICE_KEY, name="anim")).ok
+    archive = tmp_home / "anim.zip"
+
+    assert app.dispatch(ExportTheme(key=_TEST_DEVICE_KEY, theme_name="anim",
+                                    archive_path=archive)).ok
+
+    with zipfile.ZipFile(archive) as zf:
+        members = {Path(n).name: zf.read(n) for n in zf.namelist()}
+    assert members["Theme.gif"].startswith(b"GIF89a")
+    assert not members.get("00.png", b"\x89PNG").startswith(b"GIF")
+
+
 def test_save_theme_inlines_mask_overlay_elements_into_manifest(
     app: App, tmp_home: Path, user_theme_dir: Path,
 ) -> None:
@@ -1287,6 +1393,9 @@ def test_save_theme_references_screencast_region(
     source = _write_theme_with_real_pngs(tmp_home, "src")
     app.active_themes[_TEST_DEVICE_KEY] = FileContentStore().load(source)
     app.settings.set_screencast_region(_TEST_DEVICE_KEY, (100, 50, 640, 480, True))
+    # SaveTheme connects the device and reloads the saved theme, which resumes
+    # its screencast -- audio on.  The real microphone would outlive the test.
+    app.audio = FakeMic()  # type: ignore[assignment]
 
     assert app.dispatch(SaveTheme(key=_TEST_DEVICE_KEY, name="cast")).ok
     saved = user_theme_dir / "cast"
@@ -1365,7 +1474,7 @@ def test_export_theme_command_writes_archive(
 ) -> None:
     user_theme_dir.mkdir(parents=True, exist_ok=True)
     _write_theme(user_theme_dir, "demo")
-    archive = tmp_home / "out.tr"
+    archive = tmp_home / "out.zip"
 
     result = app.dispatch(
         ExportTheme(
@@ -1384,7 +1493,7 @@ def test_export_theme_unknown_name_returns_failure(
     result = app.dispatch(
         ExportTheme(
             key=_TEST_DEVICE_KEY, theme_name="missing",
-            archive_path=tmp_home / "out.tr",
+            archive_path=tmp_home / "out.zip",
         ),
     )
 
@@ -1399,7 +1508,7 @@ def test_export_theme_rejects_unsafe_name(
     result = app.dispatch(
         ExportTheme(
             key=_TEST_DEVICE_KEY, theme_name=bad_name,
-            archive_path=tmp_home / "out.tr",
+            archive_path=tmp_home / "out.zip",
         ),
     )
 
@@ -1417,7 +1526,7 @@ def test_export_theme_publishes_event(
 
     app.dispatch(ExportTheme(
         key=_TEST_DEVICE_KEY, theme_name="demo",
-        archive_path=tmp_home / "out.tr",
+        archive_path=tmp_home / "out.zip",
     ))
 
     assert len(events) == 1
@@ -1433,7 +1542,7 @@ def test_import_theme_command_unpacks_archive(
     app: App, tmp_home: Path, user_theme_dir: Path,
 ) -> None:
     source = _write_theme(tmp_home, "src_theme")
-    archive = tmp_home / "imported.tr"
+    archive = tmp_home / "imported.zip"
     FileContentStore().export(source, archive)
 
     result = app.dispatch(
@@ -1452,7 +1561,7 @@ def test_import_theme_command_defaults_name_to_archive_stem(
     app: App, tmp_home: Path, user_theme_dir: Path,
 ) -> None:
     source = _write_theme(tmp_home, "src_theme")
-    archive = tmp_home / "snowflake.tr"
+    archive = tmp_home / "snowflake.zip"
     FileContentStore().export(source, archive)
 
     result = app.dispatch(ImportTheme(
@@ -1468,7 +1577,7 @@ def test_import_theme_unknown_archive_returns_failure(
 ) -> None:
     result = app.dispatch(
         ImportTheme(
-            key=_TEST_DEVICE_KEY, archive_path=tmp_home / "nope.tr", name="x",
+            key=_TEST_DEVICE_KEY, archive_path=tmp_home / "nope.zip", name="x",
         ),
     )
 
@@ -1480,7 +1589,7 @@ def test_import_theme_publishes_event(
     app: App, tmp_home: Path, user_theme_dir: Path,
 ) -> None:
     source = _write_theme(tmp_home, "src")
-    archive = tmp_home / "src.tr"
+    archive = tmp_home / "src.zip"
     FileContentStore().export(source, archive)
     events: list[ThemeImported] = []
     app.events.subscribe(ThemeImported, lambda e: events.append(e))  # type: ignore[arg-type, return-value]
@@ -1774,20 +1883,20 @@ def test_restore_loads_exact_stored_path_no_user_override(
     app.active_themes[_TEST_DEVICE_KEY] = FileContentStore().load(shipped)
     app.settings.set_current_theme(_TEST_DEVICE_KEY, str(shipped.resolve()))
 
-    assert app.dispatch(RestoreLastTheme(key=_TEST_DEVICE_KEY)).ok
+    assert app.dispatch(RestoreDeviceState(key=_TEST_DEVICE_KEY)).ok
     restored = Path(app.settings.for_device(_TEST_DEVICE_KEY).current_theme)
     assert restored.resolve() == shipped.resolve()    # shipped stays, NOT overridden by the user theme
 
 
 def test_restore_keeps_shipped_when_no_user_shadow(app: App) -> None:
-    """No same-named user theme → RestoreLastTheme loads the stored shipped
+    """No same-named user theme → RestoreDeviceState loads the stored shipped
     theme unchanged (no regression)."""
     paths = app.platform.paths()
     shipped = _write_theme_with_real_pngs(paths.theme_dir(*_TEST_RES), "Aurora")
     app.active_themes[_TEST_DEVICE_KEY] = FileContentStore().load(shipped)
     app.settings.set_current_theme(_TEST_DEVICE_KEY, str(shipped.resolve()))
 
-    assert app.dispatch(RestoreLastTheme(key=_TEST_DEVICE_KEY)).ok
+    assert app.dispatch(RestoreDeviceState(key=_TEST_DEVICE_KEY)).ok
     restored = Path(app.settings.for_device(_TEST_DEVICE_KEY).current_theme)
     assert restored.resolve() == shipped.resolve()
 
@@ -1799,7 +1908,7 @@ def test_restore_keeps_user_theme_unchanged(app: App, user_theme_dir: Path) -> N
     app.active_themes[_TEST_DEVICE_KEY] = FileContentStore().load(user)
     app.settings.set_current_theme(_TEST_DEVICE_KEY, str(user.resolve()))
 
-    assert app.dispatch(RestoreLastTheme(key=_TEST_DEVICE_KEY)).ok
+    assert app.dispatch(RestoreDeviceState(key=_TEST_DEVICE_KEY)).ok
     restored = Path(app.settings.for_device(_TEST_DEVICE_KEY).current_theme)
     assert restored.resolve() == user.resolve()
 
@@ -2016,7 +2125,8 @@ def test_save_theme_references_the_devices_own_library(
     app.devices[key] = SimpleNamespace(          # type: ignore[assignment]
         profile=get_profile(114, 64),            # FBL 114 PM 64 → 1600x720
         handshake=SimpleNamespace(sub_byte=3, pm_byte=64),
-        info=SimpleNamespace(key=key, native_resolution=resolution),
+        info=SimpleNamespace(key=key, native_resolution=resolution,
+                             kind=Kind.LCD, capabilities=CAPABILITIES_BY_KIND[Kind.LCD]),
         is_connected=True,
     )
 
@@ -2065,7 +2175,8 @@ def test_save_theme_falls_back_when_the_sku_library_is_absent(
     app.devices[key] = SimpleNamespace(          # type: ignore[assignment]
         profile=get_profile(114, 64),            # FBL 114 PM 64 → 1600x720
         handshake=SimpleNamespace(sub_byte=3, pm_byte=64),
-        info=SimpleNamespace(key=key, native_resolution=resolution),
+        info=SimpleNamespace(key=key, native_resolution=resolution,
+                             kind=Kind.LCD, capabilities=CAPABILITIES_BY_KIND[Kind.LCD]),
         is_connected=True,
     )
 
@@ -2107,14 +2218,14 @@ def test_restore_seeds_a_null_layer_but_never_an_emptied_one(
     assert theme_elements, "fixture must carry a layout to seed from"
 
     app.settings.for_device(_TEST_DEVICE_KEY).user_overlay_elements = None
-    app.dispatch(RestoreLastTheme(key=_TEST_DEVICE_KEY))
+    app.dispatch(RestoreDeviceState(key=_TEST_DEVICE_KEY))
     seeded = app.settings.for_device(_TEST_DEVICE_KEY).user_overlay_elements
     assert seeded is not None and len(seeded) == len(theme_elements), (
         "a null layer must be seeded from the theme on restore"
     )
 
     app.settings.set_user_overlay_elements(_TEST_DEVICE_KEY, [])
-    app.dispatch(RestoreLastTheme(key=_TEST_DEVICE_KEY))
+    app.dispatch(RestoreDeviceState(key=_TEST_DEVICE_KEY))
     assert app.settings.for_device(
         _TEST_DEVICE_KEY).user_overlay_elements == [], (
         "an emptied layer must survive a restore — seeding it would undo the "
@@ -2410,3 +2521,560 @@ def test_loadtheme_reports_its_theme_identity_from_one_place() -> None:
     assert {k.arg for k in inline[0].keywords} == {"ok", "key", "message"}, (
         "the one permitted direct construction is the arm with no theme; if "
         "it now carries theme_name/theme_path it should use _loaded instead")
+
+
+# ── #301 / #276: a saved theme reloads as SAVED — the round trip ────────────
+#
+# Every test above gates the WRITE half (what the manifest holds).  Both bugs
+# lived in the READ half: LoadTheme applied the saved theme's bundled catalog
+# mask, and ApplyMask replaced the working layer with the mask's own
+# config1.dc — so "Game" reloaded as the mask's stock set, and SaveTheme (which
+# ends by loading what it wrote) lost the user's edits the moment it returned.
+
+
+def _catalog_mask_with_layout(app: App) -> Path:
+    """A cloud mask folder with its OWN readable layout, like the real catalog."""
+    from trcc.services import _dc as Dc
+
+    mask = app.platform.paths().cloud_mask_dir(*_TEST_RES) / "000a"
+    mask.mkdir(parents=True)
+    (mask / "01.png").write_bytes(_png_bytes(red=0x70))
+    Dc.File(mask / "config1.dc").write({"elements": [
+        {"type": "text", "x": 5, "y": 5, "text": "MASK_STOCK", "color": "#ffffff",
+         "size": 12.0, "bold": False, "italic": False},
+    ]})
+    return mask
+
+
+def _texts(app: App) -> list[str]:
+    layer = app.settings.for_device(_TEST_DEVICE_KEY).user_overlay_elements or []
+    return [e.text for e in layer]
+
+
+def _edit_on_catalog_mask(app: App, tmp_home: Path) -> None:
+    from trcc.core.commands import ApplyMask, SetOverlayConfig
+
+    source = _write_theme_with_real_pngs(tmp_home, "src")
+    app.active_themes[_TEST_DEVICE_KEY] = FileContentStore().load(source)
+    assert app.dispatch(ApplyMask(key=_TEST_DEVICE_KEY,
+                                  path=_catalog_mask_with_layout(app))).ok
+    assert _texts(app) == ["MASK_STOCK"]
+    app.dispatch(SetOverlayConfig(key=_TEST_DEVICE_KEY, elements=(
+        {"id": "u1", "type": "text", "x": 9, "y": 9, "color": "#ffffff",
+         "size": 14, "text": "MINE"},)))
+
+
+def test_a_saved_theme_reloads_with_its_own_layout_not_its_masks(
+    app: App, tmp_home: Path, user_theme_dir: Path,
+) -> None:
+    from trcc.core.commands import LoadTheme, SaveTheme
+
+    _edit_on_catalog_mask(app, tmp_home)
+    app.dispatch(SaveTheme(key=_TEST_DEVICE_KEY, name="Game"))
+    assert _texts(app) == ["MINE"], "saving must not swap the edits for the mask's"
+
+    other = _write_theme_with_real_pngs(tmp_home, "other")
+    app.dispatch(LoadTheme(key=_TEST_DEVICE_KEY, path=other))
+    app.dispatch(LoadTheme(key=_TEST_DEVICE_KEY, path=user_theme_dir / "Game"))
+    assert _texts(app) == ["MINE"]
+
+
+def test_a_hidden_mask_stays_hidden_through_save_and_reload(
+    app: App, tmp_home: Path, user_theme_dir: Path,
+) -> None:
+    import json as _json
+
+    from trcc.core.commands import LoadTheme, SaveTheme, SetMaskVisible
+
+    _edit_on_catalog_mask(app, tmp_home)
+    app.dispatch(SetMaskVisible(key=_TEST_DEVICE_KEY, visible=False))
+    app.dispatch(SaveTheme(key=_TEST_DEVICE_KEY, name="NoMask"))
+
+    manifest = _json.loads((user_theme_dir / "NoMask" / "trcc.json").read_text(encoding="utf-8"))
+    assert "mask" not in manifest
+    app.dispatch(LoadTheme(key=_TEST_DEVICE_KEY, path=user_theme_dir / "NoMask"))
+    assert app.settings.for_device(_TEST_DEVICE_KEY).mask_visible is False
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Windows .tr — the C# format, not a zip (#272)
+# ─────────────────────────────────────────────────────────────────────
+#
+# The fixture is built by hand from buttonDaoChu_Click's field order
+# (FormCZTV.cs), NOT by our writer -- a fixture from our own codec would only
+# restate what we believe.  Its one element is copied from a real vendor
+# config1.dc: mode 4 (custom text) "CPU" at (160, 228), 微软雅黑 12pt.
+
+_PNG_END = b"IEND\xaeB`\x82"
+
+
+def _net_str(s: str) -> bytes:
+    """A .NET BinaryWriter string: 7-bit-encoded length, then UTF-8."""
+    raw, n, out = s.encode("utf-8"), len(s.encode("utf-8")), b""
+    while n >= 0x80:
+        out, n = out + bytes([n & 0x7F | 0x80]), n >> 7
+    return out + bytes([n]) + raw
+
+
+def _i32(*values: int) -> bytes:
+    import struct
+    return b"".join(struct.pack("<i", v) for v in values)
+
+
+def _windows_tr(*, mask: bytes | None, background: bytes | None = None,
+                zt_frames: list[bytes] | None = None) -> bytes:
+    """What the Windows app's Export writes, field by field."""
+    import struct
+    body = (b"\x01" + _i32(1)                                # myXtxx, count
+            + _i32(4, 0, 160, 228, 0, 0) + _net_str("微软雅黑")
+            + struct.pack("<f", 12.0) + bytes([0, 3, 0x86])  # style unit charset
+            + bytes([0xFF, 0x80, 0x80, 0x80]) + _net_str("CPU")
+            + b"\x01\x00" + _i32(0, 0, 0) + b"\x00"          # Bjxs Tpxs dir UI mode Ycbk
+            + _i32(0, 0, 320, 320) + b"\x01" + _i32(0, 0))   # Jp rect, Mbxs, XY MB
+    out = b"\xdd\xdc\xdd\xdc" + body + b"\xdc" * 10240
+    out += _i32(len(mask)) + mask if mask else _i32(0)
+    if background is not None:
+        return out + _i32(0, len(background)) + background
+    frames = zt_frames or []
+    return (out + _i32(len(frames)) + _i32(*range(0, 40 * len(frames), 40))
+            + b"".join(_i32(len(f)) + f for f in frames))
+
+
+def _tr_png(tag: bytes) -> bytes:
+    return b"\x89PNG\r\n\x1a\n" + tag + _PNG_END
+
+
+def test_import_windows_tr_with_a_still_background(tmp_home: Path) -> None:
+    """A Windows export used to fail as 'not a zip', so nothing happened."""
+    archive = tmp_home / "peerless.tr"
+    # BitmapToByte returns MemoryStream.GetBuffer(): zeros after the PNG.
+    archive.write_bytes(_windows_tr(mask=_tr_png(b"MASK") + bytes(300),
+                                    background=_tr_png(b"BG") + bytes(100)))
+    theme = FileContentStore().import_(archive, tmp_home / "out")
+
+    out = tmp_home / "out"
+    assert sorted(p.name for p in out.iterdir()) == ["00.png", "01.png", "config1.dc"]
+    assert (out / "01.png").read_bytes() == _tr_png(b"MASK")
+    assert (out / "00.png").read_bytes() == _tr_png(b"BG")
+    (element,) = theme.config["elements"]
+    assert (element["text"], element["x"], element["y"]) == ("CPU", 160, 228)
+    assert theme.config["mask_visible"] is True
+
+
+def test_import_windows_tr_with_an_animation(tmp_home: Path) -> None:
+    """A Theme.zt background travels as its frames; unpacked, it is Theme.zt
+    again -- 0xDC, frame count, timestamps, length-prefixed JPEGs."""
+    archive = tmp_home / "anim.tr"
+    frames = [b"\xff\xd8JPEG1\xff\xd9", b"\xff\xd8JPEG2\xff\xd9"]
+    archive.write_bytes(_windows_tr(mask=None, zt_frames=frames))
+    FileContentStore().import_(archive, tmp_home / "out")
+
+    out = tmp_home / "out"
+    assert sorted(p.name for p in out.iterdir()) == ["Theme.zt", "config1.dc"]
+    assert (out / "Theme.zt").read_bytes() == (
+        b"\xdc" + _i32(2, 0, 40) + b"".join(_i32(len(f)) + f for f in frames))
+
+
+def test_import_truncated_tr_fails_and_leaves_nothing(tmp_home: Path) -> None:
+    archive = tmp_home / "cut.tr"
+    archive.write_bytes(_windows_tr(mask=None, background=_tr_png(b"BG"))[:-3])
+    with pytest.raises(ThemeError, match="runs past"):
+        FileContentStore().import_(archive, tmp_home / "out")
+    assert not (tmp_home / "out").exists()
+
+
+def test_export_tr_writes_what_windows_imports(tmp_home: Path) -> None:
+    """Export to .tr is the Windows layout -- magic, config body, padding,
+    mask, still background -- and reads back to the same theme files."""
+    from trcc.services import _tr
+
+    theme_dir = _write_self_contained_theme(tmp_home, "demo")
+    archive = tmp_home / "demo.tr"
+    FileContentStore().export(theme_dir, archive)
+
+    from trcc.services import _dc
+
+    data = archive.read_bytes()
+    mask, bg = b"\x89PNG\r\n\x1a\nMASK", b"\x89PNG\r\n\x1a\nBG"
+    body = _dc.Writer().serialize(FileContentStore().load(theme_dir).config)[1:]
+    assert data == (b"\xdd\xdc\xdd\xdc" + body + b"\xdc" * 10240
+                    + _i32(len(mask)) + mask + _i32(0, len(bg)) + bg)
+    parts = _tr.read(data)
+    assert (parts.mask_png, parts.background_png) == (
+        b"\x89PNG\r\n\x1a\nMASK", b"\x89PNG\r\n\x1a\nBG")
+    FileContentStore().import_(archive, tmp_home / "back")
+    assert (tmp_home / "back" / "00.png").read_bytes() == b"\x89PNG\r\n\x1a\nBG"
+
+
+@pytest.mark.parametrize("still_beside_it", [False, True])
+def test_export_tr_refuses_a_video_it_cannot_carry(
+    tmp_home: Path, still_beside_it: bool,
+) -> None:
+    """The format has no slot for an mp4, and the store has no transcoder --
+    the export Commands bake the video first.  Handed one raw, it refuses,
+    and a 00.png beside the video is NOT exported in its place: the panel
+    plays the video, so a still would be a different theme (the old
+    fallback exported that still and called it what Windows does)."""
+    theme_dir = _write_self_contained_theme(tmp_home, "clip")
+    if not still_beside_it:
+        (theme_dir / "00.png").unlink()
+    (theme_dir / "Theme.mp4").write_bytes(b"\x00\x00\x00\x18ftypmp42")
+    with pytest.raises(ThemeError, match="a .tr needs a still background "
+                       r"\(00.png\) or a Theme.zt"):
+        FileContentStore().export(theme_dir, tmp_home / "clip.tr")
+    assert not (tmp_home / "clip.tr").exists()
+
+
+def test_export_tr_carries_the_background_it_is_handed(tmp_home: Path) -> None:
+    """The baked Theme.zt a Command hands over is what the .tr carries, in
+    place of the theme's video -- and the theme on disk is left alone."""
+    from trcc.services import _tr
+
+    theme_dir = _write_self_contained_theme(tmp_home, "clip")
+    (theme_dir / "00.png").unlink()
+    (theme_dir / "Theme.mp4").write_bytes(b"\x00\x00\x00\x18ftypmp42")
+    before = sorted(p.name for p in theme_dir.iterdir())
+    zt = tmp_home / "baked.zt"
+    zt.write_bytes(b"\xdc" + _i32(1, 41, 4) + b"\xff\xd8\xff\xd9")
+
+    FileContentStore().export(theme_dir, tmp_home / "clip.tr", background=zt)
+
+    parts = _tr.read((tmp_home / "clip.tr").read_bytes())
+    assert (parts.background_png, parts.theme_zt) == (None, zt.read_bytes())
+    assert sorted(p.name for p in theme_dir.iterdir()) == before
+
+
+# ─────────────────────────────────────────────────────────────────────
+# ExportCurrentTheme + ImportTheme: the Windows app's export / import
+# (FormCZTV.buttonDaoChu_Click / buttonDaoRu_Click) -- what is ON the panel
+# goes out, and what comes in goes ON the panel.
+# ─────────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def panel(tmp_path: Path) -> tuple[App, list[bytes]]:
+    """A connected 320x320 panel showing a PROGRAM theme with a mask and two
+    overlay elements, plus every payload sent to it from now on."""
+    from trcc.adapters.render.qt import QtRenderer
+    from trcc.core.commands import ConnectDevice
+
+    from .mock_platform import MockPlatform
+
+    app = App(MockPlatform([{"vid": "0402", "pid": "3922", "fbl": 100}],
+                           tmp_path), renderer=QtRenderer())
+    assert app.dispatch(ConnectDevice(key=_TEST_DEVICE_KEY)).ok
+    r = app.renderer
+    theme = app.platform.paths().theme_dir(*_TEST_RES) / "Prog"
+    theme.mkdir(parents=True)
+    (theme / "00.png").write_bytes(
+        r.encode_png(r.create_surface(320, 320, color=(200, 30, 30, 255))))
+    (theme / "01.png").write_bytes(
+        r.encode_png(r.create_surface(320, 320, color=(0, 0, 0, 128))))
+    (theme / "trcc.json").write_text(json.dumps({
+        "name": "Prog", "width": 320, "height": 320, "elements": [
+            {"type": "text", "text": "HELLO", "x": 40, "y": 60,
+             "color": "#ffffff", "font_size": 30},
+            {"type": "clock", "source": "date", "format": "%Y/%m/%d",
+             "x": 120, "y": 200, "color": "#00ff00", "font_size": 24},
+        ]}), encoding="utf-8")
+    assert app.dispatch(LoadTheme(key=_TEST_DEVICE_KEY, path=theme)).ok
+    sent: list[bytes] = []
+    send = app.send
+    app.send = lambda key, payload, **kw: (  # type: ignore[method-assign]
+        sent.append(bytes(payload)), send(key, payload, **kw))[1]
+    return app, sent
+
+
+def _frame(app: App, sent: list[bytes]) -> bytes:
+    from trcc.core.commands import RenderAndSend
+
+    start = len(sent)
+    assert app.dispatch(RenderAndSend(key=_TEST_DEVICE_KEY)).ok
+    return b"".join(sent[start:])
+
+
+def test_export_current_theme_carries_the_panel_not_the_library(
+    panel: tuple[App, list[bytes]], tmp_path: Path,
+) -> None:
+    """A PROGRAM theme exports (ExportTheme only knows saved ones), its mask
+    travels in the .tr, and nothing is added to the user's library -- the
+    SaveTheme path would have copied the mask into the mask grid."""
+    from trcc.services import _tr
+
+    app, _ = panel
+    events: list[ThemeExported] = []
+    app.events.subscribe(ThemeExported, events.append)
+    archive = tmp_path / "Party.tr"
+
+    result = app.dispatch(ExportCurrentTheme(key=_TEST_DEVICE_KEY,
+                                             archive_path=archive))
+
+    assert result.ok is True, result.message
+    parts = _tr.read(archive.read_bytes())
+    theme = app.active_themes[_TEST_DEVICE_KEY].path
+    assert parts.mask_png == (theme / "01.png").read_bytes()
+    assert (parts.background_png or b"")[:8] == b"\x89PNG\r\n\x1a\n"
+    user = app.platform.paths().user_content_dir()
+    assert [p for p in user.rglob("*") if p.is_file()] == []
+    assert [e.theme_name for e in events] == ["Party"]
+
+
+# A video theme exported to .tr: the Windows app's own video themes are a
+# Theme.zt baked at the canvas (UCVideoCut.BmpToThemeFile), and that is the
+# only animation a .tr can hold, so the export bakes one.  It refused instead,
+# 10 of 10 times, telling the user to pick .zip -- which Windows cannot read.
+
+_needs_ffmpeg = pytest.mark.skipif(
+    not (toolchain.present("ffmpeg") and toolchain.present("ffprobe")),
+    reason="ffmpeg/ffprobe not on PATH")
+
+
+def _clip(path: Path) -> Path:
+    """A real 2 s 4:3 test pattern -- not the panel's square shape, so the
+    device's fit decides what reaches the frames."""
+    subprocess.run(["ffmpeg", "-y", "-f", "lavfi",
+                    "-i", "testsrc=duration=2:size=320x240:rate=30",
+                    "-pix_fmt", "yuv420p", str(path)],
+                   capture_output=True, check=True, timeout=120)
+    return path
+
+
+def _zt_frames(zt: bytes, tmp: Path) -> list[bytes]:
+    """The JPEGs of a Theme.zt, through the decoder the panel plays it with."""
+    from trcc.services.media import ZtDecoder
+
+    (tmp / "read.zt").write_bytes(zt)
+    return ZtDecoder(tmp / "read.zt", _TEST_RES).decode()
+
+
+@_needs_ffmpeg
+@pytest.mark.parametrize("fit", [FitMode.WIDTH, FitMode.HEIGHT])
+def test_export_theme_bakes_a_video_into_the_tr(
+    panel: tuple[App, list[bytes]], tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, fit: FitMode,
+) -> None:
+    """A saved video theme exports to .tr as canvas-sized Theme.zt frames at
+    the device's fit, imports back as an animation, and leaves no temp."""
+    import tempfile
+
+    from PySide6.QtGui import QImage
+
+    from trcc.services import _tr
+
+    app, _ = panel
+    private = tmp_path / "systmp"
+    private.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(private))
+    app.settings.for_device(_TEST_DEVICE_KEY).fit_mode = fit
+    theme = app.platform.paths().user_theme_dir(*_TEST_RES) / "Clip"
+    theme.mkdir(parents=True)
+    _clip(theme / "Theme.mp4")
+    (theme / "trcc.json").write_text(json.dumps(
+        {"name": "Clip", "width": 320, "height": 320, "elements": []}),
+        encoding="utf-8")
+    archive = tmp_path / "Clip.tr"
+
+    result = app.dispatch(ExportTheme(key=_TEST_DEVICE_KEY, theme_name="Clip",
+                                      archive_path=archive))
+
+    assert result.ok is True, result.message
+    parts = _tr.read(archive.read_bytes())
+    assert parts.background_png is None and parts.theme_zt is not None
+    frames = _zt_frames(parts.theme_zt, tmp_path)
+    assert len(frames) > 1                         # an animation, not a still
+    first = QImage.fromData(frames[0])
+    assert (first.width(), first.height()) == _TEST_RES
+    # 320x240 into 320x320: WIDTH letterboxes (black top row), HEIGHT pins
+    # the height and crops the sides (the pattern reaches the top).
+    top = first.pixelColor(160, 2)
+    assert (max(top.red(), top.green(), top.blue()) < 40) is (fit is FitMode.WIDTH)
+    assert list(private.iterdir()) == []
+
+    back = app.dispatch(ImportTheme(key=_TEST_DEVICE_KEY, archive_path=archive,
+                                    name="Back"))
+    assert back.ok is True, back.message
+    zt = app.active_themes[_TEST_DEVICE_KEY].path / "Theme.zt"
+    assert _zt_frames(zt.read_bytes(), tmp_path) == frames
+
+
+@_needs_ffmpeg
+def test_export_current_theme_bakes_the_video_on_the_panel(
+    panel: tuple[App, list[bytes]], tmp_path: Path,
+) -> None:
+    """The panel's export button, on a theme playing a video."""
+    from trcc.services import _tr
+
+    app, _ = panel
+    theme = app.platform.paths().theme_dir(*_TEST_RES) / "Vid"
+    theme.mkdir(parents=True)
+    _clip(theme / "Theme.mp4")
+    (theme / "trcc.json").write_text(json.dumps(
+        {"name": "Vid", "width": 320, "height": 320, "elements": []}),
+        encoding="utf-8")
+    assert app.dispatch(LoadTheme(key=_TEST_DEVICE_KEY, path=theme)).ok
+    archive = tmp_path / "Vid.tr"
+
+    result = app.dispatch(ExportCurrentTheme(key=_TEST_DEVICE_KEY,
+                                             archive_path=archive))
+
+    assert result.ok is True, result.message
+    parts = _tr.read(archive.read_bytes())
+    assert parts.background_png is None and parts.theme_zt is not None
+    assert len(_zt_frames(parts.theme_zt, tmp_path)) > 1
+
+
+@_needs_ffmpeg
+def test_a_zip_keeps_the_video_itself(
+    panel: tuple[App, list[bytes]], tmp_path: Path,
+) -> None:
+    """Our zip has room for the mp4, so nothing is baked."""
+    app, _ = panel
+    theme = app.platform.paths().user_theme_dir(*_TEST_RES) / "Clip"
+    theme.mkdir(parents=True)
+    clip = _clip(theme / "Theme.mp4")
+    (theme / "trcc.json").write_text(json.dumps(
+        {"name": "Clip", "width": 320, "height": 320, "elements": []}),
+        encoding="utf-8")
+    archive = tmp_path / "Clip.zip"
+
+    assert app.dispatch(ExportTheme(key=_TEST_DEVICE_KEY, theme_name="Clip",
+                                    archive_path=archive)).ok
+
+    with zipfile.ZipFile(archive) as zf:
+        assert zf.read("Theme.mp4") == clip.read_bytes()
+        assert "Theme.zt" not in zf.namelist()
+
+
+# LoadVideo (CLI display load-video, the API route): the file plays as it is,
+# with the device's fit live, like the gui's video button.  It was baked into
+# a canvas Theme.zt at a fixed contain-fit, so SetFitMode never reached it --
+# 6 of 6 fit/order combinations gave the same letterbox (#291).
+
+
+def _top_is_black(payload: bytes) -> bool:
+    """Whether the frame's top rows at the centre are black -- a 4:3 clip
+    letterboxed on the square panel.  Black is 0x0000 in either RGB565 byte
+    order, so the wire's order does not matter."""
+    w, _ = _TEST_RES
+    row = 2 * w * 2
+    return payload[row + w:row + w + 2] == b"\x00\x00"
+
+
+@_needs_ffmpeg
+def test_load_video_plays_the_file_with_the_live_fit(
+    panel: tuple[App, list[bytes]], tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trcc.core.commands import LoadVideo, SetFitMode
+    from trcc.services.video_export import VideoExporter
+
+    app, sent = panel
+
+    def no_bake(*_a: object, **_k: object) -> Path:
+        raise AssertionError("a load without a cut ran the exporter")
+
+    monkeypatch.setattr(VideoExporter, "export_zt", no_bake)
+    clip = _clip(tmp_path / "clip.mp4")
+
+    result = app.dispatch(LoadVideo(key=_TEST_DEVICE_KEY, path=clip))
+
+    assert result.ok is True, result.message
+    staged = app.active_themes[_TEST_DEVICE_KEY].path
+    assert sorted(p.name for p in staged.iterdir()) == ["Theme.mp4", "trcc.json"]
+    assert (staged / "Theme.mp4").read_bytes() == clip.read_bytes()
+    inode = (staged / "Theme.mp4").stat().st_ino
+    assert app.dispatch(LoadVideo(key=_TEST_DEVICE_KEY, path=clip)).ok
+    assert (staged / "Theme.mp4").stat().st_ino == inode   # unchanged: no copy
+    seen = []
+    for fit in ("width", "height", "width"):
+        assert app.dispatch(SetFitMode(key=_TEST_DEVICE_KEY, mode=fit)).ok
+        seen.append(_top_is_black(_frame(app, sent)))
+    assert seen == [True, False, True]
+
+
+@_needs_ffmpeg
+@pytest.mark.parametrize("fit", [FitMode.WIDTH, FitMode.HEIGHT])
+def test_a_cut_bakes_the_devices_fit(
+    panel: tuple[App, list[bytes]], tmp_path: Path, fit: FitMode,
+) -> None:
+    """A cut is the C#'s trimmer: the clip is baked at the canvas with the
+    W/H choice, so the device's fit goes into the frames."""
+    from PySide6.QtGui import QImage
+
+    from trcc.core.commands import LoadVideo
+
+    app, _ = panel
+    app.settings.for_device(_TEST_DEVICE_KEY).fit_mode = fit
+
+    result = app.dispatch(LoadVideo(key=_TEST_DEVICE_KEY, end_ms=1000,
+                                    path=_clip(tmp_path / "clip.mp4")))
+
+    assert result.ok is True, result.message
+    staged = app.active_themes[_TEST_DEVICE_KEY].path
+    assert sorted(p.name for p in staged.iterdir()) == ["Theme.zt", "trcc.json"]
+    first = QImage.fromData(
+        _zt_frames((staged / "Theme.zt").read_bytes(), tmp_path)[0])
+    top = first.pixelColor(160, 2)
+    assert (max(top.red(), top.green(), top.blue()) < 40) is (fit is FitMode.WIDTH)
+
+
+@_needs_ffmpeg
+def test_reloading_a_clip_replaces_the_earlier_payload(
+    panel: tuple[App, list[bytes]], tmp_path: Path,
+) -> None:
+    """The staged dir is named by the file's stem and reused.  A cut after
+    an uncut load left Theme.mp4 beside the new Theme.zt -- and the mp4 is
+    the first candidate, so the panel kept playing the old clip."""
+    from trcc.core.commands import LoadVideo
+
+    app, _ = panel
+    clip = _clip(tmp_path / "clip.mp4")
+    assert app.dispatch(LoadVideo(key=_TEST_DEVICE_KEY, path=clip)).ok
+
+    assert app.dispatch(LoadVideo(key=_TEST_DEVICE_KEY, path=clip,
+                                  end_ms=1000)).ok
+
+    staged = app.active_themes[_TEST_DEVICE_KEY]
+    assert sorted(p.name for p in staged.path.iterdir()) == [
+        "Theme.zt", "trcc.json"]
+    assert app.themes.video_path(staged) == staged.path / "Theme.zt"
+
+
+@pytest.mark.parametrize("suffix", [".tr", ".zip"])
+def test_an_exported_theme_imports_back_to_the_same_frame(
+    panel: tuple[App, list[bytes]], tmp_path: Path, suffix: str,
+) -> None:
+    """Export what the panel shows, import it: the panel sends the very same
+    bytes -- through the Windows .tr's binary layout as well as our zip."""
+    app, sent = panel
+    before = _frame(app, sent)
+    archive = tmp_path / f"Party{suffix}"
+    assert app.dispatch(ExportCurrentTheme(key=_TEST_DEVICE_KEY,
+                                           archive_path=archive)).ok
+
+    result = app.dispatch(ImportTheme(key=_TEST_DEVICE_KEY,
+                                      archive_path=archive, name="Back"))
+
+    assert result.ok is True, result.message
+    assert app.active_themes[_TEST_DEVICE_KEY].path.name == "Back"
+    assert _frame(app, sent) == before
+
+
+def test_importing_puts_the_theme_on_the_panel(
+    panel: tuple[App, list[bytes]], tmp_path: Path,
+) -> None:
+    """The Windows app's import shows the theme; it used to land in the list
+    only, whichever UI asked."""
+    app, _ = panel
+    from .conftest import renderable_theme
+
+    source = renderable_theme(tmp_path / "elsewhere", "Other")
+    archive = tmp_path / "Other.zip"
+    FileContentStore().export(source, archive)
+
+    result = app.dispatch(ImportTheme(key=_TEST_DEVICE_KEY, archive_path=archive))
+
+    assert result.ok is True, result.message
+    assert app.active_themes[_TEST_DEVICE_KEY].path == Path(result.path)
+    assert app.settings.for_device(_TEST_DEVICE_KEY).current_theme == result.path
+

@@ -25,6 +25,22 @@ import os
 # user needs their real plugin.
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
+# CLI output is PLAIN text, on every machine.  Typer decides at import whether
+# to force colour, and forces it whenever ``GITHUB_ACTIONS`` is set -- so on CI,
+# and only there, ``--yes`` in captured help arrived split by escape codes and a
+# help test failed that passes everywhere else.  Typer's own switch, set here
+# for the same reason as the line above: before the first import.
+os.environ["_TYPER_FORCE_DISABLE_TERMINAL"] = "1"
+
+# Every test builds its App IN-PROCESS.  Production's default is the shared
+# App (``_boot.trcc`` finds or STARTS a daemon), so a test that reaches the
+# factory without this would spawn a real background process on the host's
+# real USB.  Measured before the default flipped: 2 tests reach it that way
+# (``test_docs_api_consistency``).  Assignment, not ``setdefault``, for the same
+# reason as the offscreen pin: a shell exporting TRCC_DAEMON=1 must not leak
+# in.  Tests of daemon mode set it themselves with ``monkeypatch``.
+os.environ["TRCC_DAEMON"] = "0"
+
 
 import inspect
 import ipaddress
@@ -50,6 +66,7 @@ from trcc.core.ports import (
     CpuSource,
     GpuSource,
     HotplugMonitor,
+    HttpFetcher,
     MemorySource,
     PackageManager,
     Paths,
@@ -260,8 +277,10 @@ class FakeGpu(GpuSource):
         self._discrete = discrete
         self._vendor = vendor
         self.values = {
-            "temp": 55.0, "usage": 30.0, "clock": 1800.0, "power": 180.0,
-            "fan": 42.0, "vram_used": 1024.0, "vram_total": 8192.0,
+            "temp": 55.0, "hotspot": 71.0, "mem_temp": 62.0,
+            "usage": 30.0, "clock": 1800.0, "power": 180.0,
+            "fan": 42.0, "fan_rpm": 1500.0,
+            "vram_used": 1024.0, "vram_total": 8192.0,
         }
 
     @property
@@ -288,8 +307,17 @@ class FakeGpu(GpuSource):
     def power(self) -> Optional[float]:
         return self.values["power"]
 
+    def hotspot(self) -> Optional[float]:
+        return self.values["hotspot"]
+
+    def mem_temp(self) -> Optional[float]:
+        return self.values["mem_temp"]
+
     def fan(self) -> Optional[float]:
         return self.values["fan"]
+
+    def fan_rpm(self) -> Optional[float]:
+        return self.values["fan_rpm"]
 
     def vram_used(self) -> Optional[float]:
         return self.values["vram_used"]
@@ -317,8 +345,50 @@ class FakeScreenCapture(ScreenCapture):
         )
 
 
+class FakeMic:
+    """``App.audio`` without PortAudio — counts the lifecycle calls.
+
+    **Not a convenience.**  The real :class:`~trcc.services.audio.AudioCapture`
+    opens an ``sd.InputStream`` with a callback on a native thread, and a test
+    that dispatches ``StartScreencast(audio=True)`` against a real ``App``
+    leaves that stream open for the rest of the session.  Measured
+    2026-09-23: one such test killed an xdist worker with ``Fatal Python
+    error: Illegal instruction``, and the test that DIED was a different one
+    each run — whichever happened to follow it.  Assign this over
+    ``app.audio`` (a plain attribute, ``app.py:216``) in any test that turns
+    screencast audio on.
+
+    The counts are the point: a fake that never stops still reads
+    ``running=True``, so only ``starts``/``stops`` can prove that nothing
+    released the microphone.
+    """
+
+    def __init__(self) -> None:
+        self.running = False
+        self.starts = 0
+        self.stops = 0
+
+    def start(self) -> bool:
+        self.running = True
+        self.starts += 1
+        return True
+
+    def stop(self) -> None:
+        self.running = False
+        self.stops += 1
+
+    def get_spectrum(self) -> tuple[float, ...]:
+        return (0.0, 0.5, 1.0, 0.5)
+
+
 class FakePlatform(Platform):
     """Minimal Platform fake — bulk/scsi transports replayable from tests."""
+
+    def http_fetcher(self) -> HttpFetcher:
+        """Offline: a test reaches the network only through a fetcher it
+        injects itself."""
+        from trcc.adapters.repo.http import OfflineHttpFetcher
+        return OfflineHttpFetcher()
 
     def __init__(self, tmp_home: Path) -> None:
         self.bulk = FakeBulkTransport()
@@ -331,7 +401,12 @@ class FakePlatform(Platform):
     def screen_capture(self) -> ScreenCapture:
         return self.capture
 
-    def open_transport(self, wire, vid, pid, serial=None) -> Transport:
+    def open_transport(self, wire, vid, pid, serial=None,
+                       unit="", *, hid_reports=False,
+                       report_id=0x00) -> Transport:
+        # *unit* accepted and ignored: one fake transport per wire is the
+        # point of this double.  Tests that care WHICH unit was asked for
+        # spy on this method (see test_usb_unit_path).
         return self.scsi if wire is Wire.SCSI else self.bulk
 
     def scan_devices(self) -> List:
@@ -388,7 +463,8 @@ class FakePlatform(Platform):
     # question, this class stops instantiating with a ``TypeError`` naming it,
     # which is the same message a new OS's author gets, delivered to us first.
 
-    def usb_power_state(self, vid: int, pid: int) -> Optional[UsbPowerState]:
+    def usb_power_state(self, vid: int, pid: int,
+                        unit: str = "") -> Optional[UsbPowerState]:
         return None
 
     def packages(self) -> PackageManager:
@@ -399,8 +475,8 @@ class FakePlatform(Platform):
     def package_manager(self) -> str:
         return ""
 
-    def upgrade_command(self) -> Tuple[str, ...]:
-        return ()
+    def upgrade_hint(self) -> str:
+        return ""
 
     def software_install_hint(self, tool: str) -> str:
         return f"fake platform: install {tool}"
@@ -410,9 +486,6 @@ class FakePlatform(Platform):
 
     def permission_denied_hint(self) -> str:
         return "fake platform: no USB permission"
-
-    def minimize_on_close(self) -> bool:
-        return False
 
     def configure_stdout(self) -> None:
         """Nothing to rewrap — the test runner's streams are already UTF-8."""
@@ -499,9 +572,127 @@ def _the_suite_is_hermetic() -> Iterator[None]:
             )
         return real_connect(self, address)
 
+    real_getaddrinfo = socket.getaddrinfo
+
+    def getaddrinfo(host: Any, *args: Any, **kwargs: Any) -> Any:
+        # ``create_connection`` resolves BEFORE it connects, so a guard on
+        # connect alone still sent the lookup -- and with no network a lookup
+        # has no time limit (data_install.py says so).  Measured 2026-10-05:
+        # the suite made 0 such lookups once stand-in platforms went offline;
+        # this keeps it at 0.
+        if host is None or host == "localhost" or _is_local(
+                socket.AF_INET, (host, 0)):
+            return real_getaddrinfo(host, *args, **kwargs)
+        raise socket.gaierror(
+            f"the trcc test suite is hermetic — blocked a DNS lookup of "
+            f"{host!r}.  Stub the port (HttpFetcher, DataInstallService, "
+            f"GithubReleases) instead of reaching the network.",
+        )
+
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(socket.socket, "connect", connect)
+        mp.setattr(socket, "getaddrinfo", getaddrinfo)
         yield
+
+
+#: Programs no test may run: they act as root (``pkexec``/``sudo``/``doas``)
+#: or read the host's firmware tables and disks (``dmidecode``/``smartctl``, and
+#: our own pkexec helpers ``trcc-dmi``/``trcc-imc``).
+_ELEVATORS = frozenset({"pkexec", "sudo", "doas"})
+_PRIVILEGED_TOOLS = frozenset({"dmidecode", "smartctl", "trcc-dmi", "trcc-imc",
+                               "trcc-ram-access", "trcc-ram-access-off"})
+#: Every refused attempt, as ``(PYTEST_CURRENT_TEST, command)``.
+_PRIVILEGED_ATTEMPTS: list[tuple[str, str]] = []
+
+
+def _privileged(argv: Any) -> str | None:
+    """The command line if *argv* would run something privileged, else None.
+
+    Whole words only, by basename, so ``sudo_reexec`` or a path that merely
+    contains "sudo" is not mistaken for the program.
+    """
+    words = (argv.split() if isinstance(argv, str)
+             else [os.fsdecode(w) for w in argv] if argv else [])
+    names = [os.path.basename(w) for w in words]
+    if names and (names[0] in _ELEVATORS
+                  or any(n in _PRIVILEGED_TOOLS for n in names)):
+        return " ".join(words)
+    return None
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _no_privileged_commands() -> Iterator[list[tuple[str, str]]]:
+    """Nothing in the suite runs a command as root or reads the host's firmware.
+
+    Measured 2026-10-07: one full run asked for ``pkexec /usr/bin/dmidecode -t
+    memory`` 263 times, from 39 test files.  ``MockPlatform`` built the HOST's
+    real sensors by default, the memory clock reads the configured speed through
+    dmidecode, and the polkit rule this project installs (``allow_active=yes``)
+    let every call run as root without a prompt -- the developer's journal held
+    52,092 of them.
+
+    ``PermissionError`` is what a host without the polkit rule gives, so the
+    code under test degrades exactly as it does there.  Every attempt is
+    recorded: one made by a test's body fails that test
+    (``pytest_runtest_call`` below), and one made anywhere else -- a fixture's
+    setup or teardown, or outside any test -- fails the session here.  Session
+    scope for the reason "The scope trap" above gives.
+    """
+    import subprocess
+
+    attempts = _PRIVILEGED_ATTEMPTS
+    real_popen_init = subprocess.Popen.__init__
+
+    def refuse(command: str) -> PermissionError:
+        attempts.append((os.environ.get("PYTEST_CURRENT_TEST", "<outside a test>"),
+                         command))
+        return PermissionError(
+            f"the trcc test suite runs nothing privileged -- refused "
+            f"{command!r}.  Use MockPlatform's default fake sensors, or stub "
+            f"the call.")
+
+    def popen_init(self: Any, args: Any, *a: Any, **k: Any) -> None:
+        if (command := _privileged(args)) is not None:
+            raise refuse(command)
+        real_popen_init(self, args, *a, **k)
+
+    def guarded_exec(real: Any) -> Any:
+        def exec_(path: Any, args: Any, *rest: Any) -> Any:
+            if (command := _privileged([path, *list(args)[1:]])) is not None:
+                raise refuse(command)
+            return real(path, args, *rest)
+        return exec_
+
+    real_system = os.system
+
+    def system(command: str) -> int:
+        if (privileged := _privileged(command)) is not None:
+            raise refuse(privileged)
+        return real_system(command)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(subprocess.Popen, "__init__", popen_init)
+        for name in ("execv", "execve", "execvp", "execvpe"):
+            mp.setattr(os, name, guarded_exec(getattr(os, name)))
+        mp.setattr(os, "system", system)
+        yield attempts
+    elsewhere = [(where, command) for where, command in attempts
+                 if not where.endswith("(call)")]
+    assert not elsewhere, (
+        f"a fixture tried to run privileged commands, which the suite "
+        f"refuses: {elsewhere}")
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_call(item: pytest.Item) -> Iterator[None]:
+    """Fail the test whose body asked for a privileged command (it was refused)."""
+    before = len(_PRIVILEGED_ATTEMPTS)
+    result = yield
+    asked = [command for _where, command in _PRIVILEGED_ATTEMPTS[before:]]
+    if asked:
+        pytest.fail(f"this test asked to run privileged commands, which the "
+                    f"suite refuses: {asked}", pytrace=False)
+    return result
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -558,6 +749,33 @@ def _home_is_never_the_real_one(
     """
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+    # Re-pinned PER TEST, not only at import: ``DaemonUI.compose`` pops
+    # TRCC_DAEMON (it must, #162), and so does test_ui_bus.  Pinned once, the
+    # first test to run a daemon compose in-process unpinned every later test
+    # in that worker — each then tried to start a real daemon, waited out the
+    # 10 s spawn timeout, and 5 CLI tests failed on the noise (measured when
+    # the default flipped to the shared App).
+    monkeypatch.setenv("TRCC_DAEMON", "0")
+
+
+@pytest.fixture(autouse=True)
+def _runtime_dir_is_never_the_real_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[None]:
+    """No test sees the developer's ``$XDG_RUNTIME_DIR``.  Autouse, for cause.
+
+    Every TRCC socket and the one-App lock live there, and the real one holds
+    the developer's RUNNING App: a test that asked ``daemon_running()`` got
+    True from it, and one that took the App lock would have refused to start
+    while the real App ran -- or stopped it from starting.  Per test, and
+    short: an AF_UNIX path stops at 107 bytes, which a ``tmp_path`` can pass.
+    """
+    import shutil
+    import tempfile
+    runtime = tempfile.mkdtemp(prefix="trcc-rt-")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", runtime)
+    yield
+    shutil.rmtree(runtime, ignore_errors=True)
 
 
 @pytest.fixture
@@ -573,6 +791,35 @@ def tmp_home(tmp_path: Path) -> Path:
 @pytest.fixture
 def fake_platform(tmp_home: Path) -> FakePlatform:
     return FakePlatform(tmp_home)
+
+
+@pytest.fixture
+def make_window() -> Iterator[Callable[[Any], Any]]:
+    """Build qtgui ``MainWindow``s that are DESTROYED at teardown.
+
+    Closing one only hides it to the tray, and a window a test never closes
+    lives on: measured 2026-09-30, 8 were still alive after
+    ``test_gui_panels.py``, each with its preview timer dispatching
+    ``BuildPreview`` into later tests' closed Apps -- the WARNING that failed
+    whichever test ran next.  ``deleteLater`` + flushing the deferred deletes
+    ends them for good.
+    """
+    from PySide6.QtCore import QEvent
+    from PySide6.QtWidgets import QApplication
+
+    from trcc.ui.qtgui.app import MainWindow
+
+    built: list[Any] = []
+
+    def make(app: Any) -> Any:
+        window = MainWindow(app)
+        built.append(window)
+        return window
+
+    yield make
+    for window in built:
+        window.deleteLater()
+    QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
 @pytest.fixture
@@ -610,6 +857,60 @@ def assert_stub_matches(real: Callable[..., Any], stub: Callable[..., Any]) -> N
             "Update the stub — a mismatched one raises TypeError at the call "
             "site and is swallowed, leaving the suite green and unstubbed."
         )
+
+
+def renderable_theme(root: Path, name: str) -> Path:
+    """A minimal theme the real renderer draws: a solid 320x320 ``00.png``."""
+    from PySide6.QtGui import QColor, QImage
+
+    theme = root / name
+    theme.mkdir(parents=True)
+    (theme / "trcc.json").write_text(
+        '{"name": "%s", "width": 320, "height": 320, "elements": []}' % name,
+        encoding="utf-8")
+    img = QImage(320, 320, QImage.Format.Format_RGB888)
+    img.fill(QColor(0, 64, 128))
+    assert img.save(str(theme / "00.png"))
+    return theme
+
+
+def show_a_theme(app: Any, key: str) -> None:
+    """Give connected panel *key* an active theme -- what every real panel has.
+
+    A background (``PlayVideo`` / ``SetBackground``) is the background OF a
+    theme.  On a panel with none they used to answer "playing" and draw
+    nothing; now they show the saved theme first, or refuse (P4c).  Tests
+    about decode, cursors or events set the panel up the realistic way with
+    this, instead of leaning on that old false success.  In-memory: nothing
+    is read from its folder.
+    """
+    from trcc.core.models import Theme
+
+    resolution = app.devices[key].profile.resolution
+    app.active_themes[key] = Theme(path=Path("/nonexistent/test-theme"),
+                                   name="Test", resolution=resolution)
+
+
+def loopback_client(api: Any) -> Any:
+    """A FastAPI ``TestClient`` that arrives the way ``trcc api`` is reached.
+
+    ``TestClient`` sends ``Host: testserver``, and a token-less server refuses
+    any Host that is not loopback (``ui/api/_shared.is_loopback_client``) — the
+    refusal that stops a DNS-rebinding page.  So the suite reaches the API as
+    a loopback client, like every real local caller.
+
+    ``base_url`` covers HTTP only: Starlette's WebSocket handshake hardcodes
+    ``Host: testserver`` whatever the base URL says (measured), so the
+    handshake gets its Host set explicitly.
+    """
+    from fastapi.testclient import TestClient
+
+    class _Loopback(TestClient):
+        def websocket_connect(self, url: str, *args: Any, **kwargs: Any) -> Any:
+            kwargs["headers"] = {"host": "127.0.0.1", **(kwargs.get("headers") or {})}
+            return super().websocket_connect(url, *args, **kwargs)
+
+    return _Loopback(api, base_url="http://127.0.0.1")
 
 
 @pytest.fixture(autouse=True)
@@ -770,9 +1071,6 @@ class _CliRenderer(Renderer):
     def rotate(self, surface, degrees):
         return surface
 
-    def flip_horizontal(self, surface):
-        return surface
-
     def apply_brightness(self, surface, percent):
         return surface
 
@@ -788,13 +1086,6 @@ class _CliRenderer(Renderer):
 
     def from_raw_rgb24(self, frame):
         return _Surface(100, 100)
-
-    def to_raw_rgb24(self, surface):
-        # The inverse the port now requires.  Test doubles carry no pixels,
-        # so this reports the surface's DIMENSIONS with blank bytes — enough
-        # for a caller that only needs a correctly-sized RawFrame.
-        w, h = self.surface_size(surface)
-        return RawFrame(data=bytes(w * h * 3), width=w, height=h)
 
     def decode_image(self, data):
         return _Surface(100, 100)
@@ -817,10 +1108,102 @@ def cli_app(fake_platform):
 
     _ctx.set_platform(fake_platform)
     _ctx.set_renderer(_CliRenderer())  # type: ignore[arg-type]
-    yield _ctx.get_app()
+    yield _ctx.compose_app()
+    _reset_cli_ctx()
+
+
+def _reset_cli_ctx() -> None:
+    """Forget the CLI's cached App and its overrides -- a fresh process."""
+    import sys
+
+    if "trcc.ui.cli._ctx" not in sys.modules:   # never imported: nothing cached
+        return
+    from trcc.ui.cli import _ctx
+
     _ctx.get_app.cache_clear()
+    _ctx.compose_app.cache_clear()
     _ctx._platform_override = None
     _ctx._renderer_override = None
+
+
+@pytest.fixture(autouse=True)
+def _cli_app_never_outlives_its_test() -> Iterator[None]:
+    """The CLI caches ONE App per process (``_ctx.compose_app``), and three
+    fixtures filled it without clearing it.  The next test on that worker then
+    got their App: ``test_status_and_kill_through_a_ui_never_start_an_app``
+    failed whenever one ran before it, which a new test FILE decided by
+    reshuffling the workers (2026-09-30).  Reset after every test, so no
+    fixture has to remember to."""
+    yield
+    _reset_cli_ctx()
+
+
+# =========================================================================
+# A log record that cannot be written fails the test it happened in
+# =========================================================================
+
+@pytest.fixture(autouse=True)
+def _fresh_once_only_log_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each test starts with nothing reported yet.
+
+    ``recurring_warning`` / ``recurring_failure`` log a message once per
+    PROCESS; a worker runs many tests, so without this a warning another test
+    already triggered would be silent here -- an order-dependent pass or fail.
+    """
+    from trcc.core import logs
+    monkeypatch.setattr(logs, "_REPORTED", set())
+
+
+@pytest.fixture(autouse=True)
+def _no_logging_error_in_a_test(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[None]:
+    """Fail the test during which a handler could not write a record.
+
+    ``logging`` does not raise when a handler fails -- it prints
+    ``--- Logging error ---`` to stderr and carries on.  One such report, for
+    ``[%s] %s failed: %s``, appeared in one full run of about twelve on
+    2026-09-29 and never in CI: a stray line that named no test, so nothing
+    could be done with it.  This names it.
+
+    Defined BEFORE ``_logging_state_is_not_global`` and the thread guard, so
+    it is set up first and torn down LAST: its check covers their teardown too
+    -- the thread guard's ``App.close`` and the logging restore -- which is
+    where the suspect lives.  The original ``handleError`` still runs, so the
+    stderr report is kept.
+
+    A test that drives a handler into ``handleError`` ON PURPOSE is marked
+    ``expects_logging_error`` -- and must then produce one, so a marker left
+    behind after the behaviour changes fails instead of hiding nothing.
+    """
+    import sys
+    import threading
+
+    errors: list[str] = []
+    real = logging.Handler.handleError
+
+    def _record(self: logging.Handler, record: logging.LogRecord) -> None:
+        exc = sys.exc_info()[1]
+        try:
+            text = record.getMessage()
+        except Exception:                   # the failure may BE the formatting
+            text = f"{record.msg!r} % {record.args!r}"
+        errors.append(
+            f"{type(self).__name__} could not write {text!r} (logged at "
+            f"{record.pathname}:{record.lineno} on thread "
+            f"{threading.current_thread().name!r}): "
+            f"{type(exc).__name__}: {exc}")
+        real(self, record)
+
+    monkeypatch.setattr(logging.Handler, "handleError", _record)
+    yield
+    expected = request.node.get_closest_marker("expects_logging_error")
+    if expected is not None and not errors:
+        pytest.fail("marked expects_logging_error, but no log record failed "
+                    "to write -- remove the marker", pytrace=False)
+    if errors and expected is None:
+        pytest.fail("a log record could not be written during this test:\n  "
+                    + "\n  ".join(errors), pytrace=False)
 
 
 # =========================================================================
@@ -864,3 +1247,97 @@ def _logging_state_is_not_global() -> Iterator[None]:
         root.handlers[:] = before[2]
         root.setLevel(before[0])
         frame.setLevel(before[1])
+
+
+# =========================================================================
+# Background threads — a test that starts one stops it
+# =========================================================================
+
+#: Thread names this project starts (``trcc-send-<key>``, ``trcc-video``,
+#: ``trcc-metrics``, ``trcc-ipc-events``, ...) plus the sensor poller.  Threads
+#: a library starts (``AnyIO worker thread`` under FastAPI's TestClient) are
+#: not ours to stop and are not checked.
+_OUR_THREADS = ("trcc-", "sensor-poll")
+
+
+@pytest.fixture(autouse=True)
+def _no_real_microphone_in_a_test(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Refuse the real ``AudioCapture.start`` -- name the test instead of crashing.
+
+    A real one opens a PortAudio stream whose callback runs on a native
+    thread and outlives the App; the process later dies with ``Fatal Python
+    error: Illegal instruction`` in whichever test happens to be running.
+    That has now happened TWICE: 2026-09-23 (a screencast test), and
+    2026-09-26, when auto-connect let ``SaveTheme``'s reload of a screencast
+    theme reach ``_sync_audio`` in ``test_theme_persistence``.  The
+    :class:`FakeMic` docstring asked every author to remember; this does not
+    ask.  Assign ``FakeMic()`` over ``app.audio`` in a test that turns
+    screencast audio on.
+    """
+    from trcc.services.audio import AudioCapture
+
+    def _refuse(self: AudioCapture) -> bool:
+        raise AssertionError(
+            "a test started the REAL microphone (AudioCapture.start) -- its "
+            "PortAudio callback outlives the test and kills the worker later. "
+            "Assign conftest.FakeMic() over app.audio in this test.")
+
+    monkeypatch.setattr(AudioCapture, "start", _refuse)
+
+
+@pytest.fixture(autouse=True)
+def _no_background_thread_outlives_its_test(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[None]:
+    """Close every App a test built, then fail if its threads still run.
+
+    Measured 2026-09-25: **203 tests** left threads running -- sender workers,
+    IPC event readers, and three coldplug tests that each left a WHOLE session
+    (video, metrics and LED loops plus the sensor poller) alive in the worker.
+    Those loops publish and render from background threads while later tests
+    drive Qt on the main thread, and CI's pytest workers died with a segfault
+    inside Qt's event processing -- with exactly those three sessions in the
+    crash dump.  CI never failed on it, because the test step's exit code was
+    ``tee``'s.
+
+    Every App built during the test is closed here, which is what the process
+    exit a real UI performs would do.  A thread that survives THAT was started
+    by something the test itself must stop (an IPC client, a server), and the
+    test fails naming it.
+    """
+    import threading
+    import time
+
+    from trcc.app import App
+
+    built: list[App] = []
+    init = App.__init__
+
+    def recording_init(self: App, *args: Any, **kwargs: Any) -> None:
+        init(self, *args, **kwargs)
+        built.append(self)
+
+    monkeypatch.setattr(App, "__init__", recording_init)
+    before = {t.ident for t in threading.enumerate()}
+    # The REAL clock, taken now: tests script ``time.monotonic`` and their
+    # patch is still in place when this teardown runs.
+    clock = time.monotonic
+    yield
+    for app in built:
+        try:
+            app.close()
+        except Exception:
+            logging.getLogger(__name__).exception("closing a test's App raised")
+
+    def ours() -> list[threading.Thread]:
+        return [t for t in threading.enumerate()
+                if t.ident not in before and t.is_alive()
+                and t.name.startswith(_OUR_THREADS)]
+
+    deadline = clock() + 2.0
+    while (leaked := ours()) and clock() < deadline:
+        leaked[0].join(timeout=0.1)
+    assert not leaked, (
+        "this test left background threads running: "
+        f"{sorted(t.name for t in leaked)} -- stop what the test started "
+        "(close the client / server / App) before it returns")

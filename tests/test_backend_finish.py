@@ -56,8 +56,10 @@ class _FakeHttp(HttpFetcher):
         self.responses = responses
         self.calls: list[str] = []
 
-    def fetch(self, url: str, timeout_s: float = 30.0) -> bytes:
-        del timeout_s
+    def fetch(
+        self, url: str, timeout_s: float = 30.0, max_bytes: int | None = None,
+    ) -> bytes:
+        del timeout_s, max_bytes
         self.calls.append(url)
         if url in self.responses:
             return self.responses[url]
@@ -216,14 +218,11 @@ def test_check_for_update_network_failure(_trcc_app) -> None:
 def test_run_upgrade_dry_run_returns_command(_trcc_app) -> None:
     from trcc.core.commands import RunUpgrade
 
-    result = _trcc_app.dispatch(RunUpgrade(dry_run=True))
-    # On a system with a detected pm, command is populated; otherwise
-    # we get a structured no-pm error.  Either is a valid pass.
-    if result.ok:
-        assert result.command
-        assert result.command[0] == "sudo"
-    else:
-        assert "package manager" in result.message.lower()
+    result = _trcc_app.dispatch(RunUpgrade())
+    # Nothing to run, ever: the answer is the command for the user.
+    assert result.ok
+    assert result.command == []
+    assert result.message.startswith("To upgrade TRCC")
 
 
 def test_set_slideshow_persists_state(_trcc_app) -> None:
@@ -265,8 +264,11 @@ def test_keepalive_loop_without_cached_frame(_trcc_app) -> None:
     from trcc.core.commands import KeepAliveLoop
 
     r = _trcc_app.dispatch(KeepAliveLoop(key="0402:3922", count=1))
-    assert r.ok is False
-    assert "no cached frame" in r.message.lower()
+    # Nothing cached now means "show the saved display first"; with no theme
+    # installed at all, that restore's reason is the honest answer (#267).
+    assert (r.ok, r.message) == (
+        False, "No theme available for this device — install themes or load "
+               "a theme first")
 
 
 def test_keepalive_loop_negative_count_rejected(_trcc_app) -> None:

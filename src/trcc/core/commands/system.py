@@ -9,26 +9,31 @@ from typing import TYPE_CHECKING, ClassVar
 
 from .._version import is_newer
 from ..errors import (
+    DeviceNotConnectedError,
     DeviceNotFoundError,
     HttpFetchError,
 )
 from ..events import (
-    DateFormatChanged,
+    AutostartChanged,
+    DiskDeviceChanged,
     GpuDeviceChanged,
     LanguageChanged,
+    OverlayChanged,
     RefreshIntervalChanged,
+    SensorDashboardChanged,
     TempUnitChanged,
-    TimeFormatChanged,
 )
 from ..models import (
     AUTOSTART_TARGETS,
     MAX_REFRESH_INTERVAL_S,
     MIN_REFRESH_INTERVAL_S,
-    SLIDESHOW_POLL_S,
+    TIME_FORMATS,
+    Capability,
     PanelConfig,
     SensorBinding,
 )
 from ..results import (
+    ApiTlsResult,
     AutostartResult,
     ControlCenterSnapshotResult,
     DaemonResult,
@@ -74,10 +79,16 @@ from ..results import (
 from ._base import Command, Query
 from ._helpers import (
     _autostart_path,
+    _drive_slideshow,
     _health_entries,
+    _invalidate_scene,
+    _publish_slideshow,
+    _require_connected_device,
     _resolve_oriented_resolution,
     _slideshow_snapshot,
+    fan_slot_pins,
 )
+from .theme import RestoreDeviceState
 
 if TYPE_CHECKING:
     from ...app import App
@@ -85,15 +96,28 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+def _set_clock_format(app: App, key: str | None, source: str,
+                      pattern: str) -> str:
+    """Give *source* clocks *pattern*, re-render, tell every UI; the scope said."""
+    touched = app.settings.set_clock_format(key, source, pattern)
+    for k in touched:
+        _invalidate_scene(app, k)
+        app.events.publish(OverlayChanged(
+            key=k, enabled=app.settings.for_device(k).overlay_enabled,
+        ))
+    scope = f"{sum(touched.values())} {source} element(s) on {len(touched)} device(s)"
+    log.info("_set_clock_format: %r -> %s", pattern, scope)
+    return scope
+
+
 @dataclass(frozen=True, slots=True)
 class SetTimeFormat(Command[TimeFormatResult]):
-    """Set the LCD-overlay clock format (12h or 24h).
+    """Set every time element's clock to 12h or 24h — on ``key``, or on every
+    device when ``key`` is None.
 
-    ``key=None`` (the default) sets the global ``AppSettings.time_format``
-    and fans out to every device; a specific ``key`` sets just that
-    device (per-device override).  Either way one
-    :class:`TimeFormatChanged` is published per affected device so
-    ``DeviceRenderObserver`` re-renders immediately.
+    The format belongs to each element, as the C#'s myModeSub does
+    (UCXiTongXianShiSub.cs:248); this is the CLI/API's "all my clocks" edit.
+    A theme loaded later shows its own format.  Publishes ``OverlayChanged``.
 
     Distinct from :class:`SetClockFormat` (LED-segment LC2-style
     displays, which write ``led_clock_24h``).
@@ -109,16 +133,8 @@ class SetTimeFormat(Command[TimeFormatResult]):
                 ok=False, key=self.key or "", fmt=self.fmt,
                 message=f"fmt must be '12h' or '24h', got {self.fmt!r}",
             )
-        if self.key is None:
-            keys = app.settings.set_global_time_format(self.fmt)  # type: ignore[arg-type]
-            scope = f"global ({len(keys)} device(s))"
-        else:
-            app.settings.set_time_format(self.key, self.fmt)  # type: ignore[arg-type]
-            keys = [self.key]
-            scope = self.key
-        for key in keys:
-            app.display.invalidate(key)
-            app.events.publish(TimeFormatChanged(key=key, fmt=self.fmt))
+        scope = _set_clock_format(app, self.key, "time",
+                                  TIME_FORMATS[1 if self.fmt == "12h" else 0])
         return TimeFormatResult(
             ok=True, key=self.key or "", fmt=self.fmt,
             message=f"time format set to {self.fmt} for {scope}",
@@ -126,17 +142,18 @@ class SetTimeFormat(Command[TimeFormatResult]):
 
 @dataclass(frozen=True, slots=True)
 class SetDateFormat(Command[DateFormatResult]):
-    """Set the LCD-overlay date pattern.
+    """Set every date element's pattern — on ``key``, or on every device.
 
-    ``key=None`` (the default) sets the global default + fans out to
-    every device; a specific ``key`` sets just that device.  Pattern
-    uses ICU-ish tokens (``yyyy/MM/dd``, ``dd.MM.yyyy``) translated by
-    ``_clock._translate_date_pattern`` to a Python strftime string.
+    Pattern uses ICU-ish tokens (``yyyy/MM/dd``, ``dd.MM.yyyy``) translated by
+    ``_clock._translate_date_pattern`` to the strftime pattern the element
+    carries.  Publishes ``OverlayChanged``.
     """
     fmt: str
     key: str | None = None
 
     def execute(self, app: App) -> DateFormatResult:
+        from ...services._clock import _translate_date_pattern
+
         log.info("SetDateFormat.execute: fmt=%r key=%s", self.fmt, self.key)
         if not self.fmt:
             log.warning("SetDateFormat.execute: empty fmt")
@@ -144,16 +161,8 @@ class SetDateFormat(Command[DateFormatResult]):
                 ok=False, key=self.key or "", fmt=self.fmt,
                 message="fmt must not be empty",
             )
-        if self.key is None:
-            keys = app.settings.set_global_date_format(self.fmt)
-            scope = f"global ({len(keys)} device(s))"
-        else:
-            app.settings.set_date_format(self.key, self.fmt)
-            keys = [self.key]
-            scope = self.key
-        for key in keys:
-            app.display.invalidate(key)
-            app.events.publish(DateFormatChanged(key=key, fmt=self.fmt))
+        scope = _set_clock_format(app, self.key, "date",
+                                  _translate_date_pattern(self.fmt))
         return DateFormatResult(
             ok=True, key=self.key or "", fmt=self.fmt,
             message=f"date format set to {self.fmt!r} for {scope}",
@@ -256,6 +265,7 @@ class SetDiskDevice(Command[DiskDeviceResult]):
         app.platform.sensors().set_preferred_disk(normalized)
         log.info("SetDiskDevice.execute: active disk -> %s",
                  normalized or "(hottest)")
+        app.events.publish(DiskDeviceChanged(disk_key=normalized))
         return DiskDeviceResult(
             ok=True, disk_key=normalized,
             message=(f"disk_temp now follows {normalized}" if normalized
@@ -591,10 +601,13 @@ class SetSensorDashboard(Command[SensorDashboardResult]):
             )
         app.sysinfo.panels = _copy_panels(list(self.panels))
         app.sysinfo.save()
+        # A FAN row rebound to a concrete fan picks the LCD's slot too (#145).
+        app.platform.sensors().set_fan_slot_pins(fan_slot_pins(app.sysinfo.panels))
         bound = sum(1 for p in app.sysinfo.panels
                     for b in p.sensors if b.sensor_id)
         log.info("SetSensorDashboard.execute: saved %d panel(s), %d bound row(s) → %s",
                  len(app.sysinfo.panels), bound, app.sysinfo.path)
+        app.events.publish(SensorDashboardChanged(panels=len(app.sysinfo.panels)))
         return SensorDashboardResult(
             ok=True,
             panels=_copy_panels(app.sysinfo.panels),
@@ -612,16 +625,28 @@ class DaemonStatus(Query[DaemonResult]):
 
     Cheap: a connect-test against the socket, no dispatch.
     """
+    #: about the App process — through the App it started one to answer.
+    RUNS_IN_CALLER: ClassVar[bool] = True
+    #: Answer for the process that executes this, never ask another.  What
+    #: ``daemon.running_status`` sends: without it, a process serving the
+    #: socket that is not marked as THE daemon (a test, a gui hosting the
+    #: server) asked itself back, recursing until the timeout.
+    here: bool = False
 
     def execute(self, app: App) -> DaemonResult:
         del app
         import os
 
-        from ...daemon import is_this_process_the_daemon, uptime_s
+        from ...daemon import is_this_process_the_daemon, running_status, uptime_s
         from ...ipc import daemon_running, socket_path
 
         running = daemon_running()
         path = socket_path()
+        if (running and not self.here and not is_this_process_the_daemon()
+                and (theirs := running_status()) is not None):
+            log.info("DaemonStatus.execute: the running App answered for "
+                     "itself: pid=%d version=%s", theirs.pid, theirs.version)
+            return theirs
         # "A daemon is running" and "I am it" are different facts.  Reporting
         # the caller's pid for the daemon's sends an ops script to signal the
         # wrong process; 0 says "ask the daemon" and dispatching this over the
@@ -629,60 +654,15 @@ class DaemonStatus(Query[DaemonResult]):
         am_daemon = is_this_process_the_daemon()
         pid = os.getpid() if am_daemon else 0
         uptime = uptime_s()
+        from ...__version__ import __version__
         log.info("DaemonStatus.execute: running=%s am_daemon=%s pid=%d "
-                 "uptime=%ds socket=%s", running, am_daemon, pid, uptime, path)
+                 "uptime=%ds socket=%s version=%s", running, am_daemon, pid,
+                 uptime, path, __version__)
         return DaemonResult(
             ok=True, running=running, socket_path=str(path),
-            pid=pid, uptime_seconds=uptime,
+            pid=pid, uptime_seconds=uptime, version=__version__,
             message=("Daemon is running" if running
                      else "No daemon is running"),
-        )
-
-@dataclass(frozen=True, slots=True)
-class EnsureDaemon(Command[DaemonResult]):
-    """Guarantee a daemon is reachable, starting one if it is not.
-
-    The whole shape a UI wants at boot: *is the daemon up?  no -- create it;
-    yes -- talk to it.*  Idempotent, so every UI can dispatch it
-    unconditionally without checking first.
-
-    **This is the lever for CPU.**  Today each UI that starts builds its own
-    ``App``: its own sensor poll, its own render pipeline, its own USB
-    handles.  Two UIs open means two of everything for one machine.  One
-    daemon and N thin clients means the work happens once no matter how many
-    windows, terminals or REST callers are attached.
-
-    Not a ``Platform`` capability -- the daemon is this application's own
-    software, not an OS facility, so it lives on the bus with everything else.
-    """
-    timeout: float = 10.0
-
-    def execute(self, app: App) -> DaemonResult:
-        del app
-        from ...daemon import ensure_daemon
-        from ...ipc import daemon_running, socket_path
-
-        was_running = daemon_running()
-        if was_running:
-            log.info("EnsureDaemon.execute: already running — nothing to do")
-            return DaemonResult(
-                ok=True, running=True, spawned=False,
-                socket_path=str(socket_path()),
-                message="Daemon already running",
-            )
-        log.info("EnsureDaemon.execute: no daemon — spawning one "
-                 "(timeout=%.1fs)", self.timeout)
-        started = ensure_daemon(timeout=self.timeout)
-        if not started:
-            # A UI that silently carries on in-process here would double the
-            # hardware work and never say so.
-            log.warning("EnsureDaemon.execute: spawn did not come up within "
-                        "%.1fs", self.timeout)
-        return DaemonResult(
-            ok=started, running=started, spawned=started,
-            socket_path=str(socket_path()),
-            message=("Started the background daemon" if started
-                     else f"Daemon did not come up within {self.timeout:.0f}s"),
         )
 
 @dataclass(frozen=True, slots=True)
@@ -692,22 +672,27 @@ class StopDaemon(Command[DaemonResult]):
     Idempotent: no daemon is a successful outcome, not an error, because the
     caller's intent ("there should be no daemon") is already satisfied.
     """
+    #: about the App process — through the App it started one to stop it.
+    RUNS_IN_CALLER: ClassVar[bool] = True
     timeout: float = 5.0
 
     def execute(self, app: App) -> DaemonResult:
         del app
         from ...daemon import kill_daemon
-        from ...ipc import socket_path
+        from ...ipc import daemon_running, socket_path
 
-        log.info("StopDaemon.execute: timeout=%.1fs", self.timeout)
+        was_running = daemon_running()
+        log.info("StopDaemon.execute: timeout=%.1fs was_running=%s",
+                 self.timeout, was_running)
         stopped = kill_daemon(timeout=self.timeout)
         if not stopped:
             log.warning("StopDaemon.execute: daemon still reachable after "
                         "%.1fs", self.timeout)
         return DaemonResult(
             ok=stopped, running=not stopped, socket_path=str(socket_path()),
-            message=("No daemon is running" if stopped
-                     else f"Daemon still running after {self.timeout:.0f}s"),
+            message=(f"Daemon still running after {self.timeout:.0f}s"
+                     if not stopped else "TRCC App stopped" if was_running
+                     else "No TRCC App was running"),
         )
 
 @dataclass(frozen=True, slots=True)
@@ -717,6 +702,8 @@ class RunSetup(Command[SetupResult]):
     ``dry_run`` prints what would be done and changes nothing.  It was
     ``interactive`` (inverted) until 2026-09-10 — see ``Platform.setup``.
     """
+    #: ``sudo`` needs the user's terminal; the App has none.
+    RUNS_IN_CALLER: ClassVar[bool] = True
     dry_run: bool = False
 
     def execute(self, app: App) -> SetupResult:
@@ -788,11 +775,15 @@ class GenerateDebugReport(Command[DebugReportPayload]):
     the bundle is rendered into memory only — useful for the API to
     return the text body directly.
     """
+    #: reads only the host + the SHARED log, so it works while the App is hung.
+    RUNS_IN_CALLER: ClassVar[bool] = True
     output_path: Path | None = None
     log_tail_lines: int = 1000
 
     def execute(self, app: App) -> DebugReportPayload:
-        rendered = app.diagnostics.debug_report(self.log_tail_lines)
+        held, probe = self._held_devices(app)
+        rendered = app.diagnostics.debug_report(self.log_tail_lines,
+                                                held=held, probe=probe)
         out: str = ""
         if self.output_path is not None:
             try:
@@ -814,6 +805,64 @@ class GenerateDebugReport(Command[DebugReportPayload]):
             ok=True, output_path=out, rendered_text=rendered,
             message=(f"Wrote debug report to {out}" if out
                      else "Generated debug report (in-memory)"),
+        )
+
+    @staticmethod
+    def _held_devices(app: App) -> tuple[dict[str, dict[str, str]], bool]:
+        """Handshakes of the panels an App holds, and whether to probe others.
+
+        This runs in the caller, so a live probe is a second handle on any
+        panel the App drives: busy at best, and on a HID-report panel the
+        probe's driver detach pulls usbhid from under the App.  The caller's
+        own App (an in-process gui) and a running App elsewhere both say what
+        they hold.  An App that runs but does not answer may hold every panel,
+        so then nothing is probed.
+        """
+        from ...daemon import held_devices, is_this_process_the_daemon
+        from ...ipc import daemon_running
+        from .device import DeviceState, ListDevices
+        states = [app.dispatch(DeviceState(key=entry.key))
+                  for entry in app.dispatch(ListDevices()).devices]
+        probe = True
+        if daemon_running() and not is_this_process_the_daemon():
+            if (theirs := held_devices()) is None:
+                probe = False
+            else:
+                states += theirs
+        held = {s.key: {
+            "pm": str(s.pm_byte), "sub": str(s.sub_byte),
+            "fbl": "?" if s.fbl is None else str(s.fbl),
+            "resolution": "x".join(map(str, s.resolution or (0, 0))),
+            "raw": "(held by the running App)",
+        } for s in states if s.ok and s.connected and s.pm_byte is not None}
+        log.info("GenerateDebugReport._held_devices: held=%s probe=%s",
+                 sorted(held), probe)
+        return held, probe
+
+
+@dataclass(frozen=True, slots=True)
+class ProvideApiTls(Command[ApiTlsResult]):
+    """The TLS files ``trcc api --tls`` serves, and the fingerprint to pin.
+
+    The user's own pair when both paths are given, else the self-signed pair in
+    the config directory — made once, reused until it expires, so a client's
+    pin survives restarts.  A Command rather than a CLI import of the adapter:
+    a UI never does the network and file work itself.
+    """
+    bind_host: str = "127.0.0.1"
+    cert: Path | None = None
+    key: Path | None = None
+
+    def execute(self, app: App) -> ApiTlsResult:
+        files = (app.tls.supplied(self.cert, self.key)
+                 if self.cert is not None and self.key is not None
+                 else app.tls.self_signed(app.platform.paths().config_dir() / "tls",
+                                          self.bind_host))
+        log.info("ProvideApiTls.execute: %s (sha256 %s)", files.cert, files.fingerprint)
+        return ApiTlsResult(
+            ok=True, cert=str(files.cert), key=str(files.key),
+            fingerprint=files.fingerprint,
+            message=f"TLS certificate SHA-256: {files.fingerprint}",
         )
 
 @dataclass(frozen=True, slots=True)
@@ -937,64 +986,48 @@ class CheckForUpdate(Query[UpdateCheckResult]):
         )
 
 @dataclass(frozen=True, slots=True)
-class RunUpgrade(Command[UpgradeResult]):
-    """Run the OS package-manager upgrade for trcc-linux.
+class UpdateStatus(Query[UpdateCheckResult]):
+    """What the App last heard about updates -- no network.
 
-    Maps the detected package manager to the right command and spawns a
-    subprocess.  We never pipe untrusted input — the argv is a fixed
-    list per package manager.  ``dry_run=True`` returns the command
-    without executing it so UIs can show the user what would run.
+    The App checks at session start and hourly (``UpdateWatch``); a window
+    opening reads this, then follows ``UpdateChecked``.  Before the first
+    answer: ``ok=False``, "not checked yet".
     """
-    dry_run: bool = False
+
+    def execute(self, app: App) -> UpdateCheckResult:
+        latest = app.update_watch.latest
+        log.debug("UpdateStatus: %s", latest)
+        if latest is not None:
+            return latest
+        from ... import __version__ as local
+        return UpdateCheckResult(ok=False, local_version=local,
+                                 message="Not checked yet")
+
+
+@dataclass(frozen=True, slots=True)
+class RunUpgrade(Command[UpgradeResult]):
+    """Say how to upgrade this install -- the command, for the user to run.
+
+    It used to RUN the OS package manager under sudo, and trcc-linux is in no
+    distro repo: ``apt upgrade -y trcc-linux`` upgraded the whole system and
+    reported success with trcc unchanged (measured: "23 upgraded", rc 0),
+    pacman did a partial ``-Syu`` then "target not found", and the API ran it
+    from an HTTP POST.  The Platform names the right command for how TRCC was
+    installed, and nothing is executed -- so the old ``dry_run`` field is
+    gone.  (It runs in the caller, so no older client sends it over IPC; the
+    CLI flag and the API body field are still accepted.)
+    """
+    #: The install that matters is the caller's -- the one the user typed into.
+    RUNS_IN_CALLER: ClassVar[bool] = True
 
     def execute(self, app: App) -> UpgradeResult:
-        import subprocess
-
-        # pm is observed (the diagnostics port reports it, and now delegates to
-        # the OS for the answer); the RECIPE comes from the OS itself, which
-        # used to be a module table keyed on the probed string.
-        pm = app.diagnostics.package_manager()
-        if not pm:
-            log.warning("RunUpgrade.execute: no package manager detected — "
-                        "cannot self-upgrade on this system")
-            return UpgradeResult(
-                ok=False, package_manager="",
-                message="No supported package manager detected on this system",
-            )
-        cmd = app.platform.upgrade_command()
-        if not cmd:
-            log.warning("RunUpgrade.execute: package manager %r has no upgrade "
-                        "recipe", pm)
-            return UpgradeResult(
-                ok=False, package_manager=pm,
-                message=f"No upgrade recipe for package manager {pm!r}",
-            )
-        log.info("RunUpgrade.execute: pm=%s cmd=%s", pm, cmd)
-        if self.dry_run:
-            return UpgradeResult(
-                ok=True, package_manager=pm, command=list(cmd),
-                message=f"Would run: {' '.join(cmd)}",
-            )
-        try:
-            proc = subprocess.run(
-                cmd, capture_output=True, text=True,
-                timeout=600.0, check=False,
-            )
-        except (FileNotFoundError, subprocess.SubprocessError, OSError) as e:
-            return UpgradeResult(
-                ok=False, package_manager=pm, command=list(cmd),
-                message=f"Upgrade subprocess failed: {type(e).__name__}: {e}",
-            )
+        method = app.platform.install_method()
+        hint = app.platform.upgrade_hint()
+        log.info("RunUpgrade.execute: %s install -> %s (shown, not run)",
+                 method, hint)
         return UpgradeResult(
-            ok=proc.returncode == 0,
-            package_manager=pm,
-            command=list(cmd),
-            stdout=proc.stdout,
-            stderr=proc.stderr,
-            exit_code=proc.returncode,
-            message=(f"Upgrade completed (exit {proc.returncode})"
-                     if proc.returncode == 0
-                     else f"Upgrade failed (exit {proc.returncode})"),
+            ok=True, package_manager=app.platform.package_manager(),
+            message=f"To upgrade TRCC ({method} install), run:\n  {hint}",
         )
 
 @dataclass(frozen=True, slots=True)
@@ -1009,9 +1042,8 @@ class AdvanceSlideshow(Command[SlideshowAdvanceResult]):
     rotation driver inside one UI.
 
     ``theme_name is None`` is the ordinary answer — the interval has not
-    elapsed.  The caller loads the named theme itself (``LoadTheme``) rather
-    than this Command doing it, so a UI can resolve the name against whatever
-    it is displaying before switching.
+    elapsed.  The caller (``SlideshowDriver``) resolves the name and loads it
+    with ``LoadTheme``.
 
     Per-tick, so logged at DEBUG.
     """
@@ -1028,6 +1060,14 @@ class AdvanceSlideshow(Command[SlideshowAdvanceResult]):
             return SlideshowAdvanceResult(
                 ok=True, key=self.key, due=False, running=False,
                 message="No slideshow configured",
+            )
+        if self.key in app.held:
+            # Not due, so neither timer loads a theme over the push -- and the
+            # cursor stays put rather than skipping a slide it never showed.
+            log.debug("AdvanceSlideshow: %s held by a pushed frame", self.key)
+            return SlideshowAdvanceResult(
+                ok=True, key=self.key, due=False, running=True,
+                message="Held by a pushed frame",
             )
         name = app.slideshow.advance(self.key, SlideshowConfig(
             enabled=True,
@@ -1048,78 +1088,6 @@ class AdvanceSlideshow(Command[SlideshowAdvanceResult]):
 
 
 @dataclass(frozen=True, slots=True)
-class StartSlideshowDriver(Command[SlideshowResult]):
-    """Rotate a configured slideshow on a cadence until stopped.
-
-    Without this, ``ConfigureSlideshow`` persists a slideshow that nothing ever
-    advances outside the gui: the gui runs its own ``QTimer``, and a slideshow
-    set up through the CLI or the REST API was saved, reported back correctly,
-    and never switched a theme.
-
-    Separate from ``ConfigureSlideshow`` for the reason
-    ``StartScreencastDriver`` is separate from ``StartScreencast`` — a gui
-    session already has a timer, so registering a driver there too would put two
-    rotators on one device. The clients without a timer ask explicitly.
-
-    Idempotent: the scheduler replaces a task registered under the same key.
-    """
-    key: str
-    interval_s: float = SLIDESHOW_POLL_S
-
-    def execute(self, app: App) -> SlideshowResult:
-        log.info("StartSlideshowDriver.execute: key=%s poll=%.3fs",
-                 self.key, self.interval_s)
-        s = app.settings.for_device(self.key)
-        if not s.slideshow_enabled or not s.slideshow_themes:
-            log.warning(
-                "StartSlideshowDriver: %s has no slideshow configured "
-                "(enabled=%s themes=%d) — configure one first",
-                self.key, s.slideshow_enabled, len(s.slideshow_themes),
-            )
-            return SlideshowResult(
-                ok=False, key=self.key,
-                enabled=s.slideshow_enabled,
-                interval_s=float(s.slideshow_interval_s),
-                themes=list(s.slideshow_themes),
-                message=(f"no slideshow configured on {self.key} — "
-                         "configure one before driving it"),
-            )
-
-        from ...services.slideshow_driver import SlideshowDriver
-
-        app.add_task(SlideshowDriver(app, self.key, self.interval_s))
-        return SlideshowResult(
-            ok=True, key=self.key, enabled=True,
-            interval_s=float(s.slideshow_interval_s),
-            themes=list(s.slideshow_themes),
-            message=f"driving slideshow on {self.key}",
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class StopSlideshowDriver(Command[SlideshowResult]):
-    """Stop the cadence started by :class:`StartSlideshowDriver`.
-
-    Idempotent — removing a task that was never registered is a no-op, which
-    matters because a client may stop a slideshow it did not drive.
-    """
-    key: str
-
-    def execute(self, app: App) -> SlideshowResult:
-        log.info("StopSlideshowDriver.execute: key=%s", self.key)
-        from ...services.slideshow_driver import task_key
-
-        app.remove_task(task_key(self.key))
-        s = app.settings.for_device(self.key)
-        return SlideshowResult(
-            ok=True, key=self.key, enabled=s.slideshow_enabled,
-            interval_s=float(s.slideshow_interval_s),
-            themes=list(s.slideshow_themes),
-            message=f"stopped driving slideshow on {self.key}",
-        )
-
-
-@dataclass(frozen=True, slots=True)
 class ConfigureSlideshow(Command[SlideshowResult]):
     """Set the slideshow theme list + interval for a device.
 
@@ -1127,6 +1095,7 @@ class ConfigureSlideshow(Command[SlideshowResult]):
     SlideshowService cursor so the next tick picks up the new list
     from index 0.
     """
+    REQUIRES: ClassVar[Capability | None] = Capability.THEME
     key: str
     themes: tuple[str, ...] | None = None
     interval_s: float | None = None
@@ -1149,11 +1118,20 @@ class ConfigureSlideshow(Command[SlideshowResult]):
             interval_s=self.interval_s,
         )
         app.slideshow.reset(self.key)
+        _publish_slideshow(app, self.key)
         return _slideshow_snapshot(app.settings, self.key)
 
 @dataclass(frozen=True, slots=True)
 class SetSlideshow(Command[SlideshowResult]):
-    """Toggle the slideshow on or off without changing the theme list."""
+    """Switch the slideshow on or off — and with it, the rotation.
+
+    On means rotating: the driver is registered here, not by a second Command
+    each UI paired by hand (``StartSlideshowDriver`` / ``StopSlideshowDriver``,
+    deleted), which the gui never did -- it ran its own timer instead.  The
+    driver also dispatches this, with ``enabled=False``, when another source
+    takes the panel.
+    """
+    REQUIRES: ClassVar[Capability | None] = Capability.THEME
     key: str
     enabled: bool
 
@@ -1162,6 +1140,8 @@ class SetSlideshow(Command[SlideshowResult]):
         app.settings.set_slideshow_enabled(self.key, self.enabled)
         if self.enabled:
             app.slideshow.reset(self.key)
+        _drive_slideshow(app, self.key)
+        _publish_slideshow(app, self.key)
         return _slideshow_snapshot(app.settings, self.key)
 
 @dataclass(frozen=True, slots=True)
@@ -1183,6 +1163,7 @@ class KeepAliveLoop(Command[KeepaliveResult]):
     ``metric_interval_s`` is accepted for API compatibility but unused — the
     metrics observer already re-renders on its own cadence.
     """
+    USES_DEVICE: ClassVar[bool] = True
     key: str
     count: int = 0
     interval_s: float = 0.150
@@ -1198,7 +1179,28 @@ class KeepAliveLoop(Command[KeepaliveResult]):
                 ok=False, key=self.key,
                 message=f"count must be >= 0, got {self.count}",
             )
+        # The device BEFORE the cache: a failed connect leaves no cache either,
+        # and "No cached frame" hid the reason ("permission denied …").
+        try:
+            _require_connected_device(app, self.key)
+        except (DeviceNotFoundError, DeviceNotConnectedError) as e:
+            log.warning("KeepAliveLoop.execute: %s — %s", self.key, e)
+            return KeepaliveResult(ok=False, key=self.key, message=str(e))
         sender = app.senders.get(self.key)
+        if sender is None or sender.last() is None:
+            # Nothing to resend: show the saved display once, and resend THAT.
+            # A panel with a frame -- a push, a theme already showing -- is left
+            # alone.  The CLI used to restore unconditionally before this, and
+            # since RestoreDeviceState always restores, `trcc display keepalive`
+            # threw a pushed image away in daemon mode (#267).  Deciding here
+            # makes the CLI and the API the same one Command.
+            log.info("KeepAliveLoop.execute: %s has nothing to resend — "
+                     "showing its saved display first", self.key)
+            restore = app.dispatch(RestoreDeviceState(key=self.key))
+            if not restore.ok:
+                return KeepaliveResult(ok=False, key=self.key,
+                                       message=restore.message)
+            sender = app.senders.get(self.key)
         if sender is None or sender.last() is None:
             log.warning("KeepAliveLoop.execute: %s has no cached frame "
                         "(sender=%s) — render once before keepalive",
@@ -1207,15 +1209,6 @@ class KeepAliveLoop(Command[KeepaliveResult]):
                 ok=False, key=self.key,
                 message=("No cached frame for keepalive — render at least "
                          "once first"),
-            )
-        try:
-            device = app.get(self.key)
-        except DeviceNotFoundError as e:
-            return KeepaliveResult(ok=False, key=self.key, message=str(e))
-        if not device.is_connected:
-            return KeepaliveResult(
-                ok=False, key=self.key,
-                message=f"{self.key} not connected — dispatch ConnectDevice first",
             )
 
         if self.count >= 1:
@@ -1245,13 +1238,14 @@ class GetPlatformInfo(Query[PlatformInfoResult]):
     def execute(self, app: App) -> PlatformInfoResult:
         p = app.platform
         paths = p.paths()
+        server = p.display_session().server.value
         # One-shot and pure gold in a report: which distro, how it was
         # installed, and every path the app resolved to on THIS machine.
         log.info("GetPlatformInfo.execute: distro=%s install=%s config=%s "
-                 "data=%s user=%s log=%s warnings=%s minimize_on_close=%s",
+                 "data=%s user=%s log=%s warnings=%s display=%s",
                  p.distro_name(), p.install_method(), paths.config_dir(),
                  paths.data_dir(), paths.user_content_dir(), paths.log_file(),
-                 p.check_permissions(), p.minimize_on_close())
+                 p.check_permissions(), server)
         return PlatformInfoResult(
             ok=True,
             message=f"Platform: {p.distro_name()}",
@@ -1263,7 +1257,7 @@ class GetPlatformInfo(Query[PlatformInfoResult]):
             log_file=str(paths.log_file()),
             permission_warnings=p.check_permissions(),
             no_devices_hint=p.no_devices_hint(),
-            minimize_on_close=p.minimize_on_close(),
+            display_server=server,
         )
 
 @dataclass(frozen=True, slots=True)
@@ -1275,13 +1269,14 @@ class GetAutostartStatus(Query[AutostartResult]):
         enabled = mgr.is_enabled()
         path = _autostart_path(app)
         target = mgr.installed_target() or ""
-        log.debug("GetAutostartStatus.execute: enabled=%s target=%s path=%s",
-                  enabled, target, path)
+        configured = app.settings.app.autostart_configured
+        log.debug("GetAutostartStatus.execute: enabled=%s target=%s path=%s "
+                  "configured=%s", enabled, target, path, configured)
         return AutostartResult(
             ok=True,
             message=(f"enabled ({target})" if enabled and target
                      else "enabled" if enabled else "disabled"),
-            enabled=enabled, path=path, target=target,
+            enabled=enabled, path=path, target=target, configured=configured,
         )
 
 @dataclass(frozen=True, slots=True)
@@ -1307,13 +1302,15 @@ class EnableAutostart(Command[AutostartResult]):
             )
         mgr = app.platform.autostart()
         mgr.enable(self.target)
+        app.settings.mark_autostart_configured()
         installed = mgr.installed_target() or ""
         log.info("EnableAutostart.execute: enabled=%s target=%s at %s",
                  mgr.is_enabled(), installed, _autostart_path(app))
+        app.events.publish(AutostartChanged(enabled=mgr.is_enabled()))
         return AutostartResult(
             ok=True, message=f"autostart enabled ({installed or 'default'})",
             enabled=mgr.is_enabled(), path=_autostart_path(app),
-            target=installed,
+            target=installed, configured=True,
         )
 
 @dataclass(frozen=True, slots=True)
@@ -1323,11 +1320,14 @@ class DisableAutostart(Command[AutostartResult]):
     def execute(self, app: App) -> AutostartResult:
         mgr = app.platform.autostart()
         mgr.disable()
+        app.settings.mark_autostart_configured()
         log.info("DisableAutostart.execute: now enabled=%s at %s",
                  mgr.is_enabled(), _autostart_path(app))
+        app.events.publish(AutostartChanged(enabled=mgr.is_enabled()))
         return AutostartResult(
             ok=True, message="autostart disabled",
             enabled=mgr.is_enabled(), path=_autostart_path(app),
+            configured=True,
         )
 
 @dataclass(frozen=True, slots=True)

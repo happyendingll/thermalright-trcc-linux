@@ -14,8 +14,11 @@ then reads the ACTUAL widget state (gauge ``_text`` + preview ``_colors``) — w
 the user sees — and prints it.  Answers "do metrics + preview populate for this
 device" with no guessing.
 
-    PYTHONPATH=src QT_QPA_PLATFORM=offscreen python3.12 dev/tools/diagnose_metrics.py
-    PYTHONPATH=src QT_QPA_PLATFORM=offscreen python3.12 dev/tools/diagnose_metrics.py 0416:8001 3
+    env -u WAYLAND_DISPLAY PYTHONPATH=src xvfb-run -a python3.12 dev/tools/diagnose_metrics.py
+    env -u WAYLAND_DISPLAY PYTHONPATH=src xvfb-run -a python3.12 dev/tools/diagnose_metrics.py 0416:8001 3
+
+Under Xvfb, never ``QT_QPA_PLATFORM=offscreen``: the app pops that variable
+(``ui/qapp.py``), so the window would open on the real desktop.
 """
 from __future__ import annotations
 
@@ -35,7 +38,7 @@ def _say(msg: str) -> None:
 
 
 def _summon(window, vid: int, pid: int, pm: int, sub: int) -> str:
-    from _mock_bootstrap import select_device, summon_variant
+    from _mock_bootstrap import app_behind, select_device, summon_variant
 
     from trcc.core.protocol import pm_to_fbl
 
@@ -43,7 +46,7 @@ def _summon(window, vid: int, pid: int, pm: int, sub: int) -> str:
     fbl = pm_to_fbl(pm, sub)
     _say(f"\n— summon {key} pm={pm} sub={sub} fbl={fbl} —")
     # The mock answers the handshake as this cooler; the app does the rest.
-    r = summon_variant(window._app, vid, pid, pm=pm, sub=sub, fbl=fbl)
+    r = summon_variant(app_behind(window), vid, pid, pm=pm, sub=sub, fbl=fbl)
     _say(f"connect ok={getattr(r, 'ok', None)}")
     select_device(window, key)
     h = window._handlers.get(key)

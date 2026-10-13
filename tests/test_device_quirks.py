@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import pytest
 
+from trcc.core.errors import HandshakeError
 from trcc.core.models import (
     DeviceInfo,
     DeviceQuirks,
@@ -31,7 +32,7 @@ def test_warframe_se_407_opts_into_every_quirk() -> None:
     q = quirks_for(*_WF_SE)
     assert q == DeviceQuirks(
         hid_reports=True, skip_init=True, short_handshake=True,
-        portrait_native=True, keepalive_stream=True,
+        portrait_native=True, keepalive_stream=True, single_session=True,
     )
 
 
@@ -111,6 +112,22 @@ def test_streaming_connect_skips_init_and_pins_portrait(monkeypatch) -> None:
     assert dev.profile is not None and dev.profile.rotate is False
 
 
+def test_streaming_connect_keeps_the_sub_byte(monkeypatch) -> None:
+    """The streaming reply carries SUB at [4]; the profile must too.  It was
+    resolved with ``get_profile(fbl, pm)``, so SUB defaulted to 0 -- the #290
+    shape, moot only while no streaming panel has a SUB-dependent angle."""
+    monkeypatch.setattr("trcc.adapters.device.hid_lcd.time.sleep", lambda *_: None)
+    transport = FakeBulkTransport()
+    transport.read_script = [bytes([0xDA, 0xDB, 0xDC, 0xDD, 0x05, 0x3A, 0x00, 0x00])]
+    dev = _make_type2(transport)
+    dev.set_quirks(quirks_for(*_WF_SE))
+
+    result = dev.connect()
+
+    assert result.sub_byte == 5
+    assert dev.profile is not None and dev.profile.sub == 5
+
+
 def test_a_silent_quirked_panel_falls_through_to_the_standard_handshake(
     monkeypatch,
 ) -> None:
@@ -151,6 +168,64 @@ def test_a_silent_quirked_panel_falls_through_to_the_standard_handshake(
     assert transport.writes, "the fall-through must send the standard init packet"
 
 
+def _trofeo_reply() -> bytes:
+    """The full type-2 reply a 1280x480 Trofeo Vision gives (PM=128 SUB=1)."""
+    full = bytearray(512)
+    full[0:4] = b"\xda\xdb\xdc\xdd"
+    full[4], full[5], full[12] = 1, 128, 0x01
+    return bytes(full)
+
+
+def _trofeo(tmp_path, script: list[bytes], settles: list[float], monkeypatch):
+    """A 0x0407-fingerprint panel with a state dir; sleeps are recorded."""
+    monkeypatch.setattr("trcc.adapters.device.hid_lcd.time.sleep", settles.append)
+    transport = FakeBulkTransport()
+    transport.read_script = list(script)
+    dev = _make_type2(transport)
+    dev.set_quirks(quirks_for(*_WF_SE))
+    dev.set_state_dir(tmp_path)
+    return dev
+
+
+def test_a_unit_that_answered_the_ordinary_handshake_skips_the_probe_next_time(
+    tmp_path, monkeypatch,
+) -> None:
+    """Silence costs a 3 s settle + a 5 s read on EVERY connect -- 8 s per CLI
+    command in the #267 reporter's log.  Once this unit has proved it is not the
+    quirk's firmware, later connects go straight to the ordinary handshake."""
+    first: list[float] = []
+    assert _trofeo(tmp_path, [b"", _trofeo_reply()], first, monkeypatch
+                   ).connect().resolution == (1280, 480)
+    assert 3.0 in first, "the first connect must still probe"
+
+    later: list[float] = []
+    result = _trofeo(tmp_path, [_trofeo_reply()], later, monkeypatch).connect()
+    assert result.resolution == (1280, 480)
+    assert 3.0 not in later, "a remembered unit must not pay the probe again"
+
+
+def test_a_real_streaming_panel_is_never_remembered_silent(tmp_path, monkeypatch) -> None:
+    """The quirk's own firmware answers the probe, so nothing is recorded and
+    the next connect probes again."""
+    settles: list[float] = []
+    _trofeo(tmp_path, [_short_reply()], settles, monkeypatch).connect()
+    again: list[float] = []
+    assert _trofeo(tmp_path, [_short_reply()], again, monkeypatch
+                   ).connect().resolution == (240, 320)
+    assert 3.0 in again
+
+
+def test_a_remembered_unit_that_stops_answering_is_forgotten(tmp_path, monkeypatch) -> None:
+    """A memory is a hint: if the ordinary handshake fails (a real streaming
+    panel swapped onto that port), the next connect probes again."""
+    _trofeo(tmp_path, [b"", _trofeo_reply()], [], monkeypatch).connect()
+    with pytest.raises(HandshakeError):
+        _trofeo(tmp_path, [b""] * 8, [], monkeypatch).connect()
+    settles: list[float] = []
+    _trofeo(tmp_path, [b"", _trofeo_reply()], settles, monkeypatch).connect()
+    assert 3.0 in settles
+
+
 # ── Seam 5: keepalive ─────────────────────────────────────────────────
 
 
@@ -159,6 +234,77 @@ def test_keepalive_stream_quirk_marks_needs_keepalive() -> None:
     assert dev.needs_keepalive is False           # HID wire is not volatile
     dev.set_quirks(quirks_for(*_WF_SE))
     assert dev.needs_keepalive is True
+
+
+# ── Seam 6: single session is EARNED by the short reply (#283) ───────
+
+
+class _StaleOnce(FakeBulkTransport):
+    """A handle that goes stale once armed -- the first write raises EIO, as
+    after a resume -- and counts how often it is reopened."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.stale = False
+        self.opens = 0
+
+    def open(self) -> bool:
+        self.opens += 1
+        return super().open()
+
+    def write(self, endpoint: int, data, timeout_ms: int = 100) -> int:
+        if self.stale:
+            self.stale = False
+            raise OSError(5, "Input/output error")
+        return super().write(endpoint, data, timeout_ms)
+
+
+def _quirked(tmp_path, monkeypatch, script: list[bytes]) -> tuple:
+    monkeypatch.setattr("trcc.adapters.device.hid_lcd.time.sleep",
+                        lambda *_: None)
+    transport = _StaleOnce()
+    transport.read_script = list(script)
+    dev = _make_type2(transport)
+    dev.set_quirks(quirks_for(*_WF_SE))
+    dev.set_state_dir(tmp_path)
+    dev.connect()
+    return dev, transport
+
+
+def _write_after_stale(dev, transport) -> bool:
+    transport.stale = True
+    opens = transport.opens
+    ok = dev._send_with_recovery(lambda: transport.write(1, b"frame") > 0)
+    return ok, transport.opens - opens
+
+
+def test_a_407_panel_that_answers_the_handshake_may_reconnect(
+    tmp_path, monkeypatch,
+) -> None:
+    """#283: a 0416:5302 firmware-4.07 panel that is NOT the Warframe SE --
+    silent to the probe, then a full PM 52 reply to the ordinary handshake --
+    got the SE's "never reconnect", so one stale handle meant 0 frames until
+    a replug.  Taking the init packet proves it is not that firmware."""
+    full = bytearray(512)
+    full[0:4] = b"\xda\xdb\xdc\xdd"
+    full[4], full[5], full[12] = 0, 52, 0x01
+    # probe: silent; handshake; then the reconnect's handshake
+    dev, transport = _quirked(tmp_path, monkeypatch,
+                              [b"", bytes(full), bytes(full)])
+
+    assert dev.quirks.single_session is False
+    assert dev.needs_keepalive is True          # resending stays: it blanks
+    assert _write_after_stale(dev, transport) == (True, 1)
+
+
+def test_the_warframe_se_still_never_reconnects(tmp_path, monkeypatch) -> None:
+    """The panel that volunteered the short reply IS the single-session
+    firmware: a reopen wedges it (#228), so a failed write soft-fails and
+    the keepalive resends."""
+    dev, transport = _quirked(tmp_path, monkeypatch, [_short_reply()])
+
+    assert dev.quirks.single_session is True
+    assert _write_after_stale(dev, transport) == (False, 0)
 
 
 # ── Isolation: a normal Type-2 device is completely unaffected ────────
@@ -303,17 +449,10 @@ def test_the_quirk_transport_is_tried_only_after_the_ordinary_one_fails(
     from trcc.adapters.device.hid_lcd import HidLcd
     from trcc.core.commands import ConnectDevice
     from trcc.core.errors import HandshakeError
-    from trcc.core.models import Wire
 
+    # The override transport comes from MockPlatform, scripted like the
+    # ordinary one, so no hidapi is needed for a test about the RETRY.
     app = _quirk_app(tmp_path, scanned=False)
-    # hidapi is not installed in the test environment, and this test is about
-    # the RETRY, not about hidapi — so stand the override transport in with the
-    # same scripted one the ordinary path uses.
-    monkeypatch.setattr(
-        "trcc.adapters.device.transport.HidApiTransport",
-        lambda vid, pid, serial=None: app.platform.open_transport(
-            Wire.HID, vid, pid),
-    )
     real_connect = HidLcd.connect
     attempts = []
 
@@ -330,3 +469,63 @@ def test_the_quirk_transport_is_tried_only_after_the_ordinary_one_fails(
     assert len(attempts) == 2, "the override should have earned one retry"
     assert attempts[0] is not attempts[1], "the retry must rebuild the device"
     assert result.ok, f"the retry should have recovered: {result.message}"
+
+
+def test_the_quirk_transport_is_opened_by_the_platform(tmp_path, monkeypatch) -> None:
+    """The override transport comes from the Platform, so a stand-in scripts it.
+
+    MUTATION CHECK: build ``HidApiTransport`` in ``App.attach`` again -> the
+    sentinel below raises.
+    """
+    import trcc.adapters.device.transport as transport_mod
+
+    def real_hidapi(*a, **k):
+        raise AssertionError("a real hidapi transport was built")
+
+    monkeypatch.setattr(transport_mod, "HidApiTransport", real_hidapi)
+    app = _quirk_app(tmp_path, scanned=True)
+    asked: list[dict] = []
+    opener = app.platform.open_transport
+
+    def spy(*a, **k):
+        asked.append(k)
+        return opener(*a, **k)
+
+    monkeypatch.setattr(app.platform, "open_transport", spy)
+
+    app.attach(0x0416, 0x5302, quirk_transport=True)
+
+    assert asked and asked[-1].get("hid_reports") is True
+
+
+def test_the_quirk_retry_keeps_what_the_panel_shows(tmp_path, monkeypatch) -> None:
+    """The retry rebuilds the DEVICE; the theme it was showing is not its to drop.
+
+    MUTATION CHECK: ``app.detach`` before the retry again and a reconnect of a
+    quirked panel comes back with no theme -- and no cast, slideshow or stream.
+    """
+    from pathlib import Path
+
+    from trcc.adapters.device.hid_lcd import HidLcd
+    from trcc.core.commands import ConnectDevice
+    from trcc.core.errors import HandshakeError
+    from trcc.core.models import Theme
+
+    app = _quirk_app(tmp_path, scanned=False)
+    real_connect = HidLcd.connect
+    attempts: list[object] = []
+
+    def failing_first(self):  # type: ignore[no-untyped-def]
+        attempts.append(self)
+        if len(attempts) == 1:
+            raise HandshakeError("ordinary transport said nothing")
+        return real_connect(self)
+
+    monkeypatch.setattr(HidLcd, "connect", failing_first)
+    theme = Theme(path=Path("/nonexistent/shown"), name="Shown",
+                  resolution=(320, 240))
+    app.active_themes["0416:5302"] = theme
+
+    assert app.dispatch(ConnectDevice(key="0416:5302")).ok
+
+    assert app.active_themes.get("0416:5302") is theme

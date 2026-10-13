@@ -200,13 +200,15 @@ class Layout:
     # (preview ends y=648; the bottom control row sits at y=680).
     DEVICE_INFO = (16, 712, 500, 44)
 
-    # Bottom control buttons (within form_container)
+    # Bottom control row (within form_container) -- FormCZTV 2.1.8: the
+    # brightness slider ``ucScrollB1`` (164, 680) 180x24, the theme name
+    # ``textBoxCMM`` (378, 684) 102x16, save ``buttonBCZT`` (482, 680) 24x24.
+    # 2.1.8 hid the form's export / import (y=880) and kept the pair on the
+    # local-theme panel (UCThemeLocal 441,28 / 482,28), where the gui has them.
     ROTATION_COMBO = (39, 680, 108, 24)
-    BRIGHTNESS_BTN = (157, 680, 52, 24)
-    THEME_NAME_INPUT = (278, 684, 102, 16)
-    SAVE_BTN = (383, 680, 24, 24)
-    EXPORT_BTN = (412, 680, 40, 24)
-    IMPORT_BTN = (453, 680, 40, 24)
+    BRIGHTNESS_SLIDER = (164, 680, 180, 24)
+    THEME_NAME_INPUT = (378, 684, 102, 16)
+    SAVE_BTN = (482, 680, 24, 24)
 
     # Title bar buttons (within form_container)
     HELP_BTN = (1162, 24, 40, 40)
@@ -215,14 +217,14 @@ class Layout:
     # Sensor button (within sidebar)
     SENSOR_BTN = (25, 100, 140, 50)
     ABOUT_BTN = (25, 730, 140, 50)
-    DEVICE_AREA = (0, 160, 180, 560)
+    # RGB Lighting sits above About; the device list scrolls in what is left.
+    RGB_BTN = (25, 670, 140, 50)
+    DEVICE_AREA = (0, 160, 180, 500)
     NO_DEVICES_LABEL = (25, 10, 140, 50)
     HINT_LABEL = (15, 55, 150, 40)
 
     # UCThemeLocal filter buttons
     LOCAL_BTN_ALL = (21, 29, 63, 18)
-    LOCAL_BTN_DEFAULT = (121, 29, 63, 18)
-    LOCAL_BTN_USER = (221, 29, 63, 18)
 
     # UCThemeWeb category buttons
     WEB_CATEGORIES = [
@@ -259,7 +261,8 @@ class Layout:
     COLOR_Y_SPIN = (121, 32, 53, 19)
     COLOR_FONT_BTN = (12, 87, 125, 24)
     COLOR_FONT_SIZE_SPIN = (140, 89, 42, 20)
-    COLOR_AREA = (8, 139, 214, 136)
+    COLOR_AREA = (8, 139, 214, 136)        # UCColorC, the colour square
+    COLOR_HUE = (65, 273, 158, 19)         # UCColorB, the hue strip
     COLOR_R = (83, 304, 36, 16)
     COLOR_G = (132, 304, 36, 16)
     COLOR_B = (181, 304, 36, 16)

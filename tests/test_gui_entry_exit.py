@@ -9,6 +9,8 @@ it as "Failed to execute script".  ``SystemExit`` (a ``BaseException``, not an
 """
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 
@@ -86,8 +88,7 @@ def test_gui_direct_entry_shows_window(monkeypatch: pytest.MonkeyPatch) -> None:
 # runs — the metrics thread kept polling, the panel stayed lit and /dev/sgN
 # stayed held.  gui always called ``app.quit()`` here; qtgui did not.
 #
-# Exercised on an uninitialised instance (the pattern in
-# test_qtgui_video_ticker): closeEvent touches only _tray / _ticker / _video.
+# Exercised on an uninitialised instance: closeEvent touches only _tray.
 # ─────────────────────────────────────────────────────────────────────
 
 
@@ -113,12 +114,14 @@ class _FakeTray:
         return self._divert
 
 
-class _StopCounter:
-    def __init__(self) -> None:
-        self.stopped = 0
+class _FakeFleet:
+    """Records whether the window took its screencast frames down."""
 
-    def stop(self) -> None:
-        self.stopped += 1
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def _make_window(*, divert: bool):
@@ -126,8 +129,7 @@ def _make_window(*, divert: bool):
 
     win = MainWindow.__new__(MainWindow)
     win._tray = _FakeTray(divert=divert)      # type: ignore[attr-defined]
-    win._ticker = _StopCounter()              # type: ignore[attr-defined]
-    win._video = {"0402:3922": _StopCounter()}  # type: ignore[attr-defined]
+    win._viewfinders = _FakeFleet()           # type: ignore[attr-defined]
     return win
 
 
@@ -164,8 +166,7 @@ def test_qtgui_genuine_close_quits_the_event_loop(
         "a genuine close did not quit the event loop — qapp.exec() never "
         "returns, so App.close() (panel blank + device release) never runs"
     )
-    assert win._ticker.stopped == 1              # type: ignore[attr-defined]
-    assert win._video["0402:3922"].stopped == 1  # type: ignore[attr-defined]
+    assert win._viewfinders.closed, "quitting left the screencast frames up"
 
 
 def test_qtgui_close_to_tray_does_not_quit(
@@ -185,7 +186,7 @@ def test_qtgui_close_to_tray_does_not_quit(
 
     assert quits == [], "a close diverted to the tray must NOT quit the app"
     assert event.accepted is False
-    assert win._ticker.stopped == 0              # type: ignore[attr-defined]
+    assert not win._viewfinders.closed, "hiding to the tray took the frames down"
 
 
 # ── The console scripts skip typer's root callback (and its logging) ──────
@@ -245,10 +246,9 @@ def test_direct_entry_does_not_downgrade_an_explicit_verbosity() -> None:
     """
     import logging
 
-    from typer.testing import CliRunner
-
     import trcc.ui.gui as gui_mod
-    from trcc.ui.cli.main import app, gui
+    from trcc.adapters.infra.logging import ensure_configured
+    from trcc.ui.cli.main import gui
 
     def _stderr_level() -> int:
         # The ROOT level is DEBUG at EVERY rung by design — the file always
@@ -265,7 +265,11 @@ def test_direct_entry_does_not_downgrade_an_explicit_verbosity() -> None:
                     if getattr(h, _HANDLER_TAG, False)
                     and not isinstance(h, logging.FileHandler))
 
-    CliRunner().invoke(app, ["-vv", "version"])
+    # Exactly what the CLI's ``-vv`` does (``_root``).  Not through CliRunner:
+    # it binds the terminal handler to its own stderr and CLOSES that when the
+    # command returns, so every DEBUG line after it -- ``gui()``'s -- wrote to a
+    # closed stream (tests/conftest.py ``_no_logging_error_in_a_test``).
+    ensure_configured(2, force=True)
     assert _stderr_level() == logging.DEBUG, (
         "precondition: -vv puts stderr at DEBUG"
     )
@@ -282,3 +286,82 @@ def test_direct_entry_does_not_downgrade_an_explicit_verbosity() -> None:
         "a direct-entry launch re-configured logging and threw away the "
         "user's -vv — stderr fell back to the default rung"
     )
+
+
+# =========================================================================
+# Closing the window hides to the tray — on every OS, every time
+# =========================================================================
+
+
+def test_closing_after_a_taskbar_restore_still_hides_to_the_tray(
+    qtbot: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Measured on the win11 VM: Windows MINIMISED on close behind a flag only
+    a tray restore cleared, so restore from the taskbar + close again QUIT the
+    app.  The C# oracle's close button just hides (``Form1.cs:784``).  Only
+    the tray's Exit may quit.  The offscreen platform has no tray, so the test
+    says there is one — what is under test is the decision, not Qt's tray."""
+    from PySide6.QtGui import QCloseEvent, QIcon
+    from PySide6.QtWidgets import QSystemTrayIcon, QWidget
+
+    from trcc.ui.qt_tray import TrayController
+
+    monkeypatch.setattr(QSystemTrayIcon, "isSystemTrayAvailable",
+                        staticmethod(lambda: True))
+    monkeypatch.setattr(QSystemTrayIcon, "isVisible", lambda self: True)
+
+    quits: list[int] = []
+
+    class Window(QWidget):
+        def closeEvent(self, event: QCloseEvent) -> None:
+            if tray.intercept_close(event):
+                return
+            quits.append(1)
+            event.accept()
+
+    window = Window()
+    qtbot.addWidget(window)
+    tray = TrayController(window, icon=QIcon())
+    tray.install()
+    window.show()
+
+    for _ in range(3):
+        window.close()                  # the user closes the window
+        assert quits == [] and not window.isVisible(), "a close quit the app"
+        window.showNormal()             # ...restores it from the TASKBAR
+
+    tray.request_quit()                 # only Exit quits
+    assert quits == [1]
+
+
+@pytest.mark.parametrize(("face", "module", "factory"), [
+    ("GuiUI", "trcc.ui.gui.splash", "run_bootstrap_with_splash"),
+    ("QtGuiUI", "trcc.ui.qtgui.splash", "show_splash"),
+])
+@pytest.mark.parametrize("hidden", [True, False], ids=["resume", "normal"])
+def test_a_hidden_start_shows_no_splash_and_still_brings_the_session_up(
+    monkeypatch: pytest.MonkeyPatch, qapp: Any, face: str, module: str,
+    factory: str, hidden: bool,
+) -> None:
+    """``--resume`` (autostart, hidden in the tray) flashed a splash at login
+    in both skins.  The C# never shows one: ``FormStart`` is hidden 1 ms after
+    it is shown (``Form1.cs:519-521``).  A hidden start skips it and takes the
+    shared bring-up; a normal start keeps it.
+
+    MUTATION CHECK -- MEASURED 2026-10-02: drop either skin's ``start_hidden``
+    branch → that skin's ``resume`` case fails.
+    """
+    import importlib
+    from unittest import mock
+
+    from trcc.ui import _uis
+
+    shown: list[str] = []
+    monkeypatch.setattr(importlib.import_module(module), factory,
+                        lambda *_a, **_kw: shown.append(factory) or True)
+    ui = getattr(_uis, face)(start_hidden=hidden)
+    ui._composed = mock.MagicMock()
+
+    assert ui.bring_up() is True
+    assert shown == ([] if hidden else [factory])
+    ui._composed.start_session.assert_called_once()

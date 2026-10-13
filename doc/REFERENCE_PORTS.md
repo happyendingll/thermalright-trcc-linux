@@ -6,51 +6,58 @@ Every abstract contract in the tree: what a new implementation must write, what 
 
 Ordered **cheapest to extend first** — the ports at the top are where this codebase welcomes a contributor, the ones at the bottom are where it does not yet.
 
-41 ports.
+48 ports.
 
 | port | implement | inherit | implementations |
 |---|---|---|---|
-| [`BaseSendTask`](#basesendtask) | 1 | 3 | 2 |
-| [`Command`](#command) | 1 | 0 | 145 |
+| [`BaseSendTask`](#basesendtask) | 1 | 4 | 5 |
+| [`Command`](#command) | 1 | 1 | 150 |
 | [`CpuSource`](#cpusource) | 1 | 4 | 10 |
 | [`DataInstaller`](#datainstaller) | 1 | 0 | 1 |
-| [`HttpFetcher`](#httpfetcher) | 1 | 0 | 1 |
+| [`HttpFetcher`](#httpfetcher) | 1 | 0 | 2 |
 | [`MissPolicy`](#misspolicy) | 1 | 0 | 2 |
-| [`Query`](#query) | 1 | 0 | 39 |
+| [`Query`](#query) | 1 | 0 | 43 |
 | [`ScreenCapture`](#screencapture) | 1 | 1 | 3 |
-| [`UserInterface`](#userinterface) | 1 | 7 | 5 |
-| [`_HidBinding`](#_hidbinding) | 1 | 0 | 2 |
-| [`_QtUI`](#_qtui) | 1 | 1 | 2 |
+| [`UserInterface`](#userinterface) | 1 | 11 | 5 |
+| [`_QtUI`](#_qtui) | 1 | 3 | 2 |
 | [`DataInstallRunner`](#datainstallrunner) | 2 | 0 | 2 |
-| [`IdentifiedSource`](#identifiedsource) | 2 | 0 | 17 |
+| [`IdentifiedSource`](#identifiedsource) | 2 | 0 | 19 |
 | [`SingleFileTheme`](#singlefiletheme) | 2 | 0 | 1 |
+| [`TlsIdentity`](#tlsidentity) | 2 | 0 | 1 |
 | [`VideoExportRunner`](#videoexportrunner) | 2 | 0 | 2 |
+| [`_HidBinding`](#_hidbinding) | 2 | 0 | 2 |
 | [`_MappingPort`](#_mappingport) | 2 | 0 | 2 |
 | [`BaseBulkDevice`](#basebulkdevice) | 3 | 0 | 4 |
 | [`BaseDevice`](#basedevice) | 3 | 4 | 5 |
 | [`BoardTempSource`](#boardtempsource) | 3 | 0 | 1 |
-| [`Device`](#device) | 3 | 13 | 5 |
+| [`CommandBus`](#commandbus) | 3 | 1 | 7 |
+| [`Device`](#device) | 3 | 14 | 5 |
 | [`DiskSource`](#disksource) | 3 | 0 | 2 |
 | [`DramSource`](#dramsource) | 3 | 0 | 1 |
-| [`FanSource`](#fansource) | 3 | 1 | 3 |
-| [`GpuSource`](#gpusource) | 3 | 7 | 10 |
+| [`FanSource`](#fansource) | 3 | 2 | 3 |
+| [`GpuSource`](#gpusource) | 3 | 10 | 11 |
 | [`HotplugMonitor`](#hotplugmonitor) | 3 | 0 | 5 |
+| [`RamAccess`](#ramaccess) | 3 | 0 | 2 |
+| [`RgbMirror`](#rgbmirror) | 3 | 0 | 3 |
 | [`SendScheduler`](#sendscheduler) | 3 | 0 | 2 |
+| [`VoltageSource`](#voltagesource) | 3 | 0 | 1 |
 | [`_SharedRotatingFileHandler`](#_sharedrotatingfilehandler) | 3 | 4 | 2 |
 | [`CloudCatalog`](#cloudcatalog) | 4 | 0 | 1 |
 | [`MemorySource`](#memorysource) | 4 | 0 | 2 |
 | [`PackageManager`](#packagemanager) | 4 | 0 | 2 |
 | [`Paths`](#paths) | 4 | 10 | 5 |
-| [`SendTask`](#sendtask) | 4 | 0 | 3 |
+| [`SendTask`](#sendtask) | 4 | 1 | 6 |
+| [`SmBus`](#smbus) | 4 | 0 | 1 |
 | [`BulkTransport`](#bulktransport) | 5 | 0 | 2 |
+| [`RamLights`](#ramlights) | 5 | 0 | 1 |
 | [`ScsiTransport`](#scsitransport) | 5 | 0 | 3 |
-| [`AutostartManager`](#autostartmanager) | 6 | 0 | 4 |
+| [`AutostartManager`](#autostartmanager) | 6 | 0 | 5 |
 | [`Diagnostics`](#diagnostics) | 7 | 0 | 1 |
-| [`SensorEnumerator`](#sensorenumerator) | 11 | 6 | 1 |
+| [`SensorEnumerator`](#sensorenumerator) | 11 | 8 | 1 |
 | [`BaseOS`](#baseos) | 12 | 18 | 8 |
-| [`Renderer`](#renderer) | 15 | 8 | 1 |
-| [`Platform`](#platform) | 25 | 0 | 8 |
-| [`ContentStore`](#contentstore) | 26 | 0 | 1 |
+| [`Renderer`](#renderer) | 13 | 9 | 1 |
+| [`Platform`](#platform) | 25 | 2 | 8 |
+| [`ContentStore`](#contentstore) | 27 | 0 | 1 |
 
 ---
 
@@ -63,12 +70,12 @@ A :class:`SendTask` driven on a fixed cadence for one device.
 **You implement (1):**
 
 ```python
-run_once(now: 'float') -> float
+_run(now: 'float') -> float
 ```
 
-**You inherit (3):** `key` · `wait` · `wake`
+**You inherit (4):** `key` · `run_once` · `wait` · `wake`
 
-**Implementations (2):** `ScreencastDriver` · `SlideshowDriver`
+**Implementations (5):** `GameModeTask` · `ReconnectWatcher` · `ScreencastDriver` · `SlideshowDriver` · `StreamDriver`
 
 ## Command
 
@@ -82,7 +89,9 @@ A user action.  Exactly one execute method; returns one Result.
 execute(app: 'App') -> R_co
 ```
 
-**Implementations (145):** `AddOverlayElement` · `AdvanceSlideshow` · `ApplyMask` · `BuildPreview` · `CaptureScreencastFrame` · `CheckForUpdate` · `ConfigureSlideshow` · `ConnectDevice` · `ControlCenterSnapshot` · `CurrentFrame` · `DaemonStatus` · `DeleteOverlayElement` · `DeleteTheme` · `DeviceCanvas` · `DeviceConnectionIssues` · `DeviceState` · `DisableAutostart` · `DisconnectDevice` · `DiscoverDevices` · `DownloadCloudTheme` · `EnableAutostart` · `EnableLedTestMode` · `EnableOverlay` · `EnsureConnected` · `EnsureDaemon` · `EnsureDataDownload` · `ExportConfig` · `ExportDcTheme` · `ExportOverlay` · `ExportTheme` · `ExportVideoClip` · `FlashOverlayElement` · `GenerateDebugReport` · `GetAutostartStatus` · `GetFirstRunStatus` · `GetPaths` · `GetPlatformInfo` · `GetSensorDashboard` · `ImportConfig` · `ImportTheme` · `InitializeLed` · `KeepAliveLoop` · `LcdSnapshot` · `LedSnapshot` · `ListCloudThemes` · `ListDevices` · `ListDiskSensors` · `ListDisks` · `ListFans` · `ListFonts` · `ListGpus` · `ListLanguages` · `ListLedModes` · `ListLedStyles` · `ListMasks` · `ListMemorySlots` · `ListSensors` · `ListThemes` · `ListWebThemes` · `LoadCloudTheme` · `LoadImage` · `LoadTheme` · `LoadVideo` · `LoopVideo` · `MarkFirstRunDone` · `OrientedThemeTarget` · `PauseVideo` · `PlayVideo` · `PreviewSize` · `ProbeVideoDuration` · `ReadSensors` · `RefreshAutostart` · `RenderAndSend` · `RenderDcStandalone` · `RenderLed` · `ResetDevice` · `ResolveOverlay` · `ResolveThemeDirectories` · `RestoreDeviceState` · `RestoreLastTheme` · `RunDoctor` · `RunHealthCheck` · `RunQuickstart` · `RunSetup` · `RunUpgrade` · `SaveTheme` · `SeekVideo` · `SelectZone` · `SendColor` · `SendFrame` · `SendImage` · `SendScreencastFrame` · `SetBackground` · `SetBackgroundMode` · `SetBrightness` · `SetClockFormat` · `SetDateFormat` · `SetDiskDevice` · `SetFitMode` · `SetGpuDevice` · `SetHddEnabled` · `SetLanguage` · `SetLedBrightness` · `SetLedColor` · `SetLedColors` · `SetLedLoadSource` · `SetLedMode` · `SetLedTempSource` · `SetLedZoneBrightness` · `SetLedZoneColor` · `SetLedZoneMode` · `SetLedZoneSync` · `SetLedZoneSyncInterval` · `SetLedZoneSyncZones` · `SetMaskPosition` · `SetMaskVisible` · `SetMediaPlayer` · `SetMemoryRatio` · `SetOrientation` · `SetOverlayBackground` · `SetOverlayConfig` · `SetRefreshInterval` · `SetSensorDashboard` · `SetSlideshow` · `SetSplitMode` · `SetTempUnit` · `SetTimeFormat` · `SetWeekStart` · `SleepDevice` · `StartScreencast` · `StartScreencastDriver` · `StartSlideshowDriver` · `StopDaemon` · `StopScreencast` · `StopScreencastDriver` · `StopSlideshowDriver` · `StopVideo` · `TickDisplay` · `ToggleLed` · `ToggleSegment` · `ToggleVideo` · `UpdateOverlayElement` · `UploadBootAnimation` · `UploadCustomMask` · `VideoStatus`
+**You inherit (1):** `refusal`
+
+**Implementations (150):** `AddOverlayElement` · `AdvanceSlideshow` · `ApplyMask` · `BuildPreview` · `CaptureScreencastFrame` · `CaptureStreamFrame` · `CheckForUpdate` · `ConfigureSlideshow` · `ConnectDevice` · `ControlCenterSnapshot` · `CurrentFrame` · `DaemonStatus` · `DeleteOverlayElement` · `DeleteTheme` · `DeviceCanvas` · `DeviceConnectionIssues` · `DeviceState` · `DisableAutostart` · `DisconnectDevice` · `DiscoverDevices` · `DownloadCloudTheme` · `EnableAutostart` · `EnableLedTestMode` · `EnableOverlay` · `EnsureConnected` · `EnsureDataDownload` · `ExportCurrentTheme` · `ExportDcTheme` · `ExportOverlay` · `ExportTheme` · `ExportVideoClip` · `GenerateDebugReport` · `GetAutostartStatus` · `GetFirstRunStatus` · `GetPaths` · `GetPlatformInfo` · `GetSensorDashboard` · `ImportTheme` · `InitializeLed` · `KeepAliveLoop` · `LcdSnapshot` · `LedSnapshot` · `ListCloudThemes` · `ListDevices` · `ListDiskSensors` · `ListDisks` · `ListFans` · `ListFonts` · `ListGpus` · `ListLanguages` · `ListLedModes` · `ListLedStyles` · `ListMasks` · `ListMemorySlots` · `ListSensors` · `ListThemes` · `ListWebThemes` · `LoadCloudTheme` · `LoadImage` · `LoadTheme` · `LoadVideo` · `LoopVideo` · `MarkFirstRunDone` · `PauseVideo` · `PlayVideo` · `PreviewSize` · `ProbeVideoDuration` · `ProvideApiTls` · `RamLighting` · `ReadSensors` · `RecentColors` · `RefreshAutostart` · `RememberColor` · `RenderAndSend` · `RenderDcStandalone` · `RenderLed` · `ResetDevice` · `ResolveOverlay` · `ResolveThemeDirectories` · `RestoreDeviceState` · `RgbFollow` · `RgbLights` · `RunDoctor` · `RunHealthCheck` · `RunQuickstart` · `RunSetup` · `RunUpgrade` · `SaveTheme` · `ScanRgbLights` · `SeekVideo` · `SelectZone` · `SendColor` · `SendFrame` · `SendImage` · `SendScreencastFrame` · `SetBackground` · `SetBackgroundMode` · `SetBrightness` · `SetClockFormat` · `SetDateFormat` · `SetDiskDevice` · `SetFitMode` · `SetGameMode` · `SetGpuDevice` · `SetHddEnabled` · `SetLanguage` · `SetLedBrightness` · `SetLedColor` · `SetLedColors` · `SetLedLoadSource` · `SetLedMode` · `SetLedTempSource` · `SetLedZoneBrightness` · `SetLedZoneColor` · `SetLedZoneMode` · `SetLedZoneSync` · `SetLedZoneSyncInterval` · `SetLedZoneSyncZones` · `SetMaskPosition` · `SetMaskVisible` · `SetMediaPlayer` · `SetMemoryRatio` · `SetOrientation` · `SetOverlayBackground` · `SetOverlayConfig` · `SetRamEffect` · `SetRamLighting` · `SetRefreshInterval` · `SetRgbFollow` · `SetScreencastRegion` · `SetSensorDashboard` · `SetSlideshow` · `SetSplitMode` · `SetTempUnit` · `SetTimeFormat` · `SetWeekStart` · `SleepDevice` · `StartScreencast` · `StopDaemon` · `StopScreencast` · `StopVideo` · `TickDisplay` · `TickGameMode` · `ToggleLed` · `ToggleVideo` · `UpdateOverlayElement` · `UpdateStatus` · `UploadBootAnimation` · `UploadCustomMask` · `VideoStatus`
 
 ## CpuSource
 
@@ -123,10 +132,10 @@ Tiny port for "fetch bytes from URL" used by cloud-theme adapters.
 **You implement (1):**
 
 ```python
-fetch(url: 'str', timeout_s: 'float' = 30.0) -> bytes
+fetch(url: 'str', timeout_s: 'float' = 30.0, max_bytes: 'int | None' = None) -> bytes
 ```
 
-**Implementations (1):** `UrllibHttpFetcher`
+**Implementations (2):** `OfflineHttpFetcher` · `UrllibHttpFetcher`
 
 ## MissPolicy
 
@@ -154,7 +163,7 @@ A question.  Answers, and changes nothing.
 execute(app: 'App') -> R_co
 ```
 
-**Implementations (39):** `BuildPreview` · `CheckForUpdate` · `ControlCenterSnapshot` · `CurrentFrame` · `DaemonStatus` · `DeviceCanvas` · `DeviceConnectionIssues` · `DeviceState` · `GetAutostartStatus` · `GetFirstRunStatus` · `GetPaths` · `GetPlatformInfo` · `GetSensorDashboard` · `LcdSnapshot` · `LedSnapshot` · `ListCloudThemes` · `ListDevices` · `ListDiskSensors` · `ListDisks` · `ListFans` · `ListFonts` · `ListGpus` · `ListLanguages` · `ListLedModes` · `ListLedStyles` · `ListMasks` · `ListMemorySlots` · `ListSensors` · `ListThemes` · `ListWebThemes` · `OrientedThemeTarget` · `PreviewSize` · `ProbeVideoDuration` · `ReadSensors` · `ResolveOverlay` · `ResolveThemeDirectories` · `RunDoctor` · `RunHealthCheck` · `VideoStatus`
+**Implementations (43):** `BuildPreview` · `CheckForUpdate` · `ControlCenterSnapshot` · `CurrentFrame` · `DaemonStatus` · `DeviceCanvas` · `DeviceConnectionIssues` · `DeviceState` · `GetAutostartStatus` · `GetFirstRunStatus` · `GetPaths` · `GetPlatformInfo` · `GetSensorDashboard` · `LcdSnapshot` · `LedSnapshot` · `ListCloudThemes` · `ListDevices` · `ListDiskSensors` · `ListDisks` · `ListFans` · `ListFonts` · `ListGpus` · `ListLanguages` · `ListLedModes` · `ListLedStyles` · `ListMasks` · `ListMemorySlots` · `ListSensors` · `ListThemes` · `ListWebThemes` · `PreviewSize` · `ProbeVideoDuration` · `RamLighting` · `ReadSensors` · `RecentColors` · `ResolveOverlay` · `ResolveThemeDirectories` · `RgbFollow` · `RgbLights` · `RunDoctor` · `RunHealthCheck` · `UpdateStatus` · `VideoStatus`
 
 ## ScreenCapture
 
@@ -184,23 +193,9 @@ One face of the one app — CLI, API, GUI, qtgui, daemon.
 run() -> int
 ```
 
-**You inherit (7):** `bring_up` · `compose` · `dispatch` · `events` · `preflight` · `start` · `teardown`
+**You inherit (11):** `announce` · `bring_up` · `compose` · `dispatch` · `events` · `on_app_gone` · `preflight` · `remote` · `start` · `stop` · `teardown`
 
 **Implementations (5):** `ApiUI` · `CliUI` · `DaemonUI` · `GuiUI` · `QtGuiUI`
-
-## _HidBinding
-
-`adapters/device/transport.py`
-
-One ``hid`` python binding.  Children differ only in how a handle is opened and put into blocking mode; everything downstream is shared.
-
-**You implement (1):**
-
-```python
-open(vid: 'int', pid: 'int', serial: 'str | None') -> Any
-```
-
-**Implementations (2):** `_ApmortonHidBinding` · `_CythonHidBinding`
 
 ## _QtUI
 
@@ -214,7 +209,7 @@ Shared base for the two widget skins.  Intermediate — not registered.
 run() -> int
 ```
 
-**You inherit (1):** `compose`
+**You inherit (3):** `announce` · `compose` · `stop`
 
 **Implementations (2):** `GuiUI` · `QtGuiUI`
 
@@ -246,7 +241,7 @@ key() -> str
 name() -> str
 ```
 
-**Implementations (17):** `AmdGpu` · `GpuSourceChain` · `HwinfoGpu` · `HwmonDisk` · `HwmonDram` · `HwmonFan` · `IntelGpu` · `LhmDisk` · `LhmGpu` · `MacosHidGpu` · `NvidiaGpu` · `PowermetricsGpu` · `PsutilBoardTemp` · `SmcFan` · `SmcGpu` · `SysctlFan` · `WmiVideoControllerGpu`
+**Implementations (19):** `AmdGpu` · `GpuSourceChain` · `HwinfoGpu` · `HwmonDisk` · `HwmonDram` · `HwmonFan` · `HwmonVoltage` · `IntelGpu` · `LhmDisk` · `LhmGpu` · `MacosHidGpu` · `NouveauGpu` · `NvidiaGpu` · `PowermetricsGpu` · `PsutilBoardTemp` · `SmcFan` · `SmcGpu` · `SysctlFan` · `WmiVideoControllerGpu`
 
 ## SingleFileTheme
 
@@ -263,6 +258,21 @@ install(source: 'Path', filename: 'str') -> Path
 
 **Implementations (1):** `FileSingleFileTheme`
 
+## TlsIdentity
+
+`core/ports.py`
+
+Port for the LAN API's TLS files.  Concrete: ``CryptographyTls`` (``adapters/infra/tls.py``).
+
+**You implement (2):**
+
+```python
+self_signed(directory: 'Path', bind_host: 'str') -> TlsFiles
+supplied(cert: 'Path', key: 'Path') -> TlsFiles
+```
+
+**Implementations (1):** `CryptographyTls`
+
 ## VideoExportRunner
 
 `core/ports.py`
@@ -277,6 +287,21 @@ submit(token: 'str', request: 'VideoExportRequest') -> None
 ```
 
 **Implementations (2):** `SyncVideoExportRunner` · `ThreadVideoExportRunner`
+
+## _HidBinding
+
+`adapters/device/transport.py`
+
+One ``hid`` python binding.  Children differ only in how a handle is opened and put into blocking mode; everything downstream is shared.
+
+**You implement (2):**
+
+```python
+open(vid: 'int', pid: 'int', serial: 'str | None') -> Any
+open_path(path: 'bytes') -> Any
+```
+
+**Implementations (2):** `_ApmortonHidBinding` · `_CythonHidBinding`
 
 ## _MappingPort
 
@@ -343,6 +368,24 @@ temp() -> float | None
 
 **Implementations (1):** `PsutilBoardTemp`
 
+## CommandBus
+
+`core/ports.py`
+
+What every UI talks to: send a Command, observe the bus.
+
+**You implement (3):**
+
+```python
+dispatch(cmd: 'Command[_R]') -> _R
+events() -> EventBus
+remote() -> bool
+```
+
+**You inherit (1):** `on_app_gone`
+
+**Implementations (7):** `ApiUI` · `App` · `AppProxy` · `CliUI` · `DaemonUI` · `GuiUI` · `QtGuiUI`
+
 ## Device
 
 `core/ports.py`
@@ -365,7 +408,7 @@ disconnect() -> None
 send(payload: 'Any') -> bool
 ```
 
-**You inherit (13):** `can_boot_animate` · `handshake` · `is_connected` · `is_led` · `key` · `led_handshake` · `needs_keepalive` · `profile` · `quirks` · `send_boot_animation` · `set_permission_hint` · `set_quirks` · `set_state_dir`
+**You inherit (14):** `can_boot_animate` · `handshake` · `is_connected` · `is_led` · `key` · `led_handshake` · `needs_keepalive` · `profile` · `quirks` · `send_boot_animation` · `set_permission_hint` · `set_quirks` · `set_state_dir` · `set_unit`
 
 **Implementations (5):** `BulkLcd` · `HidLcd` · `Led` · `LyLcd` · `ScsiLcd`
 
@@ -415,7 +458,7 @@ name() -> str
 rpm() -> int | None
 ```
 
-**You inherit (1):** `percent`
+**You inherit (2):** `on_gpu` · `percent`
 
 **Implementations (3):** `HwmonFan` · `SmcFan` · `SysctlFan`
 
@@ -433,9 +476,9 @@ key() -> str
 name() -> str
 ```
 
-**You inherit (7):** `clock` · `fan` · `power` · `temp` · `usage` · `vram_total` · `vram_used`
+**You inherit (10):** `clock` · `fan` · `fan_rpm` · `hotspot` · `mem_temp` · `power` · `temp` · `usage` · `vram_total` · `vram_used`
 
-**Implementations (10):** `AmdGpu` · `GpuSourceChain` · `HwinfoGpu` · `IntelGpu` · `LhmGpu` · `MacosHidGpu` · `NvidiaGpu` · `PowermetricsGpu` · `SmcGpu` · `WmiVideoControllerGpu`
+**Implementations (11):** `AmdGpu` · `GpuSourceChain` · `HwinfoGpu` · `IntelGpu` · `LhmGpu` · `MacosHidGpu` · `NouveauGpu` · `NvidiaGpu` · `PowermetricsGpu` · `SmcGpu` · `WmiVideoControllerGpu`
 
 ## HotplugMonitor
 
@@ -453,6 +496,38 @@ stop() -> None
 
 **Implementations (5):** `FreeBSDHotplugMonitor` · `LinuxHotplugMonitor` · `NoopHotplugMonitor` · `PollingHotplugMonitor` · `WindowsHotplugMonitor`
 
+## RamAccess
+
+`core/ports.py`
+
+The opt-in grant that lets this user reach RGB memory's bus.
+
+**You implement (3):**
+
+```python
+disable() -> RamAccessStatus
+enable() -> RamAccessStatus
+status() -> RamAccessStatus
+```
+
+**Implementations (2):** `LinuxRamAccess` · `_NoRamAccess`
+
+## RgbMirror
+
+`core/ports.py`
+
+Another RGB system whose devices follow the cooler's colours.
+
+**You implement (3):**
+
+```python
+close() -> None
+devices() -> tuple[RgbMirrorDevice, ...]
+show(device: 'RgbMirrorDevice', colors: 'Sequence[tuple[int, int, int]]') -> None
+```
+
+**Implementations (3):** `AuraMainboard` · `CorsairDramMirror` · `OpenRgbMirror`
+
 ## SendScheduler
 
 `core/ports.py`
@@ -468,6 +543,22 @@ shutdown() -> None
 ```
 
 **Implementations (2):** `SyncSendScheduler` · `ThreadSendScheduler`
+
+## VoltageSource
+
+`core/ports.py`
+
+One motherboard / super-I/O voltage input (#259).
+
+**You implement (3):**
+
+```python
+key() -> str
+name() -> str
+volts() -> float | None
+```
+
+**Implementations (1):** `HwmonVoltage`
 
 ## _SharedRotatingFileHandler
 
@@ -497,8 +588,8 @@ Port for the hosted cloud theme catalog.
 
 ```python
 categories() -> tuple[CloudCategory, ...]
-download_preview(theme_id: 'str', resolution: 'str | None' = None) -> Path
 download_theme(theme_id: 'str', resolution: 'str | None' = None) -> Path
+downloaded(resolution: 'str') -> tuple[str, ...]
 list_themes(category: 'str' = 'all') -> list[CloudThemeEntry]
 ```
 
@@ -574,7 +665,26 @@ wait(timeout: 'float') -> None
 wake() -> None
 ```
 
-**Implementations (3):** `DeviceSender` · `ScreencastDriver` · `SlideshowDriver`
+**You inherit (1):** `runs_on_caller`
+
+**Implementations (6):** `DeviceSender` · `GameModeTask` · `ReconnectWatcher` · `ScreencastDriver` · `SlideshowDriver` · `StreamDriver`
+
+## SmBus
+
+`core/ports.py`
+
+One SMBus: byte reads and writes, and block writes, to one address.
+
+**You implement (4):**
+
+```python
+close() -> None
+read_byte_data(address: 'int', register: 'int') -> int
+write_block_data(address: 'int', register: 'int', data: 'bytes') -> None
+write_byte_data(address: 'int', register: 'int', value: 'int') -> None
+```
+
+**Implementations (1):** `LinuxSmBus`
 
 ## BulkTransport
 
@@ -593,6 +703,24 @@ write(endpoint: 'int', data: 'WriteBuffer', timeout_ms: 'int' = 100) -> int
 ```
 
 **Implementations (2):** `HidApiTransport` · `PyUsbBulkTransport`
+
+## RamLights
+
+`core/ports.py`
+
+RGB memory TRCC drives itself: it follows, and it keeps effects.
+
+**You implement (5):**
+
+```python
+apply_effect(device: 'RgbMirrorDevice', settings: 'RamEffectSettings') -> None
+close() -> None
+devices() -> tuple[RgbMirrorDevice, ...]
+found() -> tuple[RgbMirrorDevice, ...] | None
+show(device: 'RgbMirrorDevice', colors: 'Sequence[tuple[int, int, int]]') -> None
+```
+
+**Implementations (1):** `CorsairDramMirror`
 
 ## ScsiTransport
 
@@ -629,7 +757,7 @@ is_enabled() -> bool
 refresh() -> None
 ```
 
-**Implementations (4):** `MacOSAutostart` · `NoopAutostart` · `WindowsAutostart` · `XdgDesktopAutostart`
+**Implementations (5):** `MacOSAutostart` · `NoopAutostart` · `WindowsAutostart` · `WindowsTaskAutostart` · `XdgDesktopAutostart`
 
 ## Diagnostics
 
@@ -640,7 +768,7 @@ Port for system diagnostics.  Concrete: ``DiagnosticsAdapter`` (``adapters/diagn
 **You implement (7):**
 
 ```python
-debug_report(log_tail_lines: 'int') -> str
+debug_report(log_tail_lines: 'int', held: 'Mapping[str, Mapping[str, str]] | None' = None, probe: 'bool' = True) -> str
 doctor() -> DoctorResult
 gpu_reader_state() -> GpuReaderState
 health() -> HealthReport
@@ -673,7 +801,7 @@ stop_polling() -> None
 unsupported() -> frozenset[str]
 ```
 
-**You inherit (6):** `preferred_disk` · `primary_gpu` · `set_interval` · `set_preferred_disk` · `set_preferred_gpu` · `snapshot`
+**You inherit (8):** `fan_slots` · `preferred_disk` · `primary_gpu` · `set_fan_slot_pins` · `set_interval` · `set_preferred_disk` · `set_preferred_gpu` · `snapshot`
 
 **Implementations (1):** `BaselineSensors`
 
@@ -690,7 +818,7 @@ _build_autostart() -> AutostartManager
 _build_hotplug() -> HotplugMonitor
 _build_sensors() -> SensorEnumerator
 _make_paths() -> Paths
-_open_scsi(vid: 'int', pid: 'int', serial: 'str | None' = None) -> ScsiTransport
+_open_scsi(vid: 'int', pid: 'int', serial: 'str | None' = None, unit: 'str' = '') -> ScsiTransport
 check_permissions() -> list[str]
 disk_info() -> list[dict[str, str]]
 distro_name() -> str
@@ -700,7 +828,7 @@ permission_denied_hint() -> str
 setup(dry_run: 'bool' = False) -> int
 ```
 
-**You inherit (18):** `autostart` · `configure_stdout` · `disk_partitions` · `display_session` · `hotplug` · `install_method` · `minimize_on_close` · `open_transport` · `package_manager` · `packages` · `paths` · `scan_devices` · `screen_capture` · `sensors` · `software_install_hint` · `upgrade_command` · `usb_power_state` · `worker_thread_context`
+**You inherit (18):** `autostart` · `configure_stdout` · `disk_partitions` · `display_session` · `hotplug` · `http_fetcher` · `install_method` · `open_transport` · `package_manager` · `packages` · `paths` · `scan_devices` · `screen_capture` · `sensors` · `software_install_hint` · `upgrade_hint` · `usb_power_state` · `worker_thread_context`
 
 **Implementations (8):** `BsdOS` · `FreeBsdOS` · `GenericBsd` · `LinuxOS` · `MacOSPlatform` · `NetBsdOS` · `OpenBsdOS` · `WindowsPlatform`
 
@@ -710,7 +838,7 @@ setup(dry_run: 'bool' = False) -> int
 
 Rendering backend.  Concrete: QtRenderer (adapters/render/qt.py).
 
-**You implement (15):**
+**You implement (13):**
 
 ```python
 apply_brightness(surface: 'Any', percent: 'int') -> Any
@@ -720,17 +848,15 @@ decode_image(data: 'bytes') -> Any
 draw_text(surface: 'Any', x: 'int', y: 'int', text: 'str', color: 'str', size: 'int', bold: 'bool' = False, italic: 'bool' = False, family: 'str' = '') -> None
 encode_jpeg(surface: 'Any', quality: 'int' = 95, max_size: 'int' = 0) -> bytes
 encode_rgb565(surface: 'Any', byte_order: 'str' = '>') -> bytes
-flip_horizontal(surface: 'Any') -> Any
 from_raw_rgb24(frame: 'RawFrame') -> Any
 open_image(path: 'Path') -> Any
 resize(surface: 'Any', width: 'int', height: 'int') -> Any
 rotate(surface: 'Any', degrees: 'int') -> Any
 surface_nbytes(surface: 'Any') -> int
 surface_size(surface: 'Any') -> tuple[int, int]
-to_raw_rgb24(surface: 'Any') -> RawFrame
 ```
 
-**You inherit (8):** `bg_fit` · `build_frame` · `draw_spectrum` · `encode_payload` · `encode_png` · `fill_rect` · `get_pixels_rgb` · `list_fonts`
+**You inherit (9):** `bg_fit` · `build_frame` · `draw_spectrum` · `encode_payload` · `encode_png` · `fill_rect` · `get_pixels_rgb` · `list_fonts` · `raw_argb32`
 
 **Implementations (1):** `QtRenderer`
 
@@ -759,11 +885,11 @@ disk_partitions() -> list[tuple[str, str]]
 display_session() -> DisplaySession
 distro_name() -> str
 hotplug() -> HotplugMonitor
+http_fetcher() -> HttpFetcher
 install_method() -> str
 memory_info() -> list[dict[str, str]]
-minimize_on_close() -> bool
 no_devices_hint() -> str
-open_transport(wire: 'Wire', vid: 'int', pid: 'int', serial: 'str | None' = None) -> Transport
+open_transport(wire: 'Wire', vid: 'int', pid: 'int', serial: 'str | None' = None, unit: 'str' = '', hid_reports: 'bool' = False, report_id: 'int' = 0) -> Transport
 package_manager() -> str
 packages() -> PackageManager
 paths() -> Paths
@@ -773,10 +899,12 @@ screen_capture() -> ScreenCapture
 sensors() -> SensorEnumerator
 setup(dry_run: 'bool' = False) -> int
 software_install_hint(tool: 'str') -> str
-upgrade_command() -> tuple[str, ...]
-usb_power_state(vid: 'int', pid: 'int') -> UsbPowerState | None
+upgrade_hint() -> str
+usb_power_state(vid: 'int', pid: 'int', unit: 'str' = '') -> UsbPowerState | None
 worker_thread_context() -> AbstractContextManager[None]
 ```
+
+**You inherit (2):** `ram_access` · `smbuses`
 
 **Implementations (8):** `BsdOS` · `FreeBsdOS` · `GenericBsd` · `LinuxOS` · `MacOSPlatform` · `NetBsdOS` · `OpenBsdOS` · `WindowsPlatform`
 
@@ -786,15 +914,16 @@ worker_thread_context() -> AbstractContextManager[None]
 
 Where themes, masks, backgrounds and capture configs are kept.
 
-**You implement (26):**
+**You implement (27):**
 
 ```python
 background_path(theme: 'Theme') -> Path | None
 copy_preview(src_theme_dir: 'Path', dst_theme_dir: 'Path') -> bool
 delete(directory: 'Path', name: 'str') -> Path
 discover_masks(cloud_masks_dir: 'Path | None' = None, user_masks_dir: 'Path | None' = None) -> builtins.list[DiscoveredMask]
-export(theme_path: 'Path', archive_path: 'Path') -> None
-export_dc(theme_dir: 'Path', output_path: 'Path', elements: 'list[dict] | None' = None) -> Path
+export(theme_path: 'Path', archive_path: 'Path', background: 'Path | None' = None) -> None
+export_dc(theme_dir: 'Path', output_path: 'Path', elements: 'list[dict] | None' = None, flags: 'dict | None' = None) -> Path
+export_unsaved(manifest: 'dict', archive_path: 'Path', background: 'Path | bytes | None', mask: 'Path | None', preview: 'bytes | None') -> None
 import_(archive_path: 'Path', into_dir: 'Path') -> Theme
 is_theme_dir(path: 'Path') -> bool
 list(directory: 'Path') -> builtins.list[Theme]

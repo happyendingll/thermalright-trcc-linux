@@ -17,7 +17,7 @@ from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any
 
-from ...core.errors import TransportError
+from ...core.errors import PermissionError_, TransportError
 from ...core.models import (
     DisplayServer,
     DisplaySession,
@@ -164,6 +164,9 @@ def _find_physical_drive(vid: int, pid: int) -> str | None:
 # Common CreateFileW failures when opening \\.\PhysicalDriveN for SCSI
 # passthrough — translated in the log so a reporter doesn't have to look up
 # the bare WinError number.
+#: ``ERROR_ACCESS_DENIED``: the user's setup, not a panel that is not ready.
+_ERROR_ACCESS_DENIED = 5
+
 _WIN_OPEN_ERRORS: dict[int, str] = {
     2:  "ERROR_FILE_NOT_FOUND — the drive path is gone (replug / rescan)",
     5:  "ERROR_ACCESS_DENIED — raw drive access needs Administrator; "
@@ -203,9 +206,16 @@ class WindowsScsiTransport(ScsiTransport):
                     err, "see Microsoft 'System Error Codes'")
                 log.error("CreateFileW failed for %s — WinError %d: %s",
                           self._path, err, detail)
+                if err == _ERROR_ACCESS_DENIED:
+                    # Raised, like every other transport: a plain False read
+                    # as "not answering yet", so the reconnect watcher retried
+                    # a panel only elevation can open, without saying so.
+                    raise PermissionError_(f"{self._path}: {detail}")
                 return False
             self._handle = handle
             return True
+        except PermissionError_:
+            raise
         except Exception:
             log.exception("Failed to open %s", self._path)
             return False
@@ -327,9 +337,16 @@ class _ComApartment:
     def __enter__(self) -> None:
         try:
             import pythoncom  # type: ignore[import-not-found,import-untyped]
-            pythoncom.CoInitialize()
         except ImportError:
             log.debug("_ComApartment: pythoncom unavailable — no-op")
+            return
+        try:
+            pythoncom.CoInitialize()
+        except pythoncom.com_error as e:
+            # Already initialised on this thread (the main thread after Qt,
+            # or a second entry) -- the apartment is there, which is all we
+            # need.  Same handling as ``_windows_wmi.wmi_handle``.
+            log.debug("_ComApartment: COM already initialised here (%s)", e)
 
     def __exit__(self, *exc: object) -> None:
         log.debug("__exit__")
@@ -366,18 +383,47 @@ class WindowsPlatform(BaseOS, key="win32"):
         return build_windows_sensors(thread_context=self.worker_thread_context)
 
     def _build_autostart(self) -> AutostartManager:
-        log.debug("_build_autostart")
-        from ._autostart import WindowsAutostart
-        return WindowsAutostart()
+        """A sign-in task for the installer build; the Run key for pip.
+
+        The installer's exes are ``--uac-admin`` and Windows blocks elevation
+        in the sign-in path, so only a task at the highest run level starts
+        them (measured on the VM).  A pip install is not elevated, and the Run
+        key starts it (also measured: 9.7.3 autostarted from it).
+        """
+        import sys
+
+        from ._autostart import WindowsAutostart, WindowsTaskAutostart
+        frozen = getattr(sys, "frozen", False)
+        log.info("_build_autostart: %s", "scheduled task (installer build)"
+                 if frozen else "Run key (pip install)")
+        return WindowsTaskAutostart() if frozen else WindowsAutostart()
 
     def _build_hotplug(self) -> HotplugMonitor:
         log.debug("_build_hotplug")
         from ._hotplug import WindowsHotplugMonitor
         return WindowsHotplugMonitor()
 
-    def _open_scsi(self, vid: int, pid: int,
-                  serial: str | None = None) -> ScsiTransport:
-        log.info("open_scsi: %04x:%04x serial=%r", vid, pid, serial)
+    def _open_scsi(self, vid: int, pid: int, serial: str | None = None,
+                  unit: str = "") -> ScsiTransport:
+        r"""Windows SCSI passthrough over a ``\\.\PhysicalDriveN`` handle.
+
+        *unit* is ACCEPTED AND NOT HONOURED, and says so out loud.  Picking a
+        specific one of two identical devices (#287) needs the Windows device
+        path — ``SetupDiGetDeviceInstanceId`` / ``USB\VID_xxxx&PID_xxxx\…``
+        — matched against the USB topology, and this is the one OS in the
+        matrix that cannot be verified here (``doc``: macOS/BSD are
+        reporter-only, Windows needs the VM).  Shipping an untested mapping
+        that silently opens the WRONG panel is worse than shipping the
+        current behaviour with a warning that names the limit.
+        """
+        log.info("open_scsi: %04x:%04x serial=%r unit=%s",
+                 vid, pid, serial, unit or "(only)")
+        if unit:
+            log.warning(
+                "open_scsi: Windows cannot yet target a specific unit — "
+                "opening the first %04x:%04x found, which may be the other "
+                "panel (#287)", vid, pid,
+            )
         path = _find_physical_drive(vid, pid)
         if path is None:
             raise TransportError(
@@ -426,7 +472,13 @@ class WindowsPlatform(BaseOS, key="win32"):
 
     def permission_denied_hint(self) -> str:
         log.debug("WindowsPlatform.permission_denied_hint: called")
-        return "install the WinUSB driver via 'trcc system setup'"
+        # WinUSB lets ONE program hold a device, and libusb reports "held by
+        # another program" as access denied -- so with autostart on, a running
+        # TRCC window or tray makes every CLI command fail exactly like a
+        # missing driver (#173).
+        return ("install the WinUSB driver via 'trcc system setup', and make "
+                "sure no other TRCC (window, tray or daemon) is running — "
+                "WinUSB lets only one program use the device")
 
     def no_devices_hint(self) -> str:
         log.debug("no_devices_hint: called")
@@ -435,16 +487,6 @@ class WindowsPlatform(BaseOS, key="win32"):
             "driver — install it with Zadig (https://zadig.akeo.ie/). "
             "SCSI LCD panels need no driver."
         )
-
-    # ── GUI behaviour ─────────────────────────────────────────────────
-
-    def minimize_on_close(self) -> bool:
-        """Windows: minimize to taskbar (legacy TRCC parity).
-
-        Linux/macOS/BSD inherit the base False (hide-to-tray).
-        """
-        log.debug("minimize_on_close: called")
-        return True
 
     def configure_stdout(self) -> None:
         """Rewrap stdout / stderr as UTF-8 with ``errors='replace'``.

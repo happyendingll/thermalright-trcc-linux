@@ -65,15 +65,19 @@ class BaseHandler:
         """Release device resources on shutdown.  Override in subclass."""
         log.info("BaseHandler.cleanup: view=%r (no-op base)", self._view)
 
+    def follow_app(self) -> None:
+        """Show the settings the App now holds.  Override per device kind."""
+        log.info("BaseHandler.follow_app: view=%r (no-op base)", self._view)
+
     # ── Tick + push ───────────────────────────────────────────────────
 
-    def update_metrics(self, metrics: Any) -> None:
+    def update_metrics(self, metrics: Any, temp_unit: str = "C") -> None:
         """Push the latest metrics snapshot to handler-local widgets."""
         # Per-tick; DEBUG.  Subclasses override — base no-op log marks
         # the rare case a handler didn't bother to override at all.
         log.debug("BaseHandler.update_metrics: view=%r dropped (base no-op)",
                   self._view)
-        del metrics
+        del metrics, temp_unit
 
     def handle_frame(self, image: Any) -> None:
         """Show a rendered frame in the preview.  Override per device kind."""
@@ -105,6 +109,11 @@ class BaseHandler:
         log.debug("BaseHandler.on_video_started: view=%r dropped (base no-op)",
                   self._view)
         del event
+
+    def on_video_advanced(self, event: Any) -> None:
+        """A video moved one frame — handlers that show progress override."""
+        log.debug("BaseHandler.on_video_advanced: view=%r dropped (base no-op)",
+                  type(self).__name__)
 
     def on_video_stopped(self, event: Any) -> None:
         """Domain event ``VideoStopped`` for this handler's device."""

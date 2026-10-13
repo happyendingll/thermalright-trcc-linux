@@ -27,7 +27,7 @@ installer, and every rotation conclusion drawn from it was drawn from the wrong
 release.  See memory ``project_csharp_oracle_was_the_wrong_version``.
 
 The ROTATION constants are no longer transcribed here.  They come from
-``dev/decompiler/encode_reference.py``, the one 2.1.6 transcription, because
+``dev/decompiler/encode_reference.py``, the one transcription, because
 this file holding a second copy of them is how they drifted: it asserted a
 sub-independent encode base that the real switch contradicts in six families.
 What stays here is what this file uniquely checks — the PM byte to geometry
@@ -42,6 +42,7 @@ Never "fix" a failure by loosening the assertion.
 """
 from __future__ import annotations
 
+import dataclasses
 import sys
 from pathlib import Path
 
@@ -59,7 +60,11 @@ from trcc.core.protocol import (
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dev" / "decompiler"))
 
 from encode_reference import (  # pyright: ignore[reportMissingImports]
+    csharp_encode,
     csharp_encode_angles,
+)
+from formcztv_init import (  # pyright: ignore[reportMissingImports]
+    form_cztv_init,
 )
 
 # The resolutions this file checks a wire angle for.  The ANGLES come from the
@@ -207,8 +212,11 @@ _CSHARP_BULK_FINGERPRINTS: tuple[tuple[str, tuple[int, int]], ...] = (
     # branch applies, and satoru8 confirmed it upright on the panel (#137).
     ("FW360 Ultra",         (6, 0)),
     ("Mjolnir",             (5, 1)),
-    # Unknown bulk PM → stays on the 480x480 base, never echoes PM as FBL (#176).
-    ("GrandVision 360",     (50, 0)),
+    # Unknown bulk PM → stays on the 480x480 base, never echoes PM as FBL
+    # (#176).  PM 1 SUB 1 is the GrandVision 360's real handshake; this row
+    # read (50, 0) under that name, but PM 50 is in the C# ladder (SPI mode 3)
+    # and the PM-50 panel on record is a SCSI Frozen Warframe.
+    ("GrandVision 360",     (1, 1)),
     ("widescreen 854x480",  (11, 5)),
     ("widescreen 960x540",  (10, 0)),
     ("bulk 1600x720",       (1, 48)),
@@ -224,14 +232,16 @@ def test_bulk_wire_angle_matches_the_csharp(
 
     Resolves through the SHIPPING ``bulk_profile`` — never a copy of it.  A
     hand-rolled copy in ``dev/decompiler/audit_rotation.py`` dropped the
-    ``_BULK_KNOWN_PMS`` guard, invented a phantom FBL 6, and reported this very
+    ``in_pm_ladder`` guard, invented a phantom FBL 6, and reported this very
     device as a 180° bug.  An oracle that re-implements the code it audits
     proves nothing about what ships.
     """
     pm, sub = fingerprint
     fbl, profile = bulk_profile(pm, sub)
+    # Form1.cs:1071 — the bulk class enters FormCZTVInit at fbl 72, mode 2.
+    my_sub_mode = form_cztv_init(72, m=2, pm=pm, pmSub=sub).mySubMode
     expected = csharp_encode_angles(
-        profile.resolution, jpeg=profile.jpeg, pm=pm, sub=sub)
+        profile.resolution, jpeg=profile.jpeg, pm=pm, my_sub_mode=my_sub_mode)
     for orientation, want in expected.items():
         got = (wire_angle(profile, orientation, portrait_content=False)
                + profile.encode_baseline) % 360
@@ -286,12 +296,12 @@ def test_360_fan_hub_matches_the_csharp_default_branch() -> None:
 # ``test_pm_resolves_to_the_csharp_resolution`` above cannot see any of this:
 # its table is PM-keyed and every entry is a mode-2 PM, so a mode-3 panel is
 # outside its universe no matter how wrong we get it.  That is how fbl 59 sat
-# resolving to 320x320 RGB565 — wrong size AND wrong encoder for a 640x172
-# JPEG panel — under a green suite.
+# resolving to 320x320 — the wrong size for a 640x172 panel — under a green
+# suite.
 _CSHARP_MODE3_REWRITES: dict[int, tuple[int, int]] = {
     129: (480, 480),
     59: (640, 172),
-    60: (176, 320),
+    60: (320, 176),     # is176x320, stored long side first
 }
 
 
@@ -307,15 +317,42 @@ def test_mode3_fbl_rewrites_match_the_csharp(
     )
 
 
-def test_fbl_59_is_the_same_panel_as_the_pm_15_route() -> None:
-    """Both C# routes to 640x172 must produce ONE profile, not two.
+def test_fbl_59_is_the_pm_15_panel_on_the_rgb565_encoder() -> None:
+    """Both C# routes to 640x172 are ONE panel, encoded by the ROUTE.
 
     ``mode == 2 && pm == 15`` and ``mode == 3 && pm == 100 && fbl == 59`` are
     the same screen; the C# proves it by rewriting the second to 224, the very
-    code the first already carries.  Asserting equality rather than repeating
-    the flags is what stops a change to 224 from reaching one route only.
+    code the first already carries.  But every encode site is
+    ``myDeviceMode == 2 ? ImageToJpg : ImageTo565`` (FormCZTV.cs:2825), so the
+    mode-3 route ships RGB565 with the ``is640x172`` row repack.  Asserting the
+    exact set of differing fields is what stops a change to 224 from reaching
+    one route only.
     """
-    assert get_profile(59, 100) == get_profile(224, 15)
+    route3, route2 = get_profile(59, 100), get_profile(224, 15)
+    differ = {f.name for f in dataclasses.fields(route3)
+              if getattr(route3, f.name) != getattr(route2, f.name)}
+    assert differ == {"jpeg", "wire_row_px", "encode_base"}
+    assert (route3.jpeg, route3.wire_row_px) == (False, 176)
+
+
+# ImageTo565's ``is640x172`` arm (2.1.8, FormCZTV.cs:4221): SUB 5 takes the
+# default 90/0/270/180, every other SUB 270/180/90/0.  Written out here, not
+# read from the oracle, so a wrong transcription cannot agree with itself.
+_CSHARP_640x172_RGB565: dict[int, dict[int, int]] = {
+    0: {0: 270, 90: 180, 180: 90, 270: 0},
+    5: {0: 90, 90: 0, 180: 270, 270: 180},
+}
+
+
+@pytest.mark.parametrize("sub", sorted(_CSHARP_640x172_RGB565))
+def test_fbl_59_wire_angle_follows_the_sub_arm(sub: int) -> None:
+    """The mode-3 640x172 wire angle must be the 2.1.8 arm for its SUB."""
+    profile = get_profile(59, 59, sub)
+    got = {deg: resolve_encode_angle(profile, deg) for deg in (0, 90, 180, 270)}
+    assert got == _CSHARP_640x172_RGB565[sub]
+    my_sub_mode = form_cztv_init(59, m=3, pm=100, pmSub=sub).mySubMode
+    assert got == csharp_encode_angles(
+        (640, 172), jpeg=False, my_sub_mode=my_sub_mode)
 
 
 def test_the_176x320_panel_is_dual_orientation_not_just_a_size() -> None:
@@ -323,11 +360,13 @@ def test_the_176x320_panel_is_dual_orientation_not_just_a_size() -> None:
 
     It was pinned unsupported for a long time with the note that it "needs
     SUB-keyed geometry, not a table row" -- correct, and that geometry arrived
-    separately: ``is_portrait_mounted`` now covers 176x320 (``pmSub < 5`` ->
+    separately: ``is_portrait_mounted`` now covers it (``pmSub < 5`` ->
     ``320176\\`` at 0 degrees, otherwise ``176320\\`` at 90), and
     ``catalog_spellings`` names those two catalogs by long/short rather than by
-    ``(w, h)`` order -- which matters here and nowhere else, because this is
-    the one family the C# stores (short, long).
+    ``(w, h)`` order.  The C# spells the flag short-first (``is176x320``) but
+    composes the panel LANDSCAPE at 0 (GIFSize 320x176, FormCZTV.cs:3160), so
+    the row is (320, 176) like every other; stored (176, 320) until
+    2026-09-30, every angle came out transposed.
 
     Both catalogs already shipped: ``theme176320.7z`` and ``theme320176.7z``,
     5 themes each, backgrounds measured at 176x320 and 320x176 straight from
@@ -339,12 +378,12 @@ def test_the_176x320_panel_is_dual_orientation_not_just_a_size() -> None:
     from trcc.core.geometry import catalog_spellings
     from trcc.core.protocol import is_portrait_mounted
 
-    assert fbl_to_resolution(60, 100) == (176, 320)
+    assert fbl_to_resolution(60, 100) == (320, 176)
     # The SUB byte picks between the two shipped catalogs.
-    assert is_portrait_mounted((176, 320), 4) is False
-    assert is_portrait_mounted((176, 320), 5) is True
+    assert is_portrait_mounted((320, 176), 4) is False
+    assert is_portrait_mounted((320, 176), 5) is True
     # And they are named long/short, NOT (w, h)/(h, w).
-    assert catalog_spellings((176, 320)) == ((320, 176), (176, 320))
+    assert catalog_spellings((320, 176)) == ((320, 176), (176, 320))
 
 
 # ── The HID type-2 / mode-3 route, swept against the C# ────────────────────
@@ -362,20 +401,21 @@ def test_the_176x320_panel_is_dual_orientation_not_just_a_size() -> None:
 #     manufactures a divergence out of two different quantities -- the same
 #     category error as widescreen vs isBiliPingmu.
 #   mount -- always; it is a pure function of the SUB byte.
-#   encode -- NOT compared.  The C# picks JPEG vs RGB565 on `myDeviceMode == 2`
-#     (all four call sites), and `get_profile` has no mode axis, so fbl 59
-#     ships jpeg=True for its mode-2 route while mode 3 would encode 565.
-#     That simplification is pinned deliberately by
-#     `test_fbl_59_is_the_same_panel_as_the_pm_15_route`; asserting it here
-#     would contradict that test rather than find anything.
+#   encoder -- always; the C# picks JPEG vs RGB565 on `myDeviceMode == 2`
+#     (all four call sites), which FormCZTVInit can rewrite per SUB (fbl 54
+#     stays mode 3, so RGB565, at SUB 4).
+#   wire angle + mirror -- always, against the oracle arm for the C#'s own
+#     encoder; a difference passes only on an arm labelled `not_ported`.
+#
+# Every SUB 0-7 is swept: the list used to skip 4 and 7, and SUB 4 was where
+# the one encoder divergence on this route sat.
 
 
 def _mode3_fingerprints() -> list[tuple[int, int]]:
     """Every catalogued FBL against the SUB bytes a panel actually sends."""
     from trcc.core.protocol import FBL_PROFILES
 
-    return [(fbl, sub) for fbl in sorted(FBL_PROFILES)
-            for sub in (0, 1, 2, 3, 5, 6)]
+    return [(fbl, sub) for fbl in sorted(FBL_PROFILES) for sub in range(8)]
 
 
 @pytest.mark.parametrize(("fbl", "sub"), _mode3_fingerprints())
@@ -417,13 +457,38 @@ def test_mode3_fingerprint_matches_the_csharp(fbl: int, sub: int) -> None:
         )
         return
 
-    assert state.resolution == profile.resolution, (
-        f"mode-3 fbl={fbl} sub={sub}: the C# resolves "
-        f"{state.resolution}, we resolve {profile.resolution}"
+    # The flag NAMES the panel's sides (``is176x320`` short-first,
+    # ``is640x172`` long-first); what the C# composes at 0 degrees -- GIFSize
+    # at directionB 0, FormCZTV.cs:3100-3545 -- is landscape for every one,
+    # and that canvas is what ``profile.resolution`` stores.
+    at_0 = (max(state.resolution), min(state.resolution))
+    assert at_0 == profile.resolution, (
+        f"mode-3 fbl={fbl} sub={sub}: the C# composes {at_0} at 0 degrees "
+        f"(flag {state.resolution}), we resolve {profile.resolution}"
     )
     theirs = state.themeDirection == 90
     ours = is_portrait_mounted(profile.resolution, sub)
     assert theirs == ours, (
         f"mode-3 fbl={fbl} sub={sub} ({profile.resolution}): the C# mounts "
         f"portrait={theirs}, we say {ours}"
+    )
+    jpeg = state.myDeviceMode == 2
+    assert profile.jpeg == jpeg, (
+        f"mode-3 fbl={fbl} sub={sub}: the C# encodes "
+        f"{'JPEG' if jpeg else 'RGB565'}, we send "
+        f"{'JPEG' if profile.jpeg else 'RGB565'}"
+    )
+    arm = csharp_encode(state.resolution, jpeg=jpeg, pm=state.myDevicePingMu,
+                        my_sub_mode=state.mySubMode)
+    sent = ({o: (wire_angle(profile, o, portrait_content=False)
+                 + profile.encode_baseline) % 360 for o in (0, 90, 180, 270)},
+            False)
+    if arm.not_ported:
+        assert sent != (arm.angles, arm.mirror), (
+            f"mode-3 fbl={fbl} sub={sub} now matches an arm labelled "
+            f"not_ported -- delete the label in encode_reference.py")
+        return
+    assert sent == (arm.angles, arm.mirror), (
+        f"mode-3 fbl={fbl} sub={sub}: we send {sent}, the C# sends "
+        f"{(arm.angles, arm.mirror)}"
     )

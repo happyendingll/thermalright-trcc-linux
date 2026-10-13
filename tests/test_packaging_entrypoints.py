@@ -17,18 +17,23 @@ import re
 import sys
 from pathlib import Path
 
-import tomllib
+import pytest
+
+# ``tomllib`` is 3.11+; this reads pyproject, which does not change with the
+# Python running it, so 3.11 and 3.12 carry the gate and 3.10 skips cleanly
+# instead of erroring at collection.
+tomllib = pytest.importorskip("tomllib")
 
 _ROOT = Path(__file__).resolve().parent.parent
 _PYPROJECT = _ROOT / "pyproject.toml"
 _RELEASE_YML = _ROOT / ".github" / "workflows" / "release.yml"
-_RPM_SPEC = _ROOT / "packaging" / "rpm" / "trcc-linux.spec"
 
 # Binaries the packaging installs directly from ``src/trcc/assets/`` (NOT wheel
 # console scripts), so they legitimately appear in the file-lists without a
-# matching ``[project.scripts]`` entry.  ``trcc-imc`` is the standalone
-# privileged MCHBAR reader (pkexec target).
-_ASSET_HELPERS = frozenset({"trcc-imc"})
+# matching ``[project.scripts]`` entry.  ``trcc-imc`` (MCHBAR timings) and
+# ``trcc-dmi`` (DRAM slots) are the standalone privileged helpers (pkexec targets).
+_ASSET_HELPERS = frozenset({"trcc-imc", "trcc-dmi", "trcc-ram-access",
+                            "trcc-ram-access-off"})
 
 
 def _declared_scripts() -> set[str]:
@@ -41,16 +46,12 @@ def _declared_scripts() -> set[str]:
 def _packaged_binaries() -> set[str]:
     """``trcc*`` binary names hardcoded in the packaging specs:
     release.yml's RPM ``%files`` (``/usr/bin/<name>``) + DEB wrapper loops
-    (``for cmd in <names>; do``), AND the standalone RPM spec's ``%files``
-    (``%{_bindir}/<name>``).  The Arch build installs the wheel directly
+    (``for cmd in <names>; do``).  The Arch build installs the wheel directly
     (globs ``trcc*``), so it has no hardcoded list to drift."""
     text = _RELEASE_YML.read_text(encoding="utf-8")
     names = set(re.findall(r"/usr/bin/(trcc[A-Za-z0-9_-]*)", text))
     for group in re.findall(r"for cmd in ([A-Za-z0-9 _-]+?);\s*do", text):
         names |= {tok for tok in group.split() if tok.startswith("trcc")}
-    if _RPM_SPEC.is_file():
-        spec = _RPM_SPEC.read_text(encoding="utf-8")
-        names |= set(re.findall(r"%\{_bindir\}/(trcc[A-Za-z0-9_-]*)", spec))
     return names
 
 
@@ -101,10 +102,10 @@ def test_release_docker_comments_have_no_quote_breakers() -> None:
 # live distro repos.  Imported rather than copied: a second copy would drift
 # from the one being checked, and then neither is trustworthy.
 #
-# Recorded consequence of ARCH_UNAVAILABLE, rather than hidden: on Arch,
-# `trcc api` has no uvicorn and audio has no sounddevice unless the user pulls
-# them from the AUR.  Fedora solves the same problem by vendoring via pip;
-# Arch does not.  That gap is real and unfixed.
+# ARCH_UNAVAILABLE is only sounddevice now, which the Arch package bundles.
+# uvicorn left it on 2026-10-09: Arch ships it as ``uvicorn`` (the
+# python-uvicorn name it was checked under does not exist), and the bundled
+# --no-deps copy came without h11, so `trcc api` could not start.
 _DEV_TOOLS_DIR = _ROOT / "dev" / "tools"
 if str(_DEV_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_DEV_TOOLS_DIR))
@@ -318,3 +319,119 @@ def test_python_multipart_floor_is_at_or_above_the_import_rename() -> None:
         f"version whose module is named 'multipart' — FastAPI then refuses "
         f"every form route at import"
     )
+
+
+# ── Every hard dependency, declared by every hand-written package ───────
+
+
+def test_every_hard_dependency_is_declared_by_every_package() -> None:
+    """No package may install without a dependency the app needs.
+
+    ``python-multipart`` sat at NO for the rpm and the deb in the checker's
+    matrix, and the Arch package named ``python-multipart`` -- which on Arch
+    is defnull's ``multipart``, a different library FastAPI rejects.  Reproduced
+    2026-09-29 in clean Fedora 43 and Arch containers: ``trcc api`` could not
+    start.  The matrix is fully OFFLINE, yet the whole tool was exempted from
+    the suite as "online", so nothing failed.
+
+    A cell may be ``yes``, ``vendor`` or ``optional`` (each on record, with its
+    reason, in ``dev/tools/check_program_deps.py``); ``NO`` fails.
+    MUTATION CHECK: drop the rpm's ``python3-python-multipart``, or give Arch
+    back ``python-multipart`` → this fails.
+    """
+    from check_program_deps import matrix_rows
+
+    rows = matrix_rows()
+    assert {"python-multipart", "fastapi"} <= {r[0] for r in rows}  # sees them
+
+    missing = [(dep, target) for dep, *cells in rows
+               for target, cell in zip(("arch", "deb", "rpm"), cells, strict=True)
+               if cell == "NO"]
+
+    assert missing == []
+
+
+def test_the_nix_flake_carries_every_linux_dependency() -> None:
+    """flake.nix lists its Python dependencies by hand -- the version is
+    derived from pyproject.toml (PR #209), the dependency list is not, and
+    nothing checked it.  A dependency added to pyproject without the flake
+    leaves NixOS installs failing at import."""
+    linux = {name.lower().replace("_", "-") for name in _pyproject_linux_runtime_deps()}
+    flake = (_ROOT / "flake.nix").read_text(encoding="utf-8")
+    block = flake.split("dependencies = with python.pkgs; [", 1)[1].split("];", 1)[0]
+    listed = {line.split("#", 1)[0].strip() for line in block.splitlines()} - {""}
+
+    assert linux - listed == set(), f"missing from flake.nix: {sorted(linux - listed)}"
+
+
+# ── Packages that install, measured in containers (2026-10-09, v9.10.8) ──
+
+def _step(name: str) -> str:
+    """The body of one release.yml package-build step."""
+    text = _RELEASE_YML.read_text(encoding="utf-8")
+    start = text.index(f"- name: {name}")
+    end = text.index("\n      - name:", start + 1)
+    return text[start:end]
+
+
+def test_the_arch_package_brings_what_trcc_api_imports() -> None:
+    """Bundling uvicorn with ``--no-deps`` shipped it without h11 or
+    websockets: in a clean archlinux container ``trcc api`` died with
+    ``No module named 'h11'``, and the WebSocket routes 404'd.  Arch ships
+    uvicorn itself (``uvicorn``, depends python-h11); a bundled copy also
+    collided with it.
+    MUTATION CHECK: bundle uvicorn again, or drop either depend -> fails."""
+    arch = _step("Build Arch package")
+    bundled = re.search(r"pip install [^\n]*--no-deps ([^\n]+)", arch)
+
+    assert bundled is not None and "uvicorn" not in bundled.group(1)
+    assert {"uvicorn", "python-websockets"} <= _arch_depends()
+
+
+def test_the_rpm_installs_where_fedora_has_no_sounddevice() -> None:
+    """Fedora 43 has no python3-sounddevice; the RPM required it twice --
+    by hand and through rpm's generated ``python3.14dist(sounddevice)`` --
+    so ``dnf install`` failed.  It only drives the audio visualizer.
+    MUTATION CHECK: require it again, or drop the generated-dep filter."""
+    rpm = _step("Build RPM (Fedora)")
+
+    assert not re.search(r"Requires:\s+python3-sounddevice", rpm)
+    assert re.search(r"Recommends:\s+python3-sounddevice", rpm)
+    assert re.search(r"__requires_exclude\s+\^python3[^\n]*dist[^\n]*sounddevice", rpm)
+
+
+def test_the_deb_does_not_bundle_what_ubuntu_ships() -> None:
+    """The deb copied sounddevice into dist-packages; on Ubuntu 26.04 with
+    python3-sounddevice installed, dpkg refused: "trying to overwrite
+    '/usr/lib/python3/dist-packages/_sounddevice.py'" (rc 100).
+    MUTATION CHECK: bundle it again -> fails."""
+    deb = _step("Build DEB (Ubuntu/Debian)")
+
+    assert not re.search(r"pip install [^\n]*sounddevice", deb)
+    assert re.search(r"Recommends:[^\n]*python3-sounddevice", deb)
+
+
+def test_the_deb_brings_what_the_websocket_routes_import() -> None:
+    """uvicorn's WebSocket support is the ``websockets`` library, which
+    ``python3-uvicorn`` does not pull in: in clean Debian 13 and Ubuntu 26.04
+    containers ``import websockets`` failed, so /events and the live preview
+    stream were dead on every deb install (measured 2026-10-09).
+    MUTATION CHECK: drop python3-websockets from Depends -> fails."""
+    deb = _step("Build DEB (Ubuntu/Debian)")
+    depends = re.search(r"^\s*Depends: (python3[^\n]+)", deb, re.M)
+
+    assert depends is not None
+    assert "python3-websockets" in depends.group(1)
+
+
+def test_the_legacy_deb_brings_the_library_its_qt_wheel_links() -> None:
+    """The legacy deb pip-installs PySide6 into a venv, and that wheel links
+    libEGL.so.1, which no Depends brought: on a minimal Ubuntu 24.04 ``import
+    PySide6.QtWidgets`` failed, so the renderer -- and with it the App --
+    could not start (measured 2026-10-09 by the release's install test).
+    MUTATION CHECK: drop libegl1 -> fails."""
+    legacy = _step("Build DEB legacy")
+    depends = re.search(r"^\s*Depends: (python3[^\n]+)", legacy, re.M)
+
+    assert depends is not None
+    assert "libegl1" in depends.group(1)

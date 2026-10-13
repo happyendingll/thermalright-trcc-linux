@@ -1,7 +1,10 @@
 """Autostart manager implementations + the shared no-op fallback.
 
   * ``WindowsAutostart``  — writes HKCU\\Software\\Microsoft\\
-                            Windows\\CurrentVersion\\Run via ``winreg``.
+                            Windows\\CurrentVersion\\Run via ``winreg``
+                            (a pip install: not elevated).
+  * ``WindowsTaskAutostart`` — a sign-in scheduled task via ``schtasks``
+                            (the ``--uac-admin`` installer build).
   * ``MacOSAutostart``    — writes a LaunchAgent plist under
                             ``~/Library/LaunchAgents/`` and
                             ``launchctl bootstrap``s it.
@@ -77,10 +80,40 @@ class NoopAutostart(AutostartManager):
 
 _AUTOSTART_FILENAME = "trcc.desktop"
 
+#: Login entries earlier versions wrote under other names.  A name is an
+#: entry's identity, and nothing looked for these, so an upgraded user kept a
+#: second login entry that turning autostart off could not remove: legacy's
+#: ``trcc-linux.desktop`` (Exec ``trcc gui --resume``, ``-m trcc.cli``, or the
+#: oldest ``trcc --last-one``), next/'s ``trcc-next.desktop``, and legacy's
+#: Windows Run value ``TRCC Linux``.  Removed when they are ours -- never
+#: migrated: the current entry already holds the user's latest choice.
+_RETIRED_DESKTOP_FILES = ("trcc-linux.desktop", "trcc-next.desktop")
+_RETIRED_RUN_VALUES = ("TRCC Linux",)
+_OUR_PROGRAMS = frozenset({"trcc", "trcc.exe", "trcc-gui.exe", "trcc-next"})
+
+
+def runs_trcc(command: str) -> bool:
+    """Whether *command* (an ``Exec=`` line or a Run value) starts TRCC.
+
+    The ownership test for an entry under a retired name: a user's own entry
+    that happens to share the name is left alone.  The Windows Run value
+    quotes its program, so a quoted head is read whole.
+    """
+    if command.startswith('"') and (end := command.find('"', 1)) != -1:
+        program, rest = command[1:end], command[end + 1:].split()
+    else:
+        program, *rest = command.split() or [""]
+    name = re.split(r"[\\/]", program)[-1].lower()
+    module = next((rest[i + 1] for i, word in enumerate(rest[:-1])
+                   if word == "-m"), "")
+    ours = name in _OUR_PROGRAMS or module == "trcc" or module.startswith("trcc.")
+    log.debug("runs_trcc: %r -> %s", command, ours)
+    return ours
+
 _AUTOSTART_TEMPLATE = """\
 [Desktop Entry]
 Type=Application
-Name=TRCC (next)
+Name=TRCC Linux
 GenericName=Thermalright Cooler Control
 Comment=Auto-start TRCC ({target}) on login
 Exec={exec_cmd}
@@ -99,9 +132,11 @@ class XdgDesktopAutostart(AutostartManager):
     XDG spec is identical on each).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, config_home: Path | None = None) -> None:
+        """*config_home* stands in for ``$XDG_CONFIG_HOME`` -- a dev platform
+        keeps its entry out of the user's real login items with it."""
         xdg = os.environ.get("XDG_CONFIG_HOME")
-        base = Path(xdg) if xdg else Path.home() / ".config"
+        base = config_home or (Path(xdg) if xdg else Path.home() / ".config")
         self._path = base / "autostart" / _AUTOSTART_FILENAME
         log.info("XdgDesktopAutostart: desktop file path = %s", self._path)
 
@@ -134,10 +169,29 @@ class XdgDesktopAutostart(AutostartManager):
                   self._path)
         return None
 
+    def _retire_old_entries(self) -> None:
+        """Remove the login entries earlier versions wrote, when they are ours."""
+        for name in _RETIRED_DESKTOP_FILES:
+            old = self._path.parent / name
+            if not old.is_file():
+                continue
+            text = old.read_text(encoding="utf-8", errors="replace")
+            exec_cmd = next((line[len("Exec="):] for line in text.splitlines()
+                             if line.startswith("Exec=")), "")
+            # Every entry TRCC ever wrote carries the GNOME key; a copy of the
+            # menu entry made by a tweak tool does not.
+            if "X-GNOME-Autostart-enabled=" in text and runs_trcc(exec_cmd):
+                old.unlink()
+                log.info("XdgDesktopAutostart: removed the old entry %s", old)
+            else:
+                log.warning("XdgDesktopAutostart: %s is not one TRCC wrote — "
+                            "left alone", old)
+
     def enable(self, target: str | None = None) -> None:
         target = target or DEFAULT_AUTOSTART_TARGET
         log.info("XdgDesktopAutostart.enable: writing %s (target=%s)",
                  self._path, target)
+        self._retire_old_entries()
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._path.write_text(self._render(target), encoding="utf-8")
         self._path.chmod(0o644)
@@ -145,6 +199,7 @@ class XdgDesktopAutostart(AutostartManager):
 
     def disable(self) -> None:
         log.info("XdgDesktopAutostart.disable: removing %s", self._path)
+        self._retire_old_entries()
         if self._path.exists():
             self._path.unlink()
             log.info("Autostart disabled: %s", self._path)
@@ -153,6 +208,7 @@ class XdgDesktopAutostart(AutostartManager):
 
     def refresh(self) -> None:
         """Re-render the .desktop file if present (picks up a new Exec path)."""
+        self._retire_old_entries()
         if self._path.exists():
             installed = self.installed_target()
             log.info("XdgDesktopAutostart.refresh: re-rendering %s (target=%s)",
@@ -290,22 +346,27 @@ _WIN_RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _DEFAULT_VALUE_NAME = "TRCCNext"
 
 
-def _resolve_command() -> str:
-    """Pick the command line that launches the GUI on user login.
+def _resolve_command(target: str = DEFAULT_AUTOSTART_TARGET) -> str:
+    """The Run-key command that starts *target* at sign-in, for a pip install.
 
-    Prefer the installed console script when on PATH (PyInstaller bundle
-    or pip-installed entry point), otherwise fall back to invoking
-    ``python -m trcc gui`` so dev installs still autostart.
+    ``pythonw.exe -m trcc``, never ``launch_argv``'s choice: ``python.exe`` and
+    the pip ``trcc.exe`` launcher are both CONSOLE programs, so an entry naming
+    either opens a terminal at every sign-in.  ``pythonw.exe`` ships beside
+    ``python.exe`` in every CPython install and venv on Windows.  The flags are
+    ``AUTOSTART_TARGETS``' — ``--resume`` keeps the gui in the tray (#201).
     """
-    log.debug("_resolve_command: called")
-    # ``--resume`` for the same reason Linux passes it (#201): an autostarted
-    # instance belongs in the tray, not in your face at every login.  Windows
-    # and macOS never got it — #201 was reported on Linux and the fix landed
-    # only on the XDG path, so two of the three platforms popped a window.
-    argv = autostart_argv()
+    exe = Path(sys.executable)
+    pythonw = exe.with_name("pythonw.exe")
+    if not pythonw.is_file():
+        log.warning("_resolve_command: no %s — the Run entry uses %s, which "
+                    "opens a console window at sign-in", pythonw, exe)
+        pythonw = exe
     # Registry values quote the program so spaces in install dirs
     # (Program Files) don't break the launch.
-    return " ".join([f'"{argv[0]}"', *argv[1:]])
+    cmd = " ".join([f'"{pythonw}"', "-m", "trcc", target,
+                    *AUTOSTART_TARGETS[target]])
+    log.debug("_resolve_command(%s): %s", target, cmd)
+    return cmd
 
 
 def _winreg_module() -> Any:
@@ -325,12 +386,13 @@ def _winreg_module() -> Any:
 
 
 class WindowsAutostart(AutostartManager):
-    """Autostart via the HKCU Run registry key.
+    """Autostart via the HKCU Run registry key — for a pip install.
 
-    The Run key fires whenever the user logs in; no admin / no
-    scheduled task / no service.  Writes a single REG_SZ value pointing
-    at ``trcc gui`` (or ``python -m trcc gui`` when the
-    console script isn't on PATH yet).
+    The Run key fires whenever the user signs in, for a program that does NOT
+    need elevation.  Windows blocks elevation in the sign-in path, so the
+    installer build (``--uac-admin``) uses :class:`WindowsTaskAutostart`
+    instead — this class never starts it.  Writes a single REG_SZ value running
+    ``pythonw.exe -m trcc gui --resume``.
 
     Tests inject a stub ``registry`` module + ``command`` string so the
     full enable / is_enabled / disable cycle runs without touching the
@@ -391,10 +453,7 @@ class WindowsAutostart(AutostartManager):
         if target is None:
             log.debug("WindowsAutostart._command_for: default %r", self._cmd)
             return self._cmd
-        argv = autostart_argv(target)
-        cmd = " ".join([f'"{argv[0]}"', *argv[1:]])
-        log.debug("WindowsAutostart._command_for(%s): %r", target, cmd)
-        return cmd
+        return _resolve_command(target)
 
     def entry_location(self) -> str:
         location = f"HKCU\\{_WIN_RUN_KEY_PATH}\\{self._value_name}"
@@ -422,11 +481,36 @@ class WindowsAutostart(AutostartManager):
             return False
         return stored == self._command_for(target_from_command(stored))
 
+    def retire_old_values(self) -> None:
+        """Remove the Run values earlier versions wrote, when they are ours."""
+        if self._registry is None:
+            log.debug("WindowsAutostart.retire_old_values: no winreg")
+            return
+        for name in _RETIRED_RUN_VALUES:
+            try:
+                with self._open_key(write=False) as key:
+                    stored, _ = self._registry.QueryValueEx(key, name)
+            except OSError:
+                log.debug("WindowsAutostart.retire_old_values: %s absent", name)
+                continue
+            if not runs_trcc(str(stored)):
+                log.warning("WindowsAutostart: Run value %r is not one TRCC "
+                            "wrote — left alone", name)
+                continue
+            try:
+                with self._open_key(write=True) as key:
+                    self._registry.DeleteValue(key, name)
+            except OSError:
+                log.exception("WindowsAutostart: could not remove %r", name)
+            else:
+                log.info("WindowsAutostart: removed the old Run value %r", name)
+
     def enable(self, target: str | None = None) -> None:
         log.info("enable: target=%s", target)
         if self._registry is None:
             log.debug("WindowsAutostart.enable: winreg unavailable; no-op")
             return
+        self.retire_old_values()
         with self._open_key(write=True) as key:
             self._registry.SetValueEx(
                 key, self._value_name, 0,
@@ -439,6 +523,7 @@ class WindowsAutostart(AutostartManager):
         log.info("disable: called")
         if self._registry is None:
             return
+        self.retire_old_values()
         try:
             with self._open_key(write=True) as key:
                 self._registry.DeleteValue(key, self._value_name)
@@ -462,6 +547,7 @@ class WindowsAutostart(AutostartManager):
         Only rewrites when a value is already present — like every other
         ``refresh``, it must never enable autostart nobody asked for.
         """
+        self.retire_old_values()
         if not self._value_present():
             log.debug("WindowsAutostart.refresh: no entry — nothing to refresh")
             return
@@ -485,6 +571,216 @@ class WindowsAutostart(AutostartManager):
 
 
 # =========================================================================
+# Windows — a sign-in scheduled task, for the elevated installer build
+# =========================================================================
+
+
+#: The task's name is its IDENTITY — enable, disable and status all address it
+#: by name, and Task Scheduler shows it to the user.  Matches the applications
+#: menu entry; distinct from Thermalright's own ``TRCCAppStartup``.
+_TASK_NAME = "TRCC Linux"
+
+_SCHTASKS = (Path(os.environ.get("SYSTEMROOT", r"C:\Windows"))
+             / "System32" / "schtasks.exe")
+
+_TASK_NS = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+
+
+def _render_task_xml(command: str, arguments: str, user: str) -> str:
+    """The task definition — pure string, fully testable.
+
+    The shape the C# oracle ends up with (``Form1.cs:211-281``): a sign-in
+    trigger at the highest run level, which is what lets an elevated program
+    start without a UAC prompt, and settings that keep it alive — no time
+    limit (the default is 72 h, then Windows KILLS it) and no battery rules
+    (by default a laptop on battery never starts it).  The C# creates a default
+    task, reads it back and edits the XML; this writes it whole in one call.
+    """
+    from xml.sax.saxutils import escape
+    log.debug("_render_task_xml: command=%s arguments=%s user=%s",
+              command, arguments, user)
+    return (
+        '<?xml version="1.0" encoding="UTF-16"?>\n'
+        '<Task version="1.2" '
+        'xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
+        '  <RegistrationInfo><Description>Start TRCC Linux at sign-in'
+        '</Description></RegistrationInfo>\n'
+        '  <Triggers><LogonTrigger><Enabled>true</Enabled>'
+        f'<UserId>{escape(user)}</UserId></LogonTrigger></Triggers>\n'
+        '  <Principals><Principal id="Author">'
+        f'<UserId>{escape(user)}</UserId>'
+        '<LogonType>InteractiveToken</LogonType>'
+        '<RunLevel>HighestAvailable</RunLevel></Principal></Principals>\n'
+        '  <Settings>\n'
+        '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n'
+        '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n'
+        '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n'
+        '    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n'
+        '    <Enabled>true</Enabled>\n'
+        '  </Settings>\n'
+        '  <Actions Context="Author"><Exec>'
+        f'<Command>{escape(command)}</Command>'
+        f'<Arguments>{escape(arguments)}</Arguments>'
+        '</Exec></Actions>\n'
+        '</Task>\n'
+    )
+
+
+def _run_schtasks(args: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run ``schtasks.exe`` by absolute path — no shell, no console window."""
+    log.info("_run_schtasks: %s", args)
+    from ...core.models import SUBPROCESS_NO_WINDOW
+    return subprocess.run(
+        [str(_SCHTASKS), *args], capture_output=True, text=True,
+        errors="replace", check=False, timeout=30,
+        creationflags=SUBPROCESS_NO_WINDOW,
+    )
+
+
+class WindowsTaskAutostart(AutostartManager):
+    """Autostart via a sign-in scheduled task — for the installer build.
+
+    The installer's exes are built ``--uac-admin``, and Windows BLOCKS
+    elevation in the sign-in path, Run key included — measured on the win11 VM:
+    the entry was present, the user signed in, nothing started.  A task at the
+    highest run level is the documented way round, and the C# oracle's.
+
+    The task runs ``trcc-gui.exe`` (the windowed exe; ``trcc.exe`` is a console
+    program and would open a terminal at sign-in) with the target and its
+    flags.  Enabling or disabling also removes the old Run-key entry this
+    replaces, so an upgraded install carries no dead ``TRCCNext`` value.
+
+    ``run``, ``program`` and ``legacy`` are seams so the full cycle runs on the
+    Linux dev box against a fake ``schtasks``.
+    """
+
+    def __init__(
+        self,
+        *,
+        program: Path | None = None,
+        run: Any = None,
+        legacy: WindowsAutostart | None = None,
+        task_name: str = _TASK_NAME,
+    ) -> None:
+        self._program = (program if program is not None
+                         else Path(sys.executable).with_name("trcc-gui.exe"))
+        self._run = run if run is not None else _run_schtasks
+        self._legacy = legacy if legacy is not None else WindowsAutostart()
+        self._task_name = task_name
+        log.debug("WindowsTaskAutostart: task=%r program=%s",
+                  task_name, self._program)
+
+    @staticmethod
+    def _arguments(target: str) -> str:
+        """The task's Arguments for *target*: the target, then ITS flags."""
+        arguments = " ".join([target, *AUTOSTART_TARGETS[target]])
+        log.debug("WindowsTaskAutostart._arguments(%s): %s", target, arguments)
+        return arguments
+
+    def _installed(self) -> tuple[str, str] | None:
+        """``(command, arguments)`` of the installed task, or None if absent."""
+        import xml.etree.ElementTree as ET
+        result = self._run(["/query", "/tn", self._task_name, "/xml"])
+        if result.returncode != 0:
+            log.debug("WindowsTaskAutostart._installed: no task %r (%s)",
+                      self._task_name, result.stderr.strip())
+            return None
+        try:
+            exec_ = ET.fromstring(result.stdout.strip()).find(
+                "t:Actions/t:Exec", _TASK_NS)
+        except ET.ParseError:
+            log.warning("WindowsTaskAutostart._installed: unreadable task XML "
+                        "for %r", self._task_name)
+            return None
+        if exec_ is None:
+            log.warning("WindowsTaskAutostart._installed: task %r has no Exec "
+                        "action", self._task_name)
+            return None
+        installed = (exec_.findtext("t:Command", "", _TASK_NS),
+                     exec_.findtext("t:Arguments", "", _TASK_NS))
+        log.debug("WindowsTaskAutostart._installed: %s", installed)
+        return installed
+
+    @staticmethod
+    def _target_of(installed: tuple[str, str] | None) -> str | None:
+        """The autostart target an installed task runs, read off its Arguments."""
+        target = (target_from_argv(["<program>", *installed[1].split()])
+                  if installed is not None else None)
+        log.debug("WindowsTaskAutostart._target_of: %s -> %s", installed, target)
+        return target
+
+    def entry_location(self) -> str:
+        location = f"Task Scheduler\\{self._task_name}"
+        log.debug("WindowsTaskAutostart.entry_location: %s", location)
+        return location
+
+    def installed_target(self) -> str | None:
+        target = self._target_of(self._installed())
+        log.debug("WindowsTaskAutostart.installed_target: %s", target)
+        return target
+
+    def is_enabled(self) -> bool:
+        """True when the task exists AND runs this install for its target.
+
+        A task left pointing at a moved or older install reads as disabled, so
+        the gui re-enables it and the entry heals — the Run key's rule.
+        """
+        installed = self._installed()
+        target = self._target_of(installed)
+        enabled = (installed is not None and target is not None
+                   and installed == (str(self._program), self._arguments(target)))
+        log.info("WindowsTaskAutostart.is_enabled: %s", enabled)
+        return enabled
+
+    def enable(self, target: str | None = None) -> None:
+        import tempfile
+        target = target or DEFAULT_AUTOSTART_TARGET
+        user = f"{os.environ.get('USERDOMAIN', '')}\\{os.environ.get('USERNAME', '')}"
+        xml = _render_task_xml(str(self._program), self._arguments(target), user)
+        log.info("WindowsTaskAutostart.enable: target=%s user=%s", target, user)
+        # schtasks reads a task file as UTF-16, as the C# writes it.
+        with tempfile.NamedTemporaryFile("w", suffix=".xml", delete=False,
+                                         encoding="utf-16") as f:
+            f.write(xml)
+        try:
+            result = self._run(["/create", "/tn", self._task_name,
+                                 "/xml", f.name, "/f"])
+        finally:
+            Path(f.name).unlink(missing_ok=True)
+        if result.returncode != 0:
+            log.error("WindowsTaskAutostart.enable: schtasks failed (%d): %s",
+                      result.returncode, result.stderr.strip())
+            return
+        self._legacy.disable()
+        log.info("WindowsTaskAutostart: enabled as %s", self.entry_location())
+
+    def disable(self) -> None:
+        result = self._run(["/delete", "/tn", self._task_name, "/f"])
+        log.info("WindowsTaskAutostart.disable: schtasks exit %d",
+                 result.returncode)
+        self._legacy.disable()
+
+    def refresh(self) -> None:
+        """Rewrite the task — or migrate a Run-key entry — if one exists.
+
+        An install upgraded from the Run-key era has only the old
+        ``TRCCNext`` value: that IS the user's choice, so it becomes a task
+        for the same target.  Neither present means autostart was never
+        chosen, and refresh must not choose it for them.
+        """
+        self._legacy.retire_old_values()
+        target = self.installed_target()
+        if target is None and self._legacy._stored_value() is None:
+            log.debug("WindowsTaskAutostart.refresh: no task, no Run entry — "
+                      "nothing to refresh")
+            return
+        target = target or self._legacy.installed_target()
+        log.info("WindowsTaskAutostart.refresh: re-writing for target=%s",
+                 target)
+        self.enable(target)
+
+
+# =========================================================================
 # macOS — LaunchAgent plist + launchctl
 # =========================================================================
 
@@ -495,12 +791,28 @@ _DEFAULT_PLIST_PATH = (
 )
 
 
+def _macos_argv(target: str = DEFAULT_AUTOSTART_TARGET) -> list[str]:
+    """The LaunchAgent's argv: THIS install's program, never a PATH lookup.
+
+    launchd starts an agent with a minimal PATH and Terminal starts one with
+    the shell's, so ``launch_argv``'s ``shutil.which("trcc")`` named different
+    programs in the two -- and ``refresh`` rewrote the plist on every switch
+    between them (3 of 3 alternating launches).  The running interpreter is
+    the same either way, as in ``daemon._daemon_spawn_cmd``.  A frozen app
+    has no ``-m``: its own binary takes the subcommand.  The flags are
+    ``AUTOSTART_TARGETS``' -- ``--resume`` keeps the gui in the tray (#201).
+    """
+    head = ([sys.executable] if getattr(sys, "frozen", False)
+            else [sys.executable, "-m", "trcc"])
+    argv = [*head, target, *AUTOSTART_TARGETS[target]]
+    log.debug("_macos_argv(%s): %s", target, argv)
+    return argv
+
+
 def _resolve_macos_program_args() -> list[str]:
     """Return the argv that the LaunchAgent should run on login."""
     log.debug("_resolve_macos_program_args: called")
-    # ``--resume`` — see _resolve_command: launch hidden in the tray, the
-    # behaviour Linux has had since #201 and these two platforms had not.
-    return autostart_argv()
+    return _macos_argv()
 
 
 def _render_plist(program_args: list[str], *, label: str = _MAC_LABEL) -> str:
@@ -629,16 +941,27 @@ class MacOSAutostart(AutostartManager):
 
     def _args_for(self, target: str | None) -> list[str]:
         """``None`` keeps the constructor's argv — the injected-args seam."""
-        args = list(self._program_args) if target is None else autostart_argv(target)
+        args = list(self._program_args) if target is None else _macos_argv(target)
         log.debug("MacOSAutostart._args_for(%s): %s", target, args)
         return args
 
+    def _write_if_changed(self, body: str) -> bool:
+        """Write the plist only when *body* differs from it; True if it wrote."""
+        if (self._plist_path.is_file()
+                and self._plist_path.read_text(encoding="utf-8") == body):
+            log.debug("MacOSAutostart: %s is current", self._plist_path)
+            return False
+        self._plist_path.parent.mkdir(parents=True, exist_ok=True)
+        self._plist_path.write_text(body, encoding="utf-8")
+        log.info("MacOSAutostart: wrote %s", self._plist_path)
+        return True
+
     def enable(self, target: str | None = None) -> None:
         log.info("enable: target=%s", target)
-        self._plist_path.parent.mkdir(parents=True, exist_ok=True)
-        body = _render_plist(self._args_for(target), label=self._label)
-        self._plist_path.write_text(body, encoding="utf-8")
-        # bootstrap can fail with code 17 ("already loaded") — that's OK.
+        self._write_if_changed(
+            _render_plist(self._args_for(target), label=self._label))
+        # Enabling is the user's request, so the agent is loaded now, written
+        # or not.  bootstrap can fail with code 17 ("already loaded") — OK.
         rc = self._runner([
             "launchctl", "bootstrap", self._domain, str(self._plist_path),
         ])
@@ -663,16 +986,23 @@ class MacOSAutostart(AutostartManager):
             log.info("MacOSAutostart: disabled")
 
     def refresh(self) -> None:
-        """Re-render the plist when one is installed — see WindowsAutostart.
+        """Re-render an installed plist when its argv changed — see
+        WindowsAutostart.  Never touches launchd.
 
-        Was a no-op on the premise that the plist never changes between
-        sessions.  ``--resume`` changed it, and an existing LaunchAgent would
-        otherwise keep launching a visible window forever.
+        ``--resume`` changed the argv, and an existing LaunchAgent would
+        otherwise keep launching a visible window forever (#201).  But it ran
+        on EVERY UI start through ``enable``: a rewrite and a ``launchctl
+        bootstrap`` each time (PR #303).  launchd reads LaunchAgents at the
+        next login; ``bootstrap`` on a loaded label fails and reloads nothing,
+        and ``bootout`` would kill the UI the agent started.  So: write only a
+        difference, and leave the loaded agent alone.
         """
         if not self._plist_path.exists():
             log.debug("MacOSAutostart.refresh: no plist — nothing to refresh")
             return
         installed = self.installed_target()
-        log.info("MacOSAutostart.refresh: re-rendering %s (target=%s)",
-                 self._plist_path, installed)
-        self.enable(installed)
+        if self._write_if_changed(
+                _render_plist(self._args_for(installed), label=self._label)):
+            log.info("MacOSAutostart.refresh: re-rendered %s (target=%s) — "
+                     "launchd reads it at the next login",
+                     self._plist_path, installed)

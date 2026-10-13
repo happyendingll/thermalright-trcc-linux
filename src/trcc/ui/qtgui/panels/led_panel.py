@@ -6,16 +6,14 @@ Owns the device-key picker + connection status header and hosts a
 * :class:`ColorTab`    — global colour + brightness + presets
 * :class:`ModeTab`     — pick the animation mode
 * :class:`ZoneTab`     — per-zone colour + sync (hidden for single-zone)
-* :class:`SegmentTab`  — per-segment toggles (hidden if no segments)
 * :class:`AdvancedTab` — sensor source, test mode, clock options
 
-The header watches the ``LedColorsChanged`` event so an external
-mutation (another UI, an API client) refreshes every tab without the
-user having to click Refresh.  Zone + Segment tabs decide for
-themselves whether they have content to show, so the panel asks each
-on every refresh and hides the irrelevant ones.
+The panel follows the device's settings events (``settings_changed``) and
+app-wide changes (``app_settings_changed``), so a change from another UI or an
+API client refreshes every tab.  The Zone tab decides for itself whether it has
+content to show, so the panel asks on every refresh and hides it when not.
 
-Replaces the legacy 1390-line ``uc_led_control.py`` monolith.
+qtgui's counterpart of the gui skin's ``uc_led_control.py``, which still ships.
 """
 from __future__ import annotations
 
@@ -31,11 +29,12 @@ from PySide6.QtWidgets import (
 )
 
 from ....core.commands import DeviceState, LedSnapshot
+from ....core.events import DiskDeviceChanged
 from ....core.led_models import LEGACY_STYLE_ID, LedStyle
 from ...presentation.led_panel import led_panel_for
 from ..base import BasePanel
 from ..device_picker import DevicePickerWidget
-from .led import AdvancedTab, ColorTab, ModeTab, SegmentTab, ZoneTab
+from .led import AdvancedTab, ColorTab, ModeTab, ZoneTab
 
 log = logging.getLogger(__name__)
 
@@ -71,7 +70,6 @@ class LedPanel(BasePanel):
         self._color_tab = ColorTab(self.app, self._current_key, self._tabs)
         self._mode_tab = ModeTab(self.app, self._current_key, self._tabs)
         self._zone_tab = ZoneTab(self.app, self._current_key, self._tabs)
-        self._segment_tab = SegmentTab(self.app, self._current_key, self._tabs)
         self._advanced_tab = AdvancedTab(
             self.app, self._current_key, self._tabs,
         )
@@ -81,7 +79,6 @@ class LedPanel(BasePanel):
         # Indices used for show/hide.  Qt re-numbers when tabs are
         # added/removed, so we always look up by widget reference.
         self._tabs.addTab(self._zone_tab, "Zones")
-        self._tabs.addTab(self._segment_tab, "Segments")
         self._tabs.addTab(self._advanced_tab, "Advanced")
 
         # ── Compose ──────────────────────────────────────────────────
@@ -92,13 +89,26 @@ class LedPanel(BasePanel):
         root.addWidget(self._status_label)
         root.addWidget(self._tabs, stretch=1)
 
-        # Refresh whenever the LED settings change from elsewhere (CLI,
-        # API, another GUI).  QueuedConnection is the safe default —
-        # the event might fire from a background thread.
-        self._bus.led_colors_changed.connect(
+        # Refresh whenever the LED settings change, from any UI.  On the
+        # SETTINGS event -- it listened to LedColorsChanged, which every
+        # render publishes (~6.7/s animated), so three Queries ran per frame
+        # and a colour or brightness being picked was pulled back under the
+        # user.  QueuedConnection: the event may fire off the Qt thread.
+        self._bus.settings_changed.connect(
             self._on_led_settings_changed,
             type=Qt.ConnectionType.QueuedConnection,
         )
+        # The disk the Advanced tab picks is app-wide: follow it from any UI.
+        self._bus.app_settings_changed.connect(
+            self._on_app_settings_changed,
+            type=Qt.ConnectionType.QueuedConnection,
+        )
+        self._on_key_changed()          # show the selected device on open
+
+    def _on_app_settings_changed(self, event: object) -> None:
+        log.debug("_on_app_settings_changed: %s", type(event).__name__)
+        if isinstance(event, DiskDeviceChanged):
+            self._advanced_tab.show_disk_sensors()
 
     # ── Key plumbing ─────────────────────────────────────────────────
 
@@ -118,28 +128,13 @@ class LedPanel(BasePanel):
                 "Pick an LED device to load its state.  Open the "
                 "Devices panel to scan if no devices are listed.",
             )
-            self._set_optional_tabs_visible(zones=False, segments=False)
+            self._set_optional_tabs_visible(zones=False)
             self._advanced_tab.apply_panel(led_panel_for(1))   # plain default
+            self._zone_tab.apply_style(None)
             return
         # One Query, six tabs — instead of handing each of them a live
         # ``LedDeviceSettings`` reached off the App (an AttributeError under
         # TRCC_DAEMON=1, and a domain object a UI must not hold).
-        snapshot = self.dispatch(LedSnapshot(key=key))
-        for tab in (
-            self._color_tab,
-            self._mode_tab,
-            self._zone_tab,
-            self._segment_tab,
-            self._advanced_tab,
-        ):
-            tab.refresh_from(snapshot)
-        # Zone + Segment tabs may have nothing to show — hide them
-        # rather than confusing the user with empty editors.
-        self._set_optional_tabs_visible(
-            zones=self._zone_tab.has_visible_content(),
-            segments=self._segment_tab.has_visible_content(),
-        )
-
         state = self.dispatch(DeviceState(key=key))
         # Rebuilt from the VALUE, not used as-is.  ``LedStyle`` is a str-enum,
         # so this field arrives as the enum in-process and as a plain
@@ -154,6 +149,24 @@ class LedPanel(BasePanel):
         # style falls back to a plain panel (gauges only).
         sid = LEGACY_STYLE_ID.get(style) if style else None
         self._advanced_tab.apply_panel(led_panel_for(sid if sid is not None else 1))
+        # Before the tabs refresh: a page display has no zones, and the zone
+        # tab must know its pages to show them instead of "no zones".
+        self._zone_tab.apply_style(sid)
+
+        snapshot = self.dispatch(LedSnapshot(key=key))
+        for tab in (
+            self._color_tab,
+            self._mode_tab,
+            self._zone_tab,
+            self._advanced_tab,
+        ):
+            tab.refresh_from(snapshot)
+        # The Zone tab may have nothing to show — hide it rather than
+        # confusing the user with an empty editor.
+        self._set_optional_tabs_visible(
+            zones=self._zone_tab.has_visible_content(),
+        )
+
 
         if not state.connected:
             self._status_label.setText(
@@ -167,30 +180,23 @@ class LedPanel(BasePanel):
                 f"style {style_name}",
             )
 
-    def _set_optional_tabs_visible(
-        self, *, zones: bool, segments: bool,
-    ) -> None:
-        # The two optional tabs are added late so they always sit at
-        # the right of the bar.  Use widget lookups, not stored
-        # indices, since indices shift when other tabs are removed.
-        log.debug("_set_optional_tabs_visible")
-        for widget, show in (
-            (self._zone_tab, zones),
-            (self._segment_tab, segments),
-        ):
-            idx = self._tabs.indexOf(widget)
-            if show and idx == -1:
-                # Re-add at a stable position — after Mode, before Advanced.
-                insert_at = self._tabs.indexOf(self._advanced_tab)
-                label = "Zones" if widget is self._zone_tab else "Segments"
-                self._tabs.insertTab(insert_at, widget, label)
-            elif not show and idx != -1:
-                self._tabs.removeTab(idx)
+    def _set_optional_tabs_visible(self, *, zones: bool) -> None:
+        # Looked up by widget, not a stored index: indices shift when a tab
+        # is removed.
+        log.debug("_set_optional_tabs_visible: zones=%s", zones)
+        idx = self._tabs.indexOf(self._zone_tab)
+        if zones and idx == -1:
+            # Re-add at a stable position — after Mode, before Advanced.
+            self._tabs.insertTab(self._tabs.indexOf(self._advanced_tab),
+                                 self._zone_tab, "Zones")
+        elif not zones and idx != -1:
+            self._tabs.removeTab(idx)
 
     # ── Bus subscription ─────────────────────────────────────────────
 
     def _on_led_settings_changed(self, event) -> None:
-        log.info("_on_led_settings_changed")
         if event.key != self._current_key():
             return
+        log.info("_on_led_settings_changed: %s for %s",
+                 type(event).__name__, event.key)
         self._refresh_all_tabs()

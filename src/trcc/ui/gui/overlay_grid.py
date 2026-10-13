@@ -1,29 +1,29 @@
 """Overlay grid panel — 7x6 grid of overlay elements.
 
 Matches Windows UCXiTongXianShi (472x430). Manages element configs,
-selection, add/delete, and serialization to overlay config format.
+selection and add/delete; each edit names its element by id.
 """
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QFrame, QPushButton
 
-from ...core.models import OverlayElementConfig
+from ...core.logs import per_frame
+from ...core.models import OverlayElementConfig, OverlayMode
 from ..presentation.overlay_model import OverlayModel
-from ..presentation.overlay_serialization import (
-    configs_to_next_elements,
-    configs_to_overlay_config,
-    overlay_config_to_configs,
-)
+from ..presentation.overlay_serialization import tile_reading
 from .assets import Assets
 from .base import set_background_pixmap
 from .constants import Colors, Sizes, Styles
 from .overlay_element import OverlayElementWidget
 
 log = logging.getLogger(__name__)
+#: The metrics tick reaches every cell, once a second.
+frame_log = per_frame(__name__)
 
 
 class OverlayGridPanel(QFrame):
@@ -34,9 +34,9 @@ class OverlayGridPanel(QFrame):
     """
 
     element_selected = Signal(int, object)  # index, OverlayElementConfig
-    element_deleted = Signal(int)           # index
+    element_added = Signal(object)          # the new cell, id minted
+    element_deleted = Signal(object)        # the removed cell
     add_requested = Signal()
-    elements_changed = Signal()             # any add/delete/reorder
     toggle_changed = Signal(bool)           # overlay on/off
 
     MAX_ELEMENTS = 42
@@ -53,6 +53,9 @@ class OverlayGridPanel(QFrame):
         # this panel is a thin View that delegates + renders + emits signals.
         self._model = OverlayModel()
         self._cells = []           # OverlayElementWidget instances (always 42)
+        # The last metrics tick, re-applied whenever cells change occupant.
+        self._readings: Mapping[str, float] = {}
+        self._temp_unit = "C"
 
         self._setup_toggle()
         self._setup_cells()
@@ -86,10 +89,14 @@ class OverlayGridPanel(QFrame):
         self._toggle_btn.clicked.connect(self._on_toggle)
 
     def _on_toggle(self, checked):
+        """The switch sends the switch (``EnableOverlay``) and nothing else.
+
+        It used to re-send the whole layout too, so flipping it overwrote
+        whatever another UI had edited with this grid's copy.
+        """
         log.debug("_on_toggle: overlay_enabled=%s→%s", self._model.enabled, checked)
         self._model.set_enabled(checked)
         self.toggle_changed.emit(checked)
-        self.elements_changed.emit()
 
     def _setup_cells(self):
         """Create 42 cell widgets in the 7x6 grid."""
@@ -114,6 +121,31 @@ class OverlayGridPanel(QFrame):
             cell.config = configs[i] if i < len(configs) else None
             cell.set_selected(i == selected)
             cell.update()
+        self._apply_readings()
+
+    def update_metrics(self, readings: Mapping[str, float],
+                       temp_unit: str) -> None:
+        """A metrics tick: every hardware cell shows its live value (#301).
+
+        The C# refreshes each tile about once a second
+        (``UCXiTongXianShiTimer``); clock cells repaint so their time moves.
+        """
+        frame_log.debug("update_metrics: %d reading(s) temp_unit=%s",
+                        len(readings), temp_unit)
+        self._readings, self._temp_unit = readings, temp_unit
+        self._apply_readings()
+
+    def _apply_readings(self) -> None:
+        """Each occupied cell shows its own reading from the last tick."""
+        frame_log.debug("_apply_readings: %d cell(s)", len(self._cells))
+        for cell in self._cells:
+            if cell.config is None:
+                cell.show_reading(None)
+            elif cell.config.mode == OverlayMode.HARDWARE:
+                cell.show_reading(tile_reading(cell.config, self._readings,
+                                               self._temp_unit))
+            else:
+                cell.update()
 
     def _on_cell_clicked(self, index):
         count = len(self._model)
@@ -164,24 +196,26 @@ class OverlayGridPanel(QFrame):
         self._toggle_btn.blockSignals(False)
 
     def add_element(self, config):
-        """Add an element to the grid."""
+        """Add a copy of *config* as a new element, with its own id."""
+        log.debug("add_element: %s", config.mode.name)
         if self._model.add(config):
             self._refresh_cells()
-            self.elements_changed.emit()
+            self.element_added.emit(self._model.selected_config)
 
     def delete_element(self, index):
         """Delete element at index."""
+        log.debug("delete_element: index=%s", index)
+        removed = self._model.config_at(index)
         if self._model.delete(index):
             self._refresh_cells()
-            self.element_deleted.emit(index)
-            self.elements_changed.emit()
+            self.element_deleted.emit(removed)
 
     def update_element(self, index, config):
         """Update config for element at index."""
         log.debug("update_element: index=%s", index)
         if self._model.update(index, config):
             self._cells[index].set_config(config)
-            self._cells[index].update()
+            self._apply_readings()
 
     def get_selected_index(self):
         return self._model.selected_index
@@ -201,22 +235,3 @@ class OverlayGridPanel(QFrame):
     def clear_all(self):
         self._model.clear()
         self._refresh_cells()
-
-    def to_overlay_config(self):
-        """Convert to OverlayRenderer config format."""
-        return configs_to_overlay_config(self._model.all_configs(), self._model.enabled)
-
-    def to_next_elements(self) -> list[dict]:
-        """Grid → next/ ``OverlayElement`` dicts for the Command bus.
-
-        The shape ``SetOverlayConfig`` accepts (id + flat font + type).  This
-        is what edits dispatch; ``to_overlay_config`` (legacy keyed shape)
-        stays for any local-state consumers.
-        """
-        if not self._model.enabled:
-            return []
-        return configs_to_next_elements(self._model.all_configs())
-
-    def load_from_overlay_config(self, overlay_config):
-        """Load from OverlayRenderer config format."""
-        self.load_configs(overlay_config_to_configs(overlay_config))

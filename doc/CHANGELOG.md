@@ -1,5 +1,1086 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **An RGB Lighting page, in both windows.** The classic window has an RGB
+  button above Control Center; the new window has an "RGB Lighting" entry.
+  It lists your RGB memory and OpenRGB's devices, each with a tick for
+  whether it takes part, and offers three sources:
+  - **Leave alone:** TRCC sends nothing.
+  - **Built-in effect:** one of the memory's own ten effects, saved on the
+    stick. It shows only the controls that effect takes.
+  - **Follow a device:** any connected LCD, whose live picture (a video
+    too) lights them, or an LED cooler. Each light takes a thin strip at
+    its edge of the picture, one region per LED, top to bottom. The theme's
+    clock and readings are left out, so a light follows the video, not the
+    digits. **Colours** picks how a region becomes one colour: *Vivid* (its
+    brightest pixels, so small bright details such as stars still show) or
+    *Smooth* (its average, steadier). The colours are corrected for LEDs,
+    which would otherwise show a screen's deep red as pinkish white. When
+    following stops, each light keeps its last colours.
+
+  While following an LCD, a live preview shows its picture and the colours
+  each light gets. Under the two other sources, each stick is drawn running
+  its effect -- TRCC's drawing from the effect's settings, since the stick
+  runs it itself, so the real one may differ in detail. "Find lights" searches for the memory and for OpenRGB at
+  the address you type. The same is `trcc system rgb`, `trcc system
+  ram-effect` and `trcc system follow --source/--mapping/--target`, or
+  `/system/rgb`, `/system/ram-effect` and `/system/rgb-follow` in the API.
+  The OpenRGB and RAM switches on the settings panel (classic window) and the
+  LED panel's Advanced tab (new window) moved here.
+
+### Fixed
+
+- **The overlay grid shows live values again -- or rather, for the first time
+  (#301).** Each tile in the classic window's overlay grid showed only its
+  sensor's name: the window received every sensor reading and never passed it
+  to the tiles. They now show the value and unit, refreshed with each reading
+  as the Windows app does, using the panel's own rule, so a °F user sees °F and
+  a GPU fan that reports only a percentage shows a percentage.
+- **The panel's fan readings follow the fan names again (#145).** A system
+  dashboard saved by TRCC before v9.10.0 held guessed fan assignments (any
+  motherboard fan, in order), and since v9.10.6 those guesses decided what the
+  panel's CPUFAN/GPUFAN/SSDFAN/FAN2 showed -- a case fan in place of the GPU's.
+  Such a dashboard now has its fan rows cleared once and re-matched by name.
+  If you picked fans by hand on v9.10.6 or v9.10.7, pick them again.
+- **Opening a TRCC window no longer starts a second TRCC app beside the first
+  (#314).** The background app opened its connection only after connecting
+  every cooler, which on some panels takes more than the 10 seconds a window
+  waited, so the window started an app of its own and the two fought over the
+  panel. The app now answers at once, and only one can run per user: two
+  windows opened together no longer start two.
+- **The Fedora package installs on Fedora 43.** It required
+  `python3-sounddevice`, which Fedora 43 does not have. The audio visualizer
+  is the only thing that needs it, so it is now recommended, not required.
+- **The Ubuntu/Debian package installs when `python3-sounddevice` is
+  already installed.** TRCC bundled its own copy and the two collided. It now
+  uses the system package (recommended) instead.
+- **`trcc api` works on Arch.** The package bundled the web server without
+  the libraries it needs; it now uses Arch's own `uvicorn` and
+  `python-websockets`.
+- **The API's live preview and event stream work on Debian/Ubuntu and Arch.**
+  Neither package installed the WebSocket library, so `/events` and the live
+  preview stream answered 404; both now depend on it.
+- **The Ubuntu 22.04 / 24.04 (legacy) package starts on a minimal install.**
+  Its Qt needs `libEGL`, which the package did not ask for; a desktop usually
+  has it, a minimal or server install did not, and TRCC could not start.
+- **Starting the audio visualizer on a machine with no sound server no longer
+  fails with an error;** it switches the visualizer off and says why.
+- **openSUSE:** the install guide no longer offers the Fedora RPM, which
+  openSUSE refuses; it points to pipx, which works.
+- **Package installs are no longer told their udev rules are missing, and a
+  stale copy no longer blocks rule updates (#201).** The deb and Arch
+  packages put the rules in `/lib` or `/usr/lib`, but a failed connect only
+  looked in `/etc` and told you to run setup -- which then wrote an `/etc`
+  copy that hides the packaged rules for good, so later fixes never applied.
+  Every check now looks where udev does; `trcc doctor` names an outdated copy
+  and the command to remove it; and `trcc system setup` leaves a current
+  packaged rule in force, removing only an `/etc` copy TRCC wrote itself.
+- **`trcc system upgrade` no longer upgrades your whole system.** It ran the
+  distro's own upgrade for `trcc-linux` -- a package no distro repo carries --
+  so on Debian/Ubuntu it upgraded every other package and reported success
+  with TRCC unchanged, and on Arch it did a partial system upgrade. It now
+  prints the exact command for how you installed TRCC (pipx, pip, the release
+  package for your distro, or the download page), and runs nothing; the
+  window's update button shows the same command.
+- **The README and guides no longer name commands that do not exist (#247)**,
+  and `-v` / `-vv` are shown where the CLI accepts them (`trcc -vv gui`).
+
+## v9.10.8
+
+### Security
+
+- **TRCC's polkit policy no longer lets other programs run tools as root.**
+  To read your memory speed without a password, the policy allowed
+  `dmidecode` and `smartctl` to run as root for anything in your desktop
+  session -- and pkexec passes along whatever arguments it is given, so any
+  program could run those tools as root with arguments of its choosing
+  (`dmidecode` can create a root-owned file anywhere; `smartctl` can change
+  drive settings). The policy now names only TRCC's own helpers, which take no
+  arguments: the new `trcc-dmi` reads the memory-module table and passes back
+  only the fields TRCC shows, so serial numbers stay private too. `smartctl`
+  is no longer granted at all; nothing in TRCC used it. Installing the new
+  package, or running `trcc system setup` on a pip install, also removes
+  `/etc/polkit-1/rules.d/50-trcc.rules`, a rule that releases 5.3.3 to 9.6.5
+  wrote, which allowed the same tools in any session, SSH included. The
+  packages now declare `dmidecode`, which the memory speed needs.
+
+### Fixed
+
+- **`trcc report` no longer opens a panel TRCC is driving.** The report runs
+  in its own process and opened every LCD a second time to read its
+  handshake: while TRCC was running that usually failed (so the report showed
+  the catalog name instead of your cooler), and on some HID panels it could
+  disturb the panel TRCC was driving. It now asks the running TRCC app for
+  each panel it holds, and only probes panels nothing else is using.
+
+- **Two of the same cooler no longer get each other's settings after a USB
+  hiccup (#287, #317).** Three places still picked "the first one listed"
+  instead of the unit they meant: the LED controller's saved identity (two
+  different LED coolers on one USB id could swap styles after a restart),
+  the re-connect after a USB reset, and the HID panel connection. Each now
+  uses its own unit, or refuses rather than drive the other one.
+- **Starting TRCC hidden no longer pops up the window that is already open.**
+  A second `trcc gui --resume` -- autostart, or the desktop restoring your
+  session -- brought the running window to the front; it now leaves it be.
+- **SCSI panels no longer print two warnings every time they connect.** The
+  panel's normal answer to TRCC's first question was logged as an error. When
+  a panel really does not answer it, TRCC now warns that it guessed the size.
+- **macOS: watching for plugged-in coolers no longer fills the log (#283).**
+  The once-a-second check wrote several lines each time and asked every panel
+  for its serial number; it now does neither. (Not yet confirmed to change
+  the panel resetting on macOS.)
+- **`POST /display/create-theme` no longer leaves every upload behind.**
+
+## v9.10.7
+
+### Added
+
+- **Your OpenRGB devices can follow the cooler's colours (#160).** TRCC
+  connects to OpenRGB's SDK server and sends the LED cooler's colours to every
+  OpenRGB device -- motherboard, RAM, fans, strips -- so the whole PC matches.
+  Start the server in OpenRGB's SDK Server tab, then turn it on in the
+  settings panel (classic window), the LED panel's Advanced tab (new window),
+  `trcc system follow openrgb`, or `POST /system/rgb-follow`. Off by default;
+  it puts the OpenRGB devices in direct mode while it runs. Built on OpenRGB's
+  SDK protocol (credited in the README).
+- **Corsair RGB RAM can follow the cooler's colours with no OpenRGB (#160).**
+  TRCC finds the sticks' lighting controller on the chipset SMBus by reading
+  its id, checks its device info, and sends the colours itself -- the same
+  bytes OpenRGB sends. It never touches the memory's SPD chips. Pick it in the
+  same places (`trcc system follow ram`); it is one choice with OpenRGB, so
+  the two never drive the same sticks. Linux; needs the `i2c-dev` module and
+  access to `/dev/i2c-*`. Adapted from OpenRGB's Corsair DRAM controller
+  (credited in the README).
+
+### Fixed
+
+- **Changing a font no longer freezes the window's preview (#301).** Picking
+  a font in the classic window's overlay editor stopped its preview for good,
+  while the panel itself kept updating. The font dialog froze TRCC's other
+  threads while it was open, so the window stopped receiving frames from the
+  TRCC app, and the app stopped sending them. The dialog no longer blocks.
+
+- **A window that stalls for a moment no longer stops updating for good.**
+  The TRCC app drops a window that hasn't taken its updates within half a
+  second, and the window never reconnected, so its preview and status stayed
+  frozen until it was reopened. It now reconnects by itself within a fraction
+  of a second; only the updates sent during the stall are missed. Opening an
+  update stream also no longer loses the first updates that arrive with it.
+
+- **SCSI panels are named from their own handshake again (#301).** Since
+  v9.10.6 TRCC threw away the reply to a 0402:3922 panel's first poll, because
+  the USB host reports an error alongside it. The panel's model byte was lost
+  and replaced by a default, which names a Frozen Warframe Pro. The reply is
+  kept again when the panel itself says the command
+  succeeded, as before v9.10.6.
+
+- **TRCC no longer crashes within seconds on Python 3.10 and 3.11.** PySide6
+  6.12.0, released this week, has a bug on those Python versions that aborts
+  the program after a few thousand drawing calls ("Fatal Python error:
+  none_dealloc"). A new install there, such as the legacy .deb on Ubuntu
+  22.04 or pipx on Python 3.10/3.11, picked it up. TRCC now asks for PySide6
+  older than 6.12 on Python 3.10 and 3.11; Python 3.12 and newer, the Windows
+  and macOS builds, and distro packages are not affected.
+
+- **With only LED coolers, TRCC no longer loads its drawing engine (#299).**
+  An LED cooler shows a segment display, which needs no Qt rendering, but the
+  background service loaded it anyway: about 30 MB of memory for nothing
+  (58 MB instead of 90 MB, measured). It is still loaded whenever an LCD is
+  found. An LCD that appears after an LED-only start (unlikely, as coolers
+  sit inside the case) shows a message asking you to restart TRCC.
+
+- **Clicking a cloud background no longer stalls, and every downloaded one
+  gets its animated tile.** Clicking a cloud background whose animated tile
+  had once failed to generate ran ffmpeg again on every click, for up to 40
+  seconds. A click now only plays the video; tiles are made when the
+  background is downloaded, and TRCC fills in any missing ones in the
+  background after it checks its data at start. Without ffmpeg the tiles stay
+  still pictures, as in the Windows app.
+
+- **The overlay colour editor remembers your recent colours, per device.**
+  The row of 11 small swatches did nothing. As in the Windows app, the colour
+  you end an edit on is added to the front when you move to another element,
+  and clicking a swatch uses that colour again. Both windows share the row:
+  the new window offers it as the colour dialog's custom colours.
+
+- **The overlay colour editor picks colours in place, as the Windows app
+  does.** The classic window had the Windows app's hue strip painted on the
+  panel but did nothing with it, and clicking the colour square opened a
+  separate colour dialog. Dragging along the strip now picks a hue, and
+  clicking or dragging in the square picks a shade of it.
+
+- **The video trimmer's preview no longer freezes the window.** Playing or
+  dragging along the timeline started one ffmpeg per frame on the window's
+  own thread, which held it for 70-290 ms each time: the window froze and the
+  preview showed 3-6 frames a second. It now decodes the trimmed range once in
+  the background, as the Windows app does, and plays it at the chosen frame
+  rate; a drag shows where the mouse stopped. The preview is drawn by the same
+  steps as the export, so it shows exactly what Export makes. Measured on a
+  1080p clip: about 40 times less CPU while previewing.
+
+- **Fit width, Fit height and Stretch work in the new trimmer.** Exporting
+  with any of them was refused as an unknown fit, and the preview showed the
+  Fit height crop for all three.
+
+- **The video trimmer offers 15 or 24 frames per second, and starts at 15,
+  as the Windows app does.** Every trimmed clip was 24 fps: the choice was
+  never ported. It is the FPS row in the classic window, a "15 fps / 24 fps"
+  pair in the new one, `--fps` on `trcc display export-video`, and `fps` in
+  the API's export body. 15 fps clips are smaller and decode faster on the
+  panel.
+
+- **Sensors read from HWiNFO no longer risk crashing TRCC on 64-bit Windows.**
+  The address of HWiNFO's shared memory was cut to 32 bits, so reading it
+  could crash the app instead of failing cleanly. Not yet checked on Windows.
+
+- **A screencast region is cast correctly on a scaled Wayland screen, and on
+  a primary monitor that is not the leftmost.** On GNOME or KDE at 125% or
+  200%, the panel showed the wrong part of the screen, smaller than the area
+  you picked; and a picked region was counted from the primary monitor's
+  corner, not the desktop's. Not yet checked on a real scaled session.
+
+- **The LED carousel interval matches the Windows app.** Its number now
+  means what the Windows app's does (6 animation ticks each, so "2" is 1.8
+  seconds), where the classic window converted it about 10% differently. The
+  new window showed raw ticks; it now shows the same number as the classic
+  window and the Windows app. New devices default to 2, as on Windows.
+
+- **A saved video theme plays without ffmpeg installed.** A theme's
+  `Theme.zt` holds ready JPEG frames and needs no ffmpeg to play, but TRCC
+  refused to load one when ffmpeg was missing, leaving the panel black.
+
+- **The background App and CLI no longer pick up the desktop's Qt settings
+  (#299, #311).** The headless renderer let an inherited
+  `QT_QPA_PLATFORM=wayland` win, so a service or a session that had ended
+  crashed on the first render, and an App started from a Wayland window tied
+  itself to that session. It also loaded the desktop's Qt theme plugin, which
+  for KDE brings in the Quick and Wayland libraries reported in #299 (+19 MB
+  for gtk3 alone). It now always renders offscreen with no theme plugin.
+
+- **A theme download that fails is tried again, and you are told (#309).**
+  When the first download of a panel's themes, cloud backgrounds or masks
+  failed (most often: TRCC started at login before the network was up), it
+  was never tried again until `trcc kill` or a replug, and the grids just
+  stayed empty. TRCC now retries after 30 seconds, 2 minutes and 10 minutes,
+  tries again whenever the panel reconnects, and shows the failure in the
+  window (a tray notice in the classic window, the status bar in the new one).
+
+- **A saved theme keeps its cloud video background after `~/.trcc` is wiped
+  or reinstalled.** Saving a theme whose background was a cloud video only
+  pointed at the downloaded file, and nothing downloads that file again, so
+  the theme loaded black. The video is now copied into your own library when
+  you save, as a custom background already was. Cloud images and masks still
+  point at the cloud library, which the data download restores.
+
+## v9.10.6
+
+### Changed
+
+- **A command run as root shares the App again, unless it was raised with
+  `sudo`, `run0`, `pkexec` or `doas`.** v9.10.5 sent every root process to its
+  own App, so on a root-only machine (Proxmox, a headless Pi) each one-shot
+  command blanked the panel when it exited, and a root systemd service's
+  clients could not reach it (#150, #246, #267). A root login or service now
+  finds or starts the App like any user; `sudo trcc system setup` still runs on
+  its own and leaves nothing behind. Root's socket is always `/root/.cache`, so
+  a service and an ssh session find each other.
+- **The sensor dashboard's FAN rows choose which fan the LCD shows** as CPUFAN,
+  GPUFAN, FAN1 and FAN2, as in the Windows app (#145). By default a fan whose
+  name says CPU, SSD/NVMe or SYS/pump takes that slot, then spinning fans fill
+  the rest; a GPU's own fan never fills a motherboard slot. The dashboard and
+  the panel used to choose differently.
+- **The gui's Activity list is your sensor dashboard**, custom panels
+  included, so anything the dashboard shows can be placed on the panel
+  (#223, #259, #310).
+- **`trcc display load-video` plays the file itself**, with the fit mode
+  applied live and changeable while it plays (#291). `--start`, `--end` and
+  `--rotation` still cut a clip into a Theme.zt at the panel's size and fit.
+- **Connecting names the cooler it found.** `trcc device connect` prints a
+  `device:` line, `trcc status` names each device, and the REST API gains
+  `GET /devices/{key}/state` (#272). The Python result field
+  `native_resolution` is now `catalog_resolution`, because it is the catalog's
+  guess for the USB id, not the panel's size.
+
+### Added
+
+- **Game mode**, from the Windows app: above a CPU load you choose, the panel
+  shows only the overlay on black, once a second, until the load drops. Every
+  window, `trcc display game` and the REST API can switch it.
+- **More sensors** (#259, #301, #310): GPU hot spot and memory temperature,
+  each CPU core (Intel) or CCD (AMD), each memory module ("DIMM n"), and the
+  board's voltages, read as the chip reports them.
+
+### Fixed
+
+- **Sensor names say what they measure** ("Radeon RX 7800 XT Temperature"),
+  each GPU is listed once instead of three times, and an AMD card is named
+  ("AMD Radeon RX 6800 XT") instead of by its BIOS part number (#301).
+- **Vendor themes' RAM, disk and network elements showed the wrong
+  readings**: our table of the Windows app's sensor codes had those rows in a
+  different order from the Windows app.
+- **Exporting a video theme to `.tr` refused** and pointed at `.zip`, which the
+  Windows app cannot open. It now carries the video as Theme.zt frames, as a
+  Windows export does.
+- **`.gif`, `.mkv` and `.avi` backgrounds could not be saved** in a theme.
+- **No "NVIDIA GPU present" warning** on machines without an NVIDIA card (#231).
+- **A 0416:5302 panel on firmware 4.07 that answers the normal handshake can
+  reconnect** after sleep or a stale USB handle; it was given the Frozen
+  Warframe SE's "never reconnect" rule and stayed blank (#283).
+- **A Frozen Warframe SE introduces itself by name** instead of "USBDISPLAY"
+  (#295).
+- **A serial number in a 36-byte reply is kept** (#302, thanks @1Nexus0).
+- **A SCSI panel that is unplugged or offlined on Linux is noticed** instead
+  of every frame counting as sent (#254). (macOS/BSD too; Windows still to do.)
+- **Reconnecting opened the USB device twice.**
+- **macOS: the login agent is rewritten only when it changed**, never reloaded
+  on every launch, and runs this install's Python instead of whichever `trcc`
+  is on PATH (PR #303 found the problem).
+- **Windows: `trcc` is found in a new terminal right after installing**,
+  instead of only after signing out (#218).
+- **A sensor with no Windows-app code survives `config1.dc`**: board probes,
+  voltages and DIMMs were dropped from user masks and exports.
+- **The cloud theme tab no longer runs ffmpeg while drawing**, which froze it
+  briefly on every visit (#264).
+- **Install guides**: Ubuntu 24.04 / Mint 22 use the legacy .deb; Arch, SteamOS
+  and openSUSE package names corrected (#293, #309, #316).
+- The v9.10.5 entry below said no owner of a SCSI FBL 51 panel had reported
+  in; @PourrezJ had, with the same fix (#313).
+
+## v9.10.5
+
+### Breaking
+
+- **TRCC now runs as one background App that every window and command
+  shares.** Opening `trcc gui`, `trcc qtgui`, the API or any `trcc` command
+  finds the running App or starts it, and all of them control the same panels.
+  Closing a window no longer stops the panels; `trcc kill` does, and closes
+  every open window, `trcc api` and `trcc shell` with it. If the App crashes,
+  each open window starts a new one and says so; a second crash within a
+  minute leaves it closed, and `trcc report` has the reason. Set
+  `TRCC_DAEMON=0` to keep the old behaviour, where each process drives the
+  panels itself. Windows is unchanged (Python there has no Unix sockets), and a
+  command run as root never starts or joins the shared App.
+- **`trcc ensure-daemon` is removed.** Every command and window now finds or
+  starts the App on its own, so there is nothing left for it to do.
+- **`POST /trcc/ensure` is removed from the REST API**, for the same reason: the
+  API server is itself a client of the App.
+- **The `EnsureDaemon` command is removed** (for anyone scripting against the
+  Python command bus).
+- **`trcc theme export-config` and `trcc theme import-config` are removed**,
+  with the REST API's `GET /theme/{key}/config-download` and
+  `POST /theme/config/import-upload` and the `ExportConfig` / `ImportConfig`
+  commands. **Security:** importing a config restored every device setting
+  without checking paths, so a config naming any file you can read as the mask
+  made the next theme download contain that file. The API listens on this
+  machine with no token by default, so any local program could do it. The
+  feature also never worked across machines (configs hold absolute paths), and
+  the Windows app has no config import. Back up a look with the theme export
+  instead (`trcc theme export-current`, or the export button in `trcc gui`).
+- **"Flash an overlay element" is removed**: `trcc display overlay-flash`, the
+  API's `POST …/overlay-elements/{id}/flash`, the Qt gui's "Flash on screen"
+  button and the `FlashOverlayElement` command. It promised to highlight the
+  element but nothing ever drew the highlight, in any window. The Windows app
+  has no such highlight either; selecting an element marks it in the editor.
+
+- **The LED "segment on/off" setting is removed**: `trcc led toggle-segment`,
+  the API's `POST …/led/toggle-segment`, the Qt window's Segments tab, the
+  `ToggleSegment` command and `segment_on` in the LED snapshot. Turning a
+  segment off was saved but never reached the cooler or the preview, and the
+  Windows app has no such control: which segments light is decided by the
+  values shown. Saved settings carrying it load as before.
+
+### Added
+
+- **Export what the screen is showing, as the Windows app does.** In
+  `trcc gui` the export and import buttons now sit at the top of the local
+  theme list, where the Windows app puts them. Export writes whatever is on
+  the screen right now, saved or not, to a `.tr` file the Windows app can
+  open, or to a `.zip` that also keeps a video background; it is named after
+  the theme name box. Before, export looked for a saved theme with the same
+  name as the file you typed, and failed if there was none. The same export
+  is `trcc theme export-current` on the command line and
+  `GET /theme/{key}/download` in the API.
+- **A frame shows on your desktop round the area being cast.** As in the
+  Windows app, while a screen cast runs, a thin grey frame marks what is being
+  sent to the cooler's screen, in both `trcc gui` and `trcc qtgui`. Drag the
+  frame to move what is cast; double-click it, or use the border button, to
+  hide it. The frame sits just outside the cast area, so it never appears on
+  the cooler. Wayland does not let a window place itself on screen, so there
+  the border button lets you drag out a new area instead.
+- **A widescreen screen's preview can pop out into its own window.** As in
+  the Windows app, double-click the preview of a wide screen (800x480 up to
+  1920x462, and their portrait forms) in `trcc gui` and it opens in a
+  separate, always-on-top window you can drag anywhere, larger than the
+  preview in the main window. Editing works there as it does in the main
+  window. Turning the screen to portrait turns the window with it, and the
+  power button in its corner puts the preview back. The 1280x480 window also
+  uses the Windows app's current, half-size frame instead of an older
+  full-size one.
+- **The new interface (`trcc qtgui`) can type and nudge the screen-cast
+  region.** It had only "Choose region…", which drags one. It now has X, Y,
+  W and H boxes, whose arrows move the region a pixel at a time, as the
+  Windows app's +/- buttons do. Changing the width sets the height to match
+  the screen's shape, and changing the height sets the width, in both
+  interfaces. The change is sent when you press Enter, leave the box or click
+  an arrow, not on every key.
+- **Each screen keeps its own screen-cast region, and themes carry one.**
+  Like the Windows app, a theme or mask stores where on your desktop to cast
+  from, and loading it sets that region; saving or exporting a theme writes
+  yours back. Start without typing numbers casts the stored region, where it
+  used to send nothing. Editing the region moves a running cast without
+  restarting it, and every window shows the same region: the Windows-style
+  gui's X/Y/W/H fields (sent when you press Enter or leave the field, or
+  click +/-), the Qt gui's region picker, `trcc display screencast-region`
+  and `POST …/display/screencast/region`. The Windows-style gui's border
+  button and a new Qt gui checkbox store whether to hide the frame around
+  the region (the frame is described above). `trcc display screencast`
+  and `POST …/screencast/start` no longer need a region.
+  The region now keeps the shape of the picture it fills, which turns when
+  you rotate the screen. Before, it kept the shape of the unrotated panel, so
+  a portrait-mounted screen locked a landscape region.
+- **The media player plays web videos and live streams.** Give it an http,
+  https or rtsp address (`trcc display media-player <key> <url>`, or the REST
+  API) and it plays on the panel at 16 frames a second, with your theme's
+  overlay on top, the same way a screen cast does; a video file on a web
+  server loops. It needs ffmpeg. Other kinds of address, such as `file://`,
+  are refused. Before, a web address was only noted down and nothing played,
+  and setting one could lose the background you had.
+  Both windows can start it: the Windows-style gui has a **Web Video** button
+  beside Load Video, and the Qt gui's Display panel has a Media player row
+  that takes a file or an address. The Qt gui and `trcc status` now also say
+  what the screen is showing.
+- **HTTPS for the REST API: `trcc api --tls`.** The first start makes a
+  certificate and keeps it in the config directory. Every start prints its
+  SHA-256 fingerprint, so a phone app or Home Assistant can pin it; it stays the
+  same across restarts until it expires in ten years. Bring your own with
+  `--tls-cert` and `--tls-key`. Without `--tls` nothing changes. Adds the
+  `cryptography` package as a dependency.
+
+### Changed
+
+- **Gentoo: install with pipx.** The Gentoo ebuild in the repository had not
+  been updated since 8.8.1 and could no longer build; the install guide now
+  gives the pipx steps instead. The released Arch, Debian and Fedora packages
+  are unchanged (they are built by the release itself).
+- **"(next)" is gone from what you see.** The login entry is named
+  "TRCC Linux" (it said "TRCC (next)"), the Qt window's title drops "(next)",
+  and `trcc --help` and the `gui` / `qtgui` help no longer describe a
+  rebuild in progress. The REST API reports the real version instead of
+  "next".
+- **For developers: a `Renderer` no longer implements `to_raw_rgb24`.**
+  Nothing called it once screen casts moved into the App.
+- **Each screen orientation now remembers its own theme, brightness and
+  slideshow,** as the Windows app does. Turn the screen back and it shows what
+  you last chose in that orientation. The first time you turn it, what was
+  playing carries over (that orientation's version of the same theme), and
+  Theme1 shows only when nothing was ever played. 0° and 180° share one memory,
+  as do 90° and 270°.
+- **Importing a theme now shows it on the screen,** as in the Windows app,
+  from every window, the command line and the API. Before, it was only added
+  to the theme list.
+- **The local theme list (`trcc gui`) shows every theme in one list,** as
+  the Windows app does; the "Default" and "User" filter buttons are gone.
+  The delete button now appears on exactly the themes you saved or imported.
+  Before, it followed the position in the list, so on 854x480 screens five
+  of the built-in themes offered a delete that then failed. The unused
+  "export all" button is also gone; the Windows app hides it too.
+- **The Qt gui (`trcc qtgui`) no longer has a screen-cast "Update rate"
+  slider.** Every interface now casts at the Windows app's one fixed rate,
+  about 17 frames a second; before, only that slider could change it, so the
+  same cast ran at a different speed depending on which window started it.
+
+- **A clock's time and date format belongs to the clock, as in the Windows
+  app.** There used to be one 12h/24h and date setting that applied to every
+  clock on every screen and survived switching themes; now each clock keeps
+  its own, and a theme shows the format it was made with. The gui's format
+  button changes the selected clock only (it changed every screen). `trcc
+  config time-format` / `date-format` still set every clock at once; their
+  API routes can name one screen. Your current look is carried over when you
+  upgrade.
+
+- **Widescreen (1600×720) panels show the Dynamic Island at style 2 until you
+  choose**, as the Windows app does. Before, only the Windows-style gui turned
+  it on, by rewriting the setting every time it opened; the Qt gui, the CLI and
+  the API left it off. A style you chose, "off" included, is kept.
+- **Opening the gui no longer rewrites brightness, orientation or split mode**
+  for each panel. It shows what the App has and changes nothing.
+- **On a PA120 or LF10, `trcc led off` and `trcc led brightness` (and the
+  matching API routes) reach the selected zones**, as the panel's controls do
+  in the Windows app. With "select all" on, which is now how these coolers
+  start, that is every zone.
+- **`trcc led select-zone` (and the API route) selects exactly that zone.** On
+  a cooler with metric pages it is the page shown; on a PA120 or LF10 it turns
+  "select all" off, so colour, effect and brightness then reach that zone
+  alone. It did nothing on those two before.
+
+### Fixed
+
+- **Windows: TRCC no longer stalls for about 9 seconds on every log line.**
+  Since 9.10.0, each line written to the log waited on a lock it already held,
+  so starting up took minutes and every action was slow, with a
+  "Logging error … Resource deadlock avoided" message after each line. A
+  command that did not finish in a minute on 9.10.4 now takes about a second.
+- **Windows: closing the window hides it to the tray, every time.** It
+  minimised to the taskbar instead, and closing it again after restoring it
+  from the taskbar quit TRCC. Closing now hides to the tray as the Windows app
+  does; quit from the tray menu.
+- **Windows: a panel that needs administrator rights says so.** When Windows
+  refused access to the panel, TRCC treated it as "not ready yet", retried it
+  every few minutes for as long as it ran, and never said to run it as
+  administrator. It now says so once and stops retrying.
+- **Colours sent in the byte order the Windows app uses, for three panel
+  types.** The SCSI one is confirmed on a real panel (below); the other two
+  are not yet -- if colours look red/blue swapped after this, please open an
+  issue with `trcc report`:
+  - LY panels (0416:5409) and bulk panels reporting PM 50: big-endian, as
+    the Windows app sends them (they were sent little-endian).
+  - SCSI panels reporting FBL 51: big-endian (USB HID panels with FBL 51 keep
+    little-endian, which their owners confirmed). @PourrezJ found and fixed
+    this on his own panel at the same time -- a green theme showed pink
+    (#313). *This entry said no owner had reported in; he had, and it was
+    corrected after the release.*
+  - The boot animation now uses the panel's own byte order. It was always
+    sent big-endian, so FBL 36, 37 and 50 panels got theirs with red and blue
+    swapped.
+- **Upgrading no longer leaves a second login entry behind.** Older versions
+  started TRCC at login from `trcc-linux.desktop` or `trcc-next.desktop`
+  (and, on Windows, a "TRCC Linux" startup entry), and the current version
+  never looked at them, so turning autostart off left TRCC starting anyway.
+  TRCC now removes those entries when it wrote them, and leaves alone any
+  entry of the same name that it did not write.
+- **PA120 and LF10 coolers: the zone switch is labelled "Select all".** Both
+  windows called it a carousel (the Qt window also offered a rotation
+  interval), but on those coolers it makes a change reach every zone and
+  nothing rotates, as the Windows app's panel says.
+- **LCD-only settings are refused for LED coolers.** Loading a theme, setting
+  a background, brightness, rotation, overlay or mask on an LED cooler was
+  accepted, and saved LCD settings under its name that it could never use.
+  Each command now says which ability it needs, and a device without it is
+  refused with a message saying so.
+- **`trcc status` no longer pokes the panels.** It ran a full device scan,
+  which sends a USB request to every panel the background App is driving and
+  announces each device to every open window, just to list what the App
+  already had. It now asks the App.
+- **macOS: theme and data downloads trust the right certificates again.** The
+  fix for #109 (load certifi's certificate bundle, since macOS Python does
+  not read the Keychain) was lost when the code was reorganised, and the
+  macOS build stopped including the bundle. Not yet confirmed on a Mac.
+- **When ffmpeg is missing, TRCC names the right package for your system.**
+  It told everyone to run `dnf install ffmpeg` or `apt install ffmpeg`,
+  including on Windows, macOS and BSD, and stock Fedora has no package by
+  that name. The message now uses the same per-system hint as `trcc doctor`
+  (for example `winget install Gyan.FFmpeg` on Windows).
+- **Windows: a PC without ACPI thermal zones no longer retries them on every
+  sensor read.** When that source was unavailable, TRCC tried to connect to
+  it again every time it read the sensors.
+- **Selecting an LED zone that the cooler does not have is refused.** Any
+  zone number was accepted, on coolers with no zones at all, and stored a
+  selection the panel could not show.
+- **The Qt window's theme and mask lists no longer size themselves for a 0x0
+  panel.** For a cooler whose screen size only its handshake reports
+  (0416:5302), or an LED controller, they used to go ahead with no size;
+  they now ask you to connect the device first.
+- **Stopping a screen cast on one panel no longer stops it on another.** All
+  casting panels share one screen capture, and stopping any of them stopped
+  it for all of them (on Wayland, it closed the screen-sharing session).
+- **`trcc qtgui` shows its welcome once.** It opened on the System page with
+  the welcome text at every launch, because only the command line ever
+  recorded that the first run was over.
+- **On Windows, TRCC installed from the installer now starts at sign-in.**
+  The installed programs ask for administrator rights, and Windows does not
+  start such a program from the usual sign-in entry, so turning autostart on
+  did nothing. TRCC now registers a sign-in task instead, as the Windows app
+  does, and uninstalling removes it.
+- **A TRCC window showing "devices did not connect" now closes when you log
+  out.** That message held the window open until someone clicked it.
+- **A screen cast no longer fills the log.** Capturing the screen wrote up to
+  six lines to the log for every frame, about 16 frames a second, which pushed
+  everything else out of the file `trcc report` sends. Those lines now only
+  appear at the most verbose setting (`-vvv`), and a change worth knowing (the
+  capture switching to another method, a capture tool failing) is logged once.
+- **A screen cast redraws its sensor text only when a value changes.** It
+  drew every text, metric and clock element again on every frame, about 16
+  times a second, for readings that change every couple of seconds. It now
+  reuses the drawn layer like a theme does, about a tenth less work per frame.
+- **A full-screen cast costs a quarter less per frame.** Each captured frame
+  was copied in full once more than needed before being shrunk to the panel's
+  size: 8.3 ms per 1920x1080 frame, now 6.2 ms.
+- **The preview shows what the panel shows, in every window and command.**
+  During a screen cast or a web stream, the REST API's live preview,
+  `GET /preview` and `trcc display test-lcd` drew the theme underneath while
+  the panel showed the screen. They now show the frame the panel was sent,
+  as `trcc gui` and `trcc qtgui` already did, and only draw the theme when no
+  frame has gone out since the last change. A preview of a still theme also
+  costs about 40% less (0.8 ms, down from 1.4).
+- **A screen cast on Wayland no longer converts frames it throws away.** The
+  screen arrives up to 60 times a second and the cast uses about 17. Every
+  frame was converted to RGB and copied in full before most were dropped. Now
+  the extra frames are dropped first. On a test 1920x1080 60 Hz source the
+  capture work fell by about two thirds (23 billion instructions per 10
+  seconds, now 7-9).
+- **An open TRCC window no longer costs a quarter of a CPU core.** Since TRCC
+  became one shared background App, the window's live preview asked that App to
+  draw every frame a second time and send it as a PNG image, about 25% of one
+  core while a video theme played. The App now sends the frame it already drew
+  for the panel, once, and the window shows that. The Qt window (`trcc qtgui`)
+  also drew every frame twice even when running on its own, and no longer does.
+- **With two panels, the one you were looking at comes back on screen.** If
+  the panel shown in `trcc gui` briefly disconnected, the window switched to
+  your other panel and stayed there when it came back. It now switches back,
+  unless you picked another panel yourself in the meantime.
+- **A panel that is not ready when TRCC starts is connected once it is.** A
+  panel a virtual machine was holding, or whose device file had not appeared
+  yet, was given up on at startup. TRCC now keeps trying (less often the longer
+  it waits, at most every five minutes), so it comes up when it is freed. A
+  panel TRCC is not allowed to open is not retried: on Linux the error now
+  says to run `trcc system setup`, which is what fixes it.
+- **A screen cast, slideshow or media stream keeps going after the computer
+  wakes.** Waking from sleep, or a panel briefly disconnecting, stopped a
+  running screen cast (the panel froze on its last picture while TRCC still
+  said it was casting), a slideshow, or a web video stream, and none of them
+  came back on their own. They now keep running, the way a video theme already
+  did, and pause while the panel is away so nothing is captured for a panel
+  that is not there. Disconnecting a panel yourself still stops them.
+- **A panel that is slow to come back after the computer wakes is
+  reconnected.** TRCC reconnects every panel when the computer wakes from
+  sleep, but only tried once: if the panel was not ready yet, it stayed dark
+  until TRCC was restarted. It now keeps trying, the same way it does for a
+  panel that lost its connection.
+- **A panel that is not ready yet says why it could not connect.** On Linux a
+  panel's device file appears a moment after it is plugged in, and a panel a
+  virtual machine holds has none. Connecting to it then failed with an internal
+  error instead of a message, and any command that connects first (showing a
+  background, for one) failed the same way. It is now reported like any other
+  connection problem, where every window can show it.
+- **A panel that loses its connection no longer floods the log.** When
+  something else took the panel for a moment (a virtual machine it is passed
+  through to, a KVM switch, a hub that reset it), TRCC could keep treating it
+  as connected after its connection had closed. It then logged two errors for
+  every frame it tried to show, for as long as it ran, and the flood pushed
+  everything else out of the log, including whatever had gone wrong, and
+  plugging the panel back in was ignored as "already connected". The panel is
+  now seen as disconnected: the video and a screen cast stop sending to it,
+  with one warning each, every open window is told the panel has gone, and a
+  replug is no longer ignored. TRCC also keeps trying to reconnect a panel it
+  had: after 3 seconds, then less and less often, down to once a minute. A
+  panel that comes back without being replugged, such as one a virtual machine
+  hands back, now returns without a restart, the way the Windows app keeps
+  retrying. A panel you disconnect yourself is left alone.
+- **Videos play where ffmpeg is installed under a versioned name.** On
+  NetBSD (pkgsrc) the programs are `ffmpeg7` and `ffprobe7`. TRCC found them
+  when checking what was installed, then ran plain `ffmpeg` anyway, so video
+  backgrounds were refused as "ffmpeg not found", and cloud theme previews,
+  video trimming and video export failed. Every use now runs the name that is
+  actually installed.
+- **Cloud theme videos are checked before they are kept.** Thermalright's two
+  theme servers only speak plain http, so whatever arrives is only as
+  trustworthy as the network it crossed. A download is now refused if it is not
+  a video (a wifi sign-in page served in its place, for one) or is larger than
+  64 MB (the largest in the catalog is 10 MB), and the other server is tried. A
+  download is written to a temporary file and renamed into place, so an
+  interrupted one never leaves half a video behind. A file already cached that
+  is not a video is downloaded again rather than trusted.
+- **First-run downloads fetch only your panel's own themes.** Finding a
+  device used to start downloading themes for the size its USB id usually has,
+  before the device had said its real size. For panels that share an id with
+  another size (an 854×480 panel on 87ad:70db, for one) that meant ~38 MB of
+  the wrong size first, ahead of the right ones. Downloads now start when the
+  device connects and reports its size.
+- **A Frozen Warframe panel that identifies as 49 is drawn at its real size.**
+  The Windows app treats a USB-display (0416:5302) panel answering 49 as a
+  Frozen Warframe: 320×240, turned like the other Warframe panels, colours sent
+  high byte first. TRCC had no entry for 49 and drew it at 320×320, unturned,
+  with the wrong theme pack. Taken from the Windows app; not yet seen on a real
+  panel, so please report if yours shows 49.
+- **A screen command aimed at an LED controller froze its lights.**
+  `trcc display color`, `send-image`, a raw frame send and the matching API
+  routes treated an LED controller as a screen. The send failed, but the lights
+  stopped animating and stopped following the sensors until an LED setting was
+  changed. These commands, video playback, previews and screen cast now refuse
+  an LED controller with a clear message and leave it running.
+- **Turning a widescreen screen to an orientation without a matching theme
+  showed black.** A theme you saved in landscape stayed on after turning the
+  screen to portrait, and its background was drawn as solid black with the
+  overlay cut off. That orientation's Theme1 now shows instead. A restart while
+  turned no longer squashes the landscape video either.
+- **Turning the screen switched a running slideshow off.**
+- **The note after a one-off command on a screen that goes blank now gives
+  advice that works.** It always said to run `export TRCC_DAEMON=1`, which is
+  already the default and does nothing under `sudo` or on Windows. It now says
+  what applies: unset `TRCC_DAEMON` if it was set to 0, run without `sudo`, or
+  use the GUI where a background App is not possible.
+- **Themes you saved or exported stored a CPU fan reading as the fan hub's
+  own fan.** TRCC wrote it with the code the Windows app uses for a fan-hub
+  screen's built-in fan, so on any other cooler the Windows app showed that
+  reading blank. It is now saved as the CPU fan. Loading themes is unchanged.
+- **A cloud background that failed to play was saved anyway.** The panel kept
+  showing the old background, but TRCC had already recorded the broken video,
+  so the next restart or theme save picked it up. It is now saved only once it
+  plays.
+- **Seeking a paused video left the other windows' progress bars behind.** Only
+  the window you seeked from showed the new position. Every open window now
+  follows the seek.
+- **A theme saved, imported or deleted in one place didn't show in an open
+  window.** A theme saved from the command line, or deleted in the other
+  window, left the theme list out of date until you pressed Refresh or
+  restarted. Every open window's list now updates on its own.
+- **Downloading theme data from the command line left an open window's
+  lists empty.** The theme, cloud and mask lists filled in only after a
+  restart. They now fill in as soon as the download finishes. The native-skin
+  window's cloud list also refreshes now when the first-run download lands.
+- **The window now has a brightness slider, as in the Windows app.** Drag
+  it or type a value from 0 to 100. It replaces the button that cycled
+  through three levels. The bottom row now matches the Windows app 2.1.8,
+  which moved the export and import buttons to the top of the local theme
+  list.
+- **The native-skin window can now choose what an LED display shows.** On
+  coolers whose display shows one reading at a time (AX120, AK120, LF8 and
+  others), the Zones tab said "no separately-addressable zones" and offered
+  nothing. It now lists the readings: pick the one to show, or turn the
+  carousel on and tick the ones to cycle through.
+- **A new LED cooler now starts in rainbow**, as in the Windows app, instead
+  of a solid colour. Coolers you have already set up keep their effect.
+- **"Select all" on a PA120 or LF10 cooler didn't give every zone the same
+  effect.** As in the Windows app, turning it on now sets every zone to the
+  effect currently selected. Colours and brightness stay as they are.
+- **LED button labels could stay in the old language.** If you changed the
+  language before an LED device appeared, its mode buttons and section labels
+  stayed in the language TRCC started with. They now follow the language you
+  chose.
+- **The native-skin window showed every LED zone as taking part in the
+  carousel on a new device.** Only the first zone takes part until you pick
+  others, as in the Windows app, but every box showed ticked. The boxes now
+  show the zones that actually take part.
+- **The disk, sensor dashboard and start-at-login settings didn't update in
+  an open window.** Changed from the command line or the other window, they
+  showed the old value until you reopened the window. They now update on
+  their own. In the native-skin window, a dashboard layout you are still
+  editing is kept, with a note that another window saved one.
+- **Pausing a video in one place left the other window's button wrong.** A
+  window showed the play state its own last click produced, so a video paused
+  from the command line or the other window still read as playing. Both
+  windows now follow every pause and resume. The native-skin window's button
+  now reads "Pause" or "Resume" instead of "Pause/Resume".
+- **Starting at login in the tray still flashed the loading screen.** With
+  autostart (`--resume`), TRCC starts hidden in the tray, but its loading
+  screen still popped up at every login. It no longer does.
+- **`trcc report` held only seconds of history while a video played.** With
+  the window open, TRCC logged every preview frame in full, image included,
+  about 2.6 MB a second, so the log kept only the last couple of seconds.
+  It now logs about 2 KB a second, and a report covers the last hour or so.
+- **Shutting the PC down while TRCC was still starting could leave a screen
+  lit.** A stop signal that arrived while TRCC was connecting your devices
+  ended it on the spot, before it could put the screens to sleep. This
+  affected the windows and the background service. TRCC now finishes starting
+  up, puts the screens to sleep and exits.
+- **The 640x172 screen reached over HID (FBL 59) was sent JPEG frames.** The
+  Windows app sends this route raw RGB565 pixels, with each row centred in the
+  panel's 176-pixel framebuffer row, and turns the picture 90° for a panel that
+  reports SUB 5 instead of 270°. TRCC now does the same. Checked against the
+  Windows app's code and a simulated device; nobody has reported this panel,
+  so it has not been seen on real hardware.
+- **Ten cooler models that no one has reported yet would have been driven at
+  the wrong size.** The bulk and Trofeo Vision (LY) connections only
+  recognised some of the models the Windows app knows; the rest fell back to
+  a 480x480 picture (or, on the Trofeo Vision connection, a 320x320 picture in
+  the wrong format). Both now recognise every model the Windows app does,
+  through one shared lookup. The Trofeo Vision connection also now sets the
+  starting angle for a screen its cooler mounts sideways, as the other
+  connections already did. Every model that has been reported sends exactly
+  the same frames as before.
+- **The 360x360 fan-hub screen reporting SUB 4 (CORE VISION) was sent JPEG
+  frames.** The Windows app sends that one model raw RGB565 pixels, and TRCC
+  now does the same. Its SUB 3 and SUB 4 models also showed the wrong cooler
+  picture in the device list; they now show CORE VISION. Checked against the
+  Windows app's code and a simulated device; nobody has reported this panel,
+  so it has not been seen on real hardware.
+- **320x240 and 640x480 screens turned to 90° or 270° got sideways or
+  partial frames.** A screen cast, a picture sent with
+  `trcc display send-image`, and the blank frame sent when the screen sleeps
+  were built in the wrong shape on these panels, so the screen painted only
+  part of them, and a cast came out sideways. They are now built the way a
+  portrait theme is, which is also how the Windows app does it. This affected
+  FBL 50, 51, 52, 53, 58 and 64 (for example the Frozen Warframe SE and the
+  BA120 Vision).
+- **An uploaded mask could land mostly off the screen.** A mask you
+  uploaded in portrait, or one smaller than the screen, was drawn shifted
+  up and left by half its size, so only a corner showed. Uploads now sit at
+  the top-left like in the Windows app, oversized ones shrink to fit the
+  screen the same way, and masks you uploaded before this update are placed
+  correctly too.
+- **The 176x320 screen (FBL 60) had its width and height swapped**, so
+  every frame for it would have been built in the wrong shape. No one has
+  reported this screen yet; it now matches the Windows app at every angle.
+- **The gui's background, screencast, video and mask switches show what the
+  screen is doing.** They showed everything off for every theme, and never
+  followed a cast or a video started from another window. Turning the
+  background off now removes it (black behind the overlay), as the Windows
+  app does; before, it changed nothing. Playing a file from the video panel no
+  longer switches the overlay off, and it now counts as the media player
+  everywhere.
+- **A video played with the media player is remembered as one.** Starting it
+  from the command line or the API recorded it as a background video instead,
+  so a saved theme lost it and a restart brought it back as a background.
+  Turning the media player off now stops it and lets a video theme's own video
+  play again, and every open window hears about each change.
+- **With two screens, the gui's screencast controls act on the selected one.**
+  If a cast was running on one screen (started from any window, the CLI or the
+  API), turning the microphone on in the gui with the other screen selected
+  started a second cast there, copying the first one's region. The gui now
+  asks which screen is actually casting, and selecting a screen shows its own
+  cast's region and microphone setting.
+- **The gui's video progress bar works.** It sat at the start while a video
+  played, dragging it did nothing (each new frame pulled it back), and its
+  label counted frames. It now follows playback, a drag shows where you will
+  land and seeks when you let go, and both the gui and the Qt gui show the
+  time as the Windows app does, e.g. `00:00:05.000/00:00:10.000`.
+- **`-vvv` no longer fills the log with errors for LED coolers.** Every LED
+  update printed a "Logging error" traceback and its log line was lost (since
+  v9.10.3). The line now records the bytes sent to the cooler.
+- **Plugging in a second identical LED cooler no longer resets both.** Both
+  coolers came back in the default red at 65 %, losing the colour and
+  brightness you had set. Each now starts from your settings and can then be
+  set on its own, as two identical LCDs already did (#287). In the gui, hover
+  over a device button to see which USB port it is on, so two identical
+  coolers can be told apart.
+- **A rotated widescreen panel shows the rotated theme's own layout.** Since
+  v9.10.0 (#276), rotating an 854x480, 1280x480, 1600x720 or similar panel
+  kept the landscape overlay positions on the portrait screen, so elements sat
+  off the edge, and it stayed that way after a restart. Rotation now reloads
+  the rotated theme's layout, as the Windows app does; edits made before a
+  rotation are not carried over (the Windows app drops them too). Panels
+  already affected are fixed on their next start.
+- **PA120 and LF10 coolers reach full brightness.** The brightness setting was
+  multiplied by each zone's own 65 %, so 100 % showed at 65 % and a new cooler
+  started at about 42 %. They now follow their zones alone, as in the Windows
+  app. Your current look is carried over when you upgrade.
+- **On a PA120 or LF10, a colour, effect or brightness reaches every zone on a
+  new cooler**, not only the first: "select all" starts on, as in the Windows
+  app. Coolers you have already set up keep their selection.
+- **Switching a PA120 or LF10 off turns off the selected zones**, not always
+  the whole cooler.
+- **LED coolers with metric pages show the page you picked.** Clicking a page
+  could leave other pages lit on the panel's buttons, a page chosen from the
+  command line or the API was not the one shown, and turning the rotation off
+  kept a different page from the Windows app. Now the lowest page you had
+  selected stays, as there. Your current page is kept when you upgrade.
+- **The LED preview goes dark when the LEDs are switched off.** It kept
+  showing them lit while the cooler was dark.
+- **The Qt gui's settings no longer reset things you did not touch.** Its
+  Configuration and Display pages opened showing defaults instead of your
+  settings, and their "Apply" buttons wrote those defaults back — one press
+  could switch the language to Arabic, °F to °C, a rotated screen back to 0°,
+  brightness to 100%, the overlay on, and empty your slideshow. The pages now
+  show what is set, follow changes made from any window or the command line,
+  and apply each control as you change it; there are no Apply buttons. The
+  clock and date format there now set the selected screen's clocks.
+- **A screencast carries on after the computer wakes from sleep.** The gui
+  stopped it when the computer went to sleep, and only on the screen that was
+  selected, so it had to be started again; the Windows app keeps it running.
+- **The Qt gui's GPU, HDD, screencast and LED pages show what is set.** The
+  GPU choice opened on the first GPU and switched to it on a press; the
+  screencast buttons did not show a cast started from another window or
+  another screen; the LED page reloaded on every animation frame, pulling
+  back a colour or brightness while you were picking it.
+- **Picking a screen in the Qt gui's device rail updates every page.** Most
+  pages kept showing the previous screen.
+- **The Qt gui sends each frame to your screen once.** It ran a render loop
+  of its own beside the App's, so every frame went out twice while it was
+  open — even when closed to the tray. Its preview also kept rendering once
+  a second after the window was closed; it now pauses until you open it again.
+- **Clocks show the format the theme was made with.** Themes designed with a
+  12-hour clock showed 24-hour. The 12-hour clock now reads `02:58 PM`, as in
+  the Windows app, and keeps its AM/PM on systems set to a language whose
+  locale has none. Exporting a theme keeps each clock's format and each
+  value's unit, which the export used to reset.
+- **An LED cooler's 12h/24h clock button works.** The cooler's clock ignored
+  it and followed the LCD overlay's time format instead; each cooler now keeps
+  its own, as in the Windows app.
+- **Switching the overlay off in the gui no longer deletes it.** The switch
+  also cleared every overlay element, and so did editing one element while the
+  overlay was off. The gui put them back only if you switched it on again in
+  the same window; switching on from the Qt gui, the CLI or the API showed an
+  empty overlay. Switching now only switches, and an edit keeps the other
+  elements.
+- **The gui's overlay editor shows and keeps what the panel shows.** It was
+  filled from the theme's files, so it never showed an edit made from the Qt
+  gui, the CLI or the API, and any change in the gui put back what they had
+  moved or deleted. Its own edits also vanished the next time it opened, and
+  every edit renamed all the elements, so an element id used from the CLI or
+  the API stopped working. The editor now shows the panel's current layout,
+  follows changes from any window, and changes only the element you edit —
+  a custom time format or a bold italic label set elsewhere is no longer
+  rewritten when you move it.
+
+- **The gui now shows changes made from another window or the command line.**
+  Brightness, orientation, split mode, the overlay switch, the mask's
+  visibility and position, °C/°F, language, the refresh interval, HDD reading
+  and the GPU choice used to stay as the gui last saw them, even though the
+  App had changed. So do the LED controls: colour, effect, brightness, on/off,
+  the zone and page buttons, the clock format, the week start and the DDR
+  ratio. Theme and slideshow already followed. The Qt gui is not covered yet.
+- **The LED panel shows what the cooler is set to when the gui opens.** The
+  clock format, week start and DDR ratio showed their defaults; a PA120 or
+  LF10 edited one zone at a time showed its first zone's colour and
+  brightness. A slider or the colour wheel you are dragging is never moved
+  under you.
+- **Opening the gui shows the mask as it is.** The mask's visibility and
+  position showed as visible at 0,0 until something changed them.
+- **The theme on the panel is highlighted in the theme list**, when the gui
+  opens and whenever any window or command loads one; it stays highlighted
+  when the list is filtered or refreshed.
+- **The brightness button shows the selected panel's level** after switching
+  panels, instead of the previous panel's.
+
+## v9.10.4
+
+**A correction first: v9.10.3 said two identical coolers were two devices.
+They were not.** The pieces shipped, but the step that connects a device never
+told it which port it was on, so two units of the same model still collapsed
+into one. That step is fixed now, and so is everything that depended on it:
+each unit connects on its own port, every interface lists and targets the unit
+rather than the model, plugging in or removing one twin leaves the other alone,
+and `trcc report` shows each unit's own USB power state. Only models you own
+two of are affected. (#287)
+
+**TRCC starts again on Python 3.10.** Since v9.10.0 the graphical
+interfaces, the web API and the background service crashed the moment they
+started on Python 3.10 -- the Python Ubuntu 22.04, Mint 21 and the legacy deb
+use. Our automated tests caught it on every run, but a mistake in how the
+test server read their results reported them as passing; that is fixed as
+well. They all start now. `trcc doctor` also stops telling Python 3.10 users their Python is
+too old: 3.10 is supported, and `trcc quickstart` no longer stops there.
+
+**`trcc system list-endpoints` lists every endpoint again.** With the FastAPI
+version installed today it showed 7 of about 140; the API itself was
+unaffected.
+
+**Fan readouts on the screen show a number.** A CPU, GPU, SSD or case fan
+element you added to the display drew nothing, on every machine; only the side
+panel had the values. They draw now. The GPU fan is shown in RPM, as the
+Windows app does, and as a percentage, labelled `%`, when the driver reports
+only that. (#145)
+
+**More GPUs report their sensors.** Cards on the open-source NVIDIA driver
+(nouveau) now show temperature, fan and power where the driver provides them
+(GTX 10-series and older; newer cards expose nothing on nouveau yet). Intel Arc
+cards now show their fan and clock, and Intel graphics power works on every
+Intel GPU, where before it never did. A graphics card's own fan no longer fills
+the CPU fan slot. (#236)
+
+**Windows themes can be imported, and ours can go to Windows.** A theme
+exported from the Windows app did nothing when imported, because its file is
+not the kind of archive we expected. It imports now. Exporting to a `.tr` file
+writes the Windows app's own format, so Windows can import it; like a Windows
+export, a video background travels as its still frame. Export to `.zip` keeps
+everything, including the video. (#272)
+
+**Mac downloads work without Homebrew, and Intel Macs have their own.** The
+7-Zip and ffmpeg inside the Mac app were never actually used, and the ffmpeg
+could not start on a Mac without Homebrew's copy installed. Both are now
+bundled so they run on their own, and there is a separate download for Intel
+Macs. (#219)
+
+**Windows starts promptly with LibreHardwareMonitor.** TRCC could launch
+several copies of it at once, and when its sensors never appeared, every read
+waited ten seconds again, holding up startup. It now starts one copy and waits
+for it once. (#191)
+
+**Saved themes come back as you saved them.** Reloading a saved theme could
+replace your overlay layout with the one from its mask, and a mask you had
+hidden came back. Both are fixed. (#301, #276)
+
+**Split mode no longer freezes one family of panels**, and shows the same
+picture as the Windows app on the others. (#149)
+
+**Video plays in every mode**, including the background service, where it
+stuck on the first frame; and two players can no longer run one video at double
+speed. (#249)
+
+**Smaller fixes**
+- The RAM speed on the screen is the speed the memory runs at, not the
+  number printed on the module. (#279)
+- Fans on boards whose driver keeps its sensors one folder down are read. (#282)
+- A background picked from anywhere on disk is scaled with your fit setting. (#291)
+- A permission error on a device explains what to do for your operating
+  system instead of crashing. (#173)
+- Coolers are named from what they report about themselves, in every place a
+  name is shown. (#272, #176, #289)
+- A long-running `trcc display play` or `trcc led play` reconnects a panel that
+  dropped off instead of exiting. (#270)
+- Panels that go blank when frames stop now say so when a one-shot command
+  ends, and point to `export TRCC_DAEMON=1`, which keeps the picture showing. A
+  panel sharing the Frozen Warframe SE's firmware no longer waits eight seconds
+  on every connect once it has shown it is a different panel. (#228, #267)
+- LY panels log how long each acknowledgement takes, so a report shows what a
+  frozen panel answered. (#251)
+
+**Packages set up devices the way `trcc system setup` does.** The deb, rpm and
+Arch packages installed an older copy of the device-access rules, in which one
+panel (0416:5406) was still set up as a different kind of device. They now
+ship exactly what setup writes, plus the CPU power module entry. The Steam Deck
+guide no longer runs a command that is not installed on the host, and the
+one-line installers in the new-to-Linux guide download a single, correct
+package; the Ubuntu 24.04 one could not work before. (#231, #181)
+
+## v9.10.3
+
+**Two identical coolers are two devices now.** Two units of the same model
+report the same USB identity, and TRCC told them apart by that identity alone.
+So it saw one device, and the second screen either stayed dark or fought the
+first for the connection with an "in use by another process" error. Each unit
+is now recognised by the port it is plugged into, and each one opens its own
+screen. Only models you own two of are affected. (#287)
+
+**Macs pick their screens back up after sleep.** On Linux, TRCC reconnects
+every display when the machine wakes, because the connection it held before
+sleeping has gone stale. macOS was never told the machine had woken, so the
+panel went back to its initial picture and stayed that way until TRCC was
+restarted. macOS now gets the same reconnect. (#283)
+
+**Rotating the screen keeps your overlay edits.** Turning a display in either
+graphical interface reloaded the theme twice, and the second reload threw away
+anything you had moved, restyled or added. It now reloads once and keeps your
+changes, the same as it always did from the command line.
+
+**Two more display models from TRCC 2.1.8 are recognised**, along with the new
+button images and theme artwork that release added. Before this, one of them
+warned about an unknown screen and drew at the wrong size.
+
+**The command line and the web API can list what is on the screen.** Moving,
+editing or deleting an overlay element needs its id, and until now the only
+place to find one was the line printed when you created it. `trcc display
+overlay-list` now shows every element with its id, and the web API has the
+same.
+
+**The sensor dashboard can be edited from the command line**: add, remove,
+rename and bind panels, as the graphical interface could already. The newer
+interface can now add, remove and rename panels too, instead of only rebinding
+them.
+
+**The font you pick for overlay text is kept everywhere.** The web API and the
+command line dropped it without saying so, and the newer interface had no way
+to choose one. The web API also ignored a request to hide an element's unit.
+
+**The newer interface can include your microphone in a screen mirror**, as
+the original interface could, and it now releases the microphone when the
+mirror stops.
+
+**A problem report no longer fills up with screen data.** Some log lines
+wrote an entire copy of the frame being sent, up to six megabytes each, so the
+log recycled itself within moments and a report came back holding nothing
+else. They now record the frame's size. This is what had stopped us
+diagnosing #220.
+
+**Under the hood**, a display-scaling setting that TRCC applied at every
+launch for seven months turned out to belong to an older version of the
+graphics toolkit and never did anything. It is removed, and nothing changes.
+The newer interface also sized its artwork from a different source than the
+rest of the app, and now uses the same one.
+
 ## v9.10.2
 
 **A screen bolted into its cooler sideways now starts upright on six more

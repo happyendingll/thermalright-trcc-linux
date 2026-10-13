@@ -4,7 +4,7 @@
 
 Every capability in TRCC, as the one surface all four UIs dispatch against. A new UI — a browser client, a VR panel, a TUI — needs only this page and an event subscription; it never imports a service or an adapter.
 
-**145 total: 106 Commands and 39 Queries.** A *Query* is a read and nothing else, which is why it is named separately — a missing read should be obvious rather than archaeological.
+**150 total: 107 Commands and 43 Queries.** A *Query* is a read and nothing else, which is why it is named separately — a missing read should be obvious rather than archaeological.
 
 ## Dispatching one
 
@@ -12,12 +12,12 @@ Every capability in TRCC, as the one surface all four UIs dispatch against. A ne
 from trcc._boot import trcc
 from trcc.core.commands import SendColor
 
-app = trcc()                     # in-process, or a daemon client
+app = trcc()                     # the shared App, or in-process
 result = app.dispatch(SendColor(key="0402:3922", r=255, g=0, b=0))
 result.ok, result.message
 ```
 
-`trcc()` returns an in-process `App`, or an `AppProxy` speaking to the daemon when `TRCC_DAEMON=1`. Both expose `dispatch(cmd) -> Result` and nothing else, so a UI written against this page works in either mode.
+`trcc()` returns an `AppProxy` speaking to the shared App -- the default -- or an in-process `App` (`TRCC_DAEMON=0`, as root, or on Windows). Both are the same `CommandBus`: `dispatch(cmd) -> Result`, `events`, `remote` and `on_app_gone`, so a UI written against this page works either way.
 
 Over the socket the same call is one line of JSON:
 
@@ -79,6 +79,16 @@ Render the device's active theme and stop before the wire.
 ### `CaptureScreencastFrame`
 
 Grab the device's screencast region once, encode it, put it on the wire.
+
+*Command* → `ScreencastResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+
+### `CaptureStreamFrame`
+
+One tick of a web media source: its newest frame, onto the panel.
 
 *Command* → `ScreencastResult`
 
@@ -184,18 +194,6 @@ Bring *key* up for a wire command only if it isn't already connected.
 |---|---|---|
 | `key` | `str` | yes |
 
-### `FlashOverlayElement`
-
-Briefly highlight one element so the user can locate it on screen.
-
-*Command* → `OverlayElementResult`
-
-| Field | Type | Required |
-|---|---|---|
-| `key` | `str` | yes |
-| `element_id` | `str` | yes |
-| `duration_ms` | `int` | no |
-
 ### `LcdSnapshot`
 
 Per-device LCD state snapshot — what settings.for_device holds.
@@ -224,17 +222,6 @@ Toggle whether playback wraps to frame 0 or sticks at the last frame.
 |---|---|---|
 | `key` | `str` | yes |
 | `loop` | `bool` | yes |
-
-### `OrientedThemeTarget`
-
-After a rotation swaps the catalog, which theme should be reloaded.
-
-*Query* → `OrientedThemeTargetResult`
-
-| Field | Type | Required |
-|---|---|---|
-| `key` | `str` | yes |
-| `active_theme` | `Path` | yes |
 
 ### `PauseVideo`
 
@@ -268,6 +255,27 @@ How big a UI should draw this device's preview (#136).
 | Field | Type | Required |
 |---|---|---|
 | `key` | `str` | yes |
+
+### `RecentColors`
+
+*key*'s recent-colour row, newest first, padded with Silver.
+
+*Query* → `RecentColorsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+
+### `RememberColor`
+
+Push a colour onto *key*'s recent-colour row and return the row.
+
+*Command* → `RecentColorsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `color` | `tuple[int, int, int]` | yes |
 
 ### `RenderAndSend`
 
@@ -423,6 +431,18 @@ Set how the background image/video fits the device canvas.
 | `key` | `str` | yes |
 | `mode` | `str` | yes |
 
+### `SetGameMode`
+
+Switch game mode and/or set its CPU threshold -- the C#'s ``buttonGame`` / ``textBoxCPU`` (UCThemeLocal.cs:620-727).
+
+*Command* → `GameModeResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `enabled` | `bool | None` | no |
+| `threshold` | `int | None` | no |
+
 ### `SetMaskPosition`
 
 Set the mask offset within the canvas, or pass None to reset to (0, 0).
@@ -490,6 +510,21 @@ Replace the user-overlay layer wholesale.
 | `key` | `str` | yes |
 | `elements` | `tuple[dict, Ellipsis]` | no |
 
+### `SetScreencastRegion`
+
+Set the device's screencast region -- and its hide-border flag.
+
+*Command* → `ScreencastResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `x` | `int` | yes |
+| `y` | `int` | yes |
+| `w` | `int` | yes |
+| `h` | `int` | yes |
+| `hide_border` | `bool | None` | no |
+
 ### `SetSplitMode`
 
 Set the Dynamic Island style for widescreen panels.
@@ -513,43 +548,22 @@ Blank a connected panel so it goes dark on shutdown / quit (#143).
 
 ### `StartScreencast`
 
-Begin a screen-capture session for a device.
+Begin a screen-capture session for a device, and drive it.
 
 *Command* → `ScreencastResult`
 
 | Field | Type | Required |
 |---|---|---|
 | `key` | `str` | yes |
-| `x` | `int` | yes |
-| `y` | `int` | yes |
-| `w` | `int` | yes |
-| `h` | `int` | yes |
+| `x` | `int` | no |
+| `y` | `int` | no |
+| `w` | `int` | no |
+| `h` | `int` | no |
 | `audio` | `bool` | no |
-
-### `StartScreencastDriver`
-
-Drive ``CaptureScreencastFrame`` on a cadence until stopped.
-
-*Command* → `ScreencastResult`
-
-| Field | Type | Required |
-|---|---|---|
-| `key` | `str` | yes |
-| `interval_s` | `float` | no |
 
 ### `StopScreencast`
 
 End the screen-capture session for a device.
-
-*Command* → `ScreencastResult`
-
-| Field | Type | Required |
-|---|---|---|
-| `key` | `str` | yes |
-
-### `StopScreencastDriver`
-
-Stop the cadence started by :class:`StartScreencastDriver`.
 
 *Command* → `ScreencastResult`
 
@@ -573,6 +587,16 @@ Clear the device's playback override AND the persisted bg override.
 Advance a video playback one frame, then render + send (one tick).
 
 *Command* → `RenderResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+
+### `TickGameMode`
+
+One game-mode reading: read the row, step the hysteresis, act.
+
+*Command* → `GameModeTickResult`
 
 | Field | Type | Required |
 |---|---|---|
@@ -667,16 +691,16 @@ Force-install the theme + cloud + mask archives for a resolution.
 | `width` | `int` | yes |
 | `height` | `int` | yes |
 
-### `ExportConfig`
+### `ExportCurrentTheme`
 
-Write one device's ``DeviceSettings`` to a JSON file.
+Export what the device is SHOWING, saved or not, to a file.
 
-*Command* → `ExportConfigResult`
+*Command* → `ThemeExportResult`
 
 | Field | Type | Required |
 |---|---|---|
 | `key` | `str` | yes |
-| `output_path` | `Path` | yes |
+| `archive_path` | `Path` | yes |
 
 ### `ExportDcTheme`
 
@@ -704,7 +728,7 @@ Copy a theme's overlay config file to ``output_path``.
 
 ### `ExportTheme`
 
-Zip a theme under ``user_theme_dir(w, h) / theme_name`` to an archive path.
+Export a theme under ``user_theme_dir(w, h) / theme_name`` to a file.
 
 *Command* → `ThemeExportResult`
 
@@ -728,17 +752,7 @@ Encode a clip of *path* into a loose ``Theme.zt`` for *key*'s panel.
 | `end_ms` | `int | None` | no |
 | `rotation` | `int` | no |
 | `fit_mode` | `FitMode | None` | no |
-
-### `ImportConfig`
-
-Restore one device's ``DeviceSettings`` from an :class:`ExportConfig` JSON.
-
-*Command* → `ImportConfigResult`
-
-| Field | Type | Required |
-|---|---|---|
-| `key` | `str` | yes |
-| `input_path` | `Path` | yes |
+| `fps` | `int` | no |
 
 ### `ImportTheme`
 
@@ -858,17 +872,7 @@ How long is this video file, in milliseconds?
 
 ### `RestoreDeviceState`
 
-Ensure *key* has a renderable display state from persisted settings.
-
-*Command* → `ThemeResult`
-
-| Field | Type | Required |
-|---|---|---|
-| `key` | `str` | yes |
-
-### `RestoreLastTheme`
-
-Re-load the theme persisted in Settings for *key*.
+Put *key*'s saved display back on the panel — the one restore Command.
 
 *Command* → `ThemeResult`
 
@@ -914,13 +918,15 @@ Enable / disable the 4-color diagnostic test cycle.
 
 ### `InitializeLed`
 
-Connect + render one initial LED frame in a single dispatch.
+Render ONE LED frame, connecting the device first — the one-shot render.
 
 *Command* → `LedColorsResult`
 
 | Field | Type | Required |
 |---|---|---|
 | `key` | `str` | yes |
+| `color` | `tuple[int, int, int] | None` | no |
+| `phase` | `int` | no |
 
 ### `LedSnapshot`
 
@@ -948,6 +954,14 @@ Enumerate every LED style the PM registry can resolve.
 
 Takes no arguments.
 
+### `RamLighting`
+
+Whether TRCC may reach RGB memory's bus -- read from files, no bus.
+
+*Query* → `RamLightingResult`
+
+Takes no arguments.
+
 ### `RenderLed`
 
 Compute one LED frame from current settings + sensors and send it.
@@ -961,9 +975,17 @@ Compute one LED frame from current settings + sensors and send it.
 | `phase` | `int` | no |
 | `advance` | `bool` | no |
 
+### `RgbFollow`
+
+What follows the cooler, and what it is doing (#160).
+
+*Query* → `RgbFollowResult`
+
+Takes no arguments.
+
 ### `SelectZone`
 
-Pick the active zone (UI selection state).
+Select exactly this zone: the page a page-style cooler shows, or the one zone a PA120/LF10 edit reaches.
 
 *Command* → `LedColorsResult`
 
@@ -995,7 +1017,7 @@ Toggle HDD metrics inclusion in sensor broadcasts.
 
 ### `SetLedBrightness`
 
-Set the global LED brightness percent (0–100).
+Set the LED brightness percent (0–100): the global value, plus the zones the edit reaches on a multi-zone style (FormLED ``ucScrollWDelegate``).
 
 *Command* → `LedColorsResult`
 
@@ -1141,6 +1163,32 @@ Set the DDR memory multiplier (1, 2, or 4) for the LED memory gauge.
 | `key` | `str` | yes |
 | `ratio` | `int` | yes |
 
+### `SetRamLighting`
+
+Switch the opt-in RAM-lighting grant on or off.
+
+*Command* → `RamLightingResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `enabled` | `bool` | yes |
+
+### `SetRgbFollow`
+
+Pick what follows the LED cooler's colours (#160): one at a time.
+
+*Command* → `RgbFollowResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `mode` | `RgbFollowMode` | yes |
+| `host` | `str` | no |
+| `port` | `int` | no |
+| `source` | `str | None` | no |
+| `mapping` | `FollowMapping | None` | no |
+| `targets` | `tuple[str, Ellipsis] | None` | no |
+| `colors` | `FollowColors | None` | no |
+
 ### `SetWeekStart`
 
 Week-start convention: ``True`` = Sunday-first, ``False`` = Monday-first.
@@ -1163,18 +1211,6 @@ Toggle an LED device on/off — global, or one zone if ``zone`` is given.
 | `key` | `str` | yes |
 | `on` | `bool` | yes |
 | `zone` | `int | None` | no |
-
-### `ToggleSegment`
-
-Flip one segment's on/off state (segment-display devices).
-
-*Command* → `LedColorsResult`
-
-| Field | Type | Required |
-|---|---|---|
-| `key` | `str` | yes |
-| `index` | `int` | yes |
-| `on` | `bool` | yes |
 
 ## System, settings and diagnostics
 
@@ -1222,7 +1258,9 @@ Is the background daemon running, and where is its socket?
 
 *Query* → `DaemonResult`
 
-Takes no arguments.
+| Field | Type | Required |
+|---|---|---|
+| `here` | `bool` | no |
 
 ### `DisableAutostart`
 
@@ -1241,16 +1279,6 @@ Install the OS-specific autostart entry (per-user, no sudo).
 | Field | Type | Required |
 |---|---|---|
 | `target` | `str | None` | no |
-
-### `EnsureDaemon`
-
-Guarantee a daemon is reachable, starting one if it is not.
-
-*Command* → `DaemonResult`
-
-| Field | Type | Required |
-|---|---|---|
-| `timeout` | `float` | no |
 
 ### `GenerateDebugReport`
 
@@ -1391,6 +1419,18 @@ Tell next/ the onboarding flow has been completed.
 
 Takes no arguments.
 
+### `ProvideApiTls`
+
+The TLS files ``trcc api --tls`` serves, and the fingerprint to pin.
+
+*Command* → `ApiTlsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `bind_host` | `str` | no |
+| `cert` | `Path | None` | no |
+| `key` | `Path | None` | no |
+
 ### `ReadSensors`
 
 Return current sensor readings — personalized to user prefs.
@@ -1443,17 +1483,15 @@ OS-specific one-time setup (udev, WinUSB guide, etc.).
 
 ### `RunUpgrade`
 
-Run the OS package-manager upgrade for trcc-linux.
+Say how to upgrade this install -- the command, for the user to run.
 
 *Command* → `UpgradeResult`
 
-| Field | Type | Required |
-|---|---|---|
-| `dry_run` | `bool` | no |
+Takes no arguments.
 
 ### `SetDateFormat`
 
-Set the LCD-overlay date pattern.
+Set every date element's pattern — on ``key``, or on every device.
 
 *Command* → `DateFormatResult`
 
@@ -1514,7 +1552,7 @@ Replace the sensor-dashboard layout wholesale and persist it.
 
 ### `SetSlideshow`
 
-Toggle the slideshow on or off without changing the theme list.
+Switch the slideshow on or off — and with it, the rotation.
 
 *Command* → `SlideshowResult`
 
@@ -1535,7 +1573,7 @@ Set the global temperature unit ("C" or "F") and propagate to every device.
 
 ### `SetTimeFormat`
 
-Set the LCD-overlay clock format (12h or 24h).
+Set every time element's clock to 12h or 24h — on ``key``, or on every device when ``key`` is None.
 
 *Command* → `TimeFormatResult`
 
@@ -1543,17 +1581,6 @@ Set the LCD-overlay clock format (12h or 24h).
 |---|---|---|
 | `fmt` | `str` | yes |
 | `key` | `str | None` | no |
-
-### `StartSlideshowDriver`
-
-Rotate a configured slideshow on a cadence until stopped.
-
-*Command* → `SlideshowResult`
-
-| Field | Type | Required |
-|---|---|---|
-| `key` | `str` | yes |
-| `interval_s` | `float` | no |
 
 ### `StopDaemon`
 
@@ -1565,12 +1592,47 @@ Ask a running daemon to shut down.
 |---|---|---|
 | `timeout` | `float` | no |
 
-### `StopSlideshowDriver`
+### `UpdateStatus`
 
-Stop the cadence started by :class:`StartSlideshowDriver`.
+What the App last heard about updates -- no network.
 
-*Command* → `SlideshowResult`
+*Query* → `UpdateCheckResult`
+
+Takes no arguments.
+
+## rgb
+
+### `RgbLights`
+
+The lights the RGB page lists, from the last scan -- touches no bus.
+
+*Query* → `RgbLightsResult`
+
+Takes no arguments.
+
+### `ScanRgbLights`
+
+Look for the lights: RGB memory on the SMBus, and OpenRGB's devices.
+
+*Command* → `RgbLightsResult`
 
 | Field | Type | Required |
 |---|---|---|
-| `key` | `str` | yes |
+| `host` | `str` | no |
+| `port` | `int` | no |
+
+### `SetRamEffect`
+
+Save one of the memory's own effects on the sticks named by ``refs`` (every stick when empty).
+
+*Command* → `RgbLightsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `effect` | `RamEffect` | yes |
+| `refs` | `tuple[str, Ellipsis]` | no |
+| `speed` | `EffectSpeed` | no |
+| `direction` | `EffectDirection | None` | no |
+| `colors` | `tuple[tuple[int, int, int], Ellipsis]` | no |
+| `random_colors` | `bool` | no |
+| `brightness` | `int` | no |

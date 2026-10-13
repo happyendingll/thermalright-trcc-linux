@@ -24,9 +24,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ...app import App
 from ...core.commands import ReadSensors
 from ...core.models import SensorInfo
+from ...core.ports import CommandBus
 from ..presentation.sensor_display import format_sensor_value, group_sensors
 from .assets import Assets
 from .base import set_background_pixmap
@@ -99,8 +99,9 @@ class SensorRow(QWidget):
 
     def set_selected(self, selected: bool):
         """Update checkbox image."""
-        log.debug("SensorRow.set_selected: %s -> %s (sensor=%s)",
-                  self._selected, selected, self.sensor.id)
+        if selected != self._selected:       # on change: called for every row
+            log.debug("SensorRow.set_selected: %s -> %s (sensor=%s)",
+                      self._selected, selected, self.sensor.id)
         self._selected = selected
         px = self._cb_on if selected else self._cb_off
         if not px.isNull():
@@ -128,7 +129,7 @@ class SensorRow(QWidget):
 class SensorPickerDialog(QDialog):
     """Sensor selection dialog matching Windows FormSystemInfo (490x800)."""
 
-    def __init__(self, app: App, parent=None):
+    def __init__(self, app: CommandBus, parent=None):
         super().__init__(parent)
         self._app = app
         # One ``ReadSensors`` per tick feeds BOTH the row list and the live

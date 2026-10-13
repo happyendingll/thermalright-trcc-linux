@@ -1,7 +1,6 @@
 """/devices/{key}/display router — orientation, brightness, theme."""
 from __future__ import annotations
 
-import hmac
 import json
 import logging
 import shutil
@@ -10,7 +9,6 @@ from pathlib import Path
 
 from fastapi import (
     APIRouter,
-    Depends,
     File,
     Form,
     HTTPException,
@@ -27,10 +25,10 @@ from ...core.commands import (
     BuildPreview,
     ConfigureSlideshow,
     DeleteOverlayElement,
+    DeviceCanvas,
     DeviceState,
     EnableOverlay,
     ExportVideoClip,
-    FlashOverlayElement,
     GetPaths,
     KeepAliveLoop,
     LcdSnapshot,
@@ -43,6 +41,7 @@ from ...core.commands import (
     PlayVideo,
     ProbeVideoDuration,
     RenderDcStandalone,
+    ResolveOverlay,
     RestoreDeviceState,
     SeekVideo,
     SendColor,
@@ -51,21 +50,19 @@ from ...core.commands import (
     SetBackgroundMode,
     SetBrightness,
     SetFitMode,
+    SetGameMode,
     SetMaskPosition,
     SetMaskVisible,
     SetMediaPlayer,
     SetOrientation,
     SetOverlayBackground,
     SetOverlayConfig,
+    SetScreencastRegion,
     SetSlideshow,
     SetSplitMode,
     SleepDevice,
     StartScreencast,
-    StartScreencastDriver,
-    StartSlideshowDriver,
     StopScreencast,
-    StopScreencastDriver,
-    StopSlideshowDriver,
     StopVideo,
     TickDisplay,
     UpdateOverlayElement,
@@ -73,6 +70,7 @@ from ...core.commands import (
     UploadCustomMask,
     VideoStatus,
 )
+from ...core.logs import per_frame
 from ...core.models import MEDIA, MediaKind
 from ...core.results import (
     BackgroundModeResult,
@@ -80,6 +78,7 @@ from ...core.results import (
     BootAnimationResult,
     BrightnessResult,
     FitModeResult,
+    GameModeResult,
     KeepaliveResult,
     LcdSnapshotResult,
     LoopVideoResult,
@@ -94,9 +93,9 @@ from ...core.results import (
     OverlayConfigResult,
     OverlayElementDeleteResult,
     OverlayElementResult,
+    OverlayLayoutResult,
     OverlayResult,
     PauseVideoResult,
-    RenderDcResult,
     RenderResult,
     ScreencastResult,
     SeekVideoResult,
@@ -109,9 +108,11 @@ from ...core.results import (
     VideoResult,
 )
 from ._shared import (
-    ensure_connected,
+    admit_ws,
     http_error_if_failed,
+    owned_path,
     staging_dir,
+    temp_output,
     to_theme_response,
 )
 from .schemas import (
@@ -123,6 +124,7 @@ from .schemas import (
     CreateThemeResponse,
     ExportVideoRequest,
     FitModeRequest,
+    GameModeRequest,
     KeepaliveRequest,
     LoadVideoRequest,
     LoopVideoRequest,
@@ -136,16 +138,14 @@ from .schemas import (
     OverlayConfigRequest,
     OverlayElementAddRequest,
     OverlayElementUpdateRequest,
-    OverlayFlashRequest,
     OverlayRequest,
     PauseVideoRequest,
     PlayVideoRequest,
     RenderDcRequest,
+    ScreencastRegionRequest,
     ScreencastStartRequest,
     SeekVideoRequest,
-    SendImageRequest,
     SlideshowConfigureRequest,
-    SlideshowDriveRequest,
     SlideshowToggleRequest,
     SplitModeRequest,
     ThemeRequest,
@@ -154,6 +154,8 @@ from .schemas import (
 )
 
 log = logging.getLogger(__name__)
+#: ``/tick`` is a poller's route — once per frame, so the per-frame family.
+frame_log = per_frame(__name__)
 
 router = APIRouter(prefix="/devices/{key}/display", tags=["display"])
 
@@ -186,7 +188,7 @@ def set_brightness(key: str, body: BrightnessRequest,
     return result
 
 
-@router.post("/theme", response_model=ThemeResponse, dependencies=[Depends(ensure_connected)])
+@router.post("/theme", response_model=ThemeResponse)
 def load_theme(key: str, body: ThemeRequest,
                request: Request) -> ThemeResponse:
     log.info(
@@ -340,7 +342,22 @@ def set_split_mode(key: str, body: SplitModeRequest,
     return result
 
 
-@router.post("/play-video", dependencies=[Depends(ensure_connected)])
+@router.post("/game")
+def set_game_mode(key: str, body: GameModeRequest,
+                  request: Request) -> GameModeResult:
+    """Switch game mode and/or set its CPU threshold."""
+    log.info(
+        "api POST /devices/{key}/display/game: key=%s enabled=%s threshold=%s",
+        key, body.enabled, body.threshold,
+    )
+    result = request.app.state.trcc.dispatch(
+        SetGameMode(key=key, enabled=body.enabled, threshold=body.threshold),
+    )
+    http_error_if_failed(result)
+    return result
+
+
+@router.post("/play-video")
 def play_video(key: str, body: PlayVideoRequest,
                 request: Request) -> VideoResult:
     """Start a video playback override on the device."""
@@ -350,7 +367,7 @@ def play_video(key: str, body: PlayVideoRequest,
     )
     # PlayVideo persists the background path itself (#249).
     result = request.app.state.trcc.dispatch(
-        PlayVideo(key=key, path=Path(body.path), fps=body.fps),
+        PlayVideo(key=key, path=owned_path(request, body.path), fps=body.fps),
     )
     http_error_if_failed(result)
     return result
@@ -365,11 +382,12 @@ def load_video(key: str, body: LoadVideoRequest,
     from the CLI and from qtgui, and nowhere else, so a REST client could
     play a ``.zt`` it already had but could not turn an ``.mp4`` into one.
 
-    ``.zt`` inputs are copied straight in; real video files are
-    transcoded to the device's native resolution first, which is why the
-    device must be attached (or its key known to the product registry).
-    Use ``export-video`` instead when you want the ``.zt`` file back
-    rather than the theme applied.
+    The file plays as it is, with the device's fit applied live.  A cut
+    (``start_ms`` / ``end_ms`` / ``rotation``) is baked into a ``Theme.zt``
+    at the panel's size and the current fit, which is why the device must
+    be attached (or its key known to the product registry).  Use
+    ``export-video`` instead when you want the ``.zt`` file back rather
+    than the theme applied.
     """
     log.info(
         "api POST /devices/{key}/display/load-video: key=%s path=%s "
@@ -377,7 +395,7 @@ def load_video(key: str, body: LoadVideoRequest,
         key, body.path, body.start_ms, body.end_ms, body.rotation,
     )
     result = request.app.state.trcc.dispatch(LoadVideo(
-        key=key, path=Path(body.path), start_ms=body.start_ms,
+        key=key, path=owned_path(request, body.path), start_ms=body.start_ms,
         end_ms=body.end_ms, rotation=body.rotation,
     ))
     http_error_if_failed(result)
@@ -401,14 +419,14 @@ def export_video(key: str, body: ExportVideoRequest,
     """
     log.info(
         "api POST /devices/{key}/display/export-video: key=%s path=%s "
-        "start_ms=%s end_ms=%s rotation=%s fit_mode=%s",
+        "start_ms=%s end_ms=%s rotation=%s fit_mode=%s fps=%s",
         key, body.path, body.start_ms, body.end_ms, body.rotation,
-        body.fit_mode or "auto",
+        body.fit_mode or "auto", body.fps,
     )
     result = request.app.state.trcc.dispatch(ExportVideoClip(
-        key=key, path=Path(body.path), start_ms=body.start_ms,
+        key=key, path=owned_path(request, body.path), start_ms=body.start_ms,
         end_ms=body.end_ms, rotation=body.rotation,
-        fit_mode=body.fit_mode,
+        fit_mode=body.fit_mode, fps=body.fps,
     ))
     http_error_if_failed(result)
     return result
@@ -453,16 +471,18 @@ async def send_image(
     request: Request,
     image: UploadFile = File(...),
 ) -> ThemeResponse:
-    """One-shot image-to-LCD via multipart upload.
+    """Show an uploaded image on the LCD until the next theme load.
 
-    Remote clients (web dashboard, mobile app) that have an image in
-    memory rather than on the server's filesystem can use this instead
-    of ``POST /devices/{key}/display/theme`` (which requires the file
-    to already exist server-side).  Stages the upload to
-    ``user_content_dir/uploads/`` then dispatches ``LoadImage``.
+    The client sends the bytes, so no server path is ever named.  Stages the
+    upload, dispatches ``SendImage`` — the same Command as CLI ``display
+    send-image`` — and deletes the staged file: nothing is kept.
 
-    Supported formats: PNG / JPG / JPEG / BMP / WEBP — matches
-    :class:`LoadImage`.
+    It dispatched ``LoadImage`` until #306, which made every upload a saved
+    theme and left two files per call on disk forever; a dashboard pushing
+    on every change filled a partition.  ``/push-image`` went at the same
+    time: it did the same job from a server path that nothing confined.
+
+    Supported formats: PNG / JPG / JPEG / BMP / WEBP.
     """
     log.info(
         "api POST /devices/{key}/display/send-image: key=%s filename=%s",
@@ -477,13 +497,17 @@ async def send_image(
             f"{sorted(_CREATE_THEME_IMG_EXTS)}",
         )
     staged = uploads_dir / f"{uuid.uuid4().hex}{suffix}"
-    with staged.open("wb") as f:
-        shutil.copyfileobj(image.file, f)
-    result = request.app.state.trcc.dispatch(
-        LoadImage(key=key, path=staged),
-    )
+    try:
+        with staged.open("wb") as f:
+            shutil.copyfileobj(image.file, f)
+        result = request.app.state.trcc.dispatch(
+            SendImage(key=key, path=staged),
+        )
+    finally:
+        staged.unlink(missing_ok=True)
+        log.debug("send-image: removed staged %s", staged.name)
     http_error_if_failed(result)
-    return to_theme_response(result)
+    return ThemeResponse(ok=result.ok, message=result.message, key=result.key)
 
 
 @router.websocket("/preview/stream")
@@ -506,16 +530,9 @@ async def preview_stream(ws: WebSocket, key: str) -> None:
     """
     import asyncio
 
-    from .main import _api_token
-
-    # Token check FIRST — accept the WS handshake only when auth
-    # passes.  Skipping the accept on auth failure is the conventional
-    # way to send a 1008 close without exposing why.
-    if _api_token is not None:
-        token = ws.query_params.get("token", "")
-        if not hmac.compare_digest(token, _api_token):
-            await ws.close(code=1008)
-            return
+    # Admission FIRST — token, or loopback-only when there is none.
+    if not await admit_ws(ws):
+        return
 
     trcc = ws.app.state.trcc
     if not trcc.dispatch(DeviceState(key=key)).ok:
@@ -561,21 +578,13 @@ def preview(key: str, request: Request) -> Response:
     return Response(content=result.image, media_type=result.media_type)
 
 
-@router.post("/screencast/start", dependencies=[Depends(ensure_connected)])
+@router.post("/screencast/start")
 def screencast_start(key: str, body: ScreencastStartRequest,
                      request: Request) -> ScreencastResult:
     """Begin a screen-capture session for *key*.
 
-    Dispatches :class:`StartScreencast` — which validates region geometry,
-    stops any active video playback, and publishes
-    :class:`ScreencastStarted` — then :class:`StartScreencastDriver` to
-    actually capture.
-
-    That second dispatch is the whole feature for an API caller.  This
-    docstring used to end "the bus event still fires, just no consumer picks
-    it up", which was true and was the bug: the GUI's ``ScreencastHandler``
-    was the only subscriber that ran a capture timer, so a headless caller got
-    ``ok=True`` and an unchanged panel.
+    One :class:`StartScreencast`, which validates the region, stops any
+    video playback, and starts the capture driver.
     """
     log.info(
         "api POST /devices/{key}/display/screencast/start: key=%s "
@@ -589,8 +598,23 @@ def screencast_start(key: str, body: ScreencastStartRequest,
         ),
     )
     http_error_if_failed(result)
-    drive = request.app.state.trcc.dispatch(StartScreencastDriver(key=key))
-    http_error_if_failed(drive)
+    return result
+
+
+@router.post("/screencast/region")
+def screencast_region(key: str, body: ScreencastRegionRequest,
+                      request: Request) -> ScreencastResult:
+    """Set *key*'s screen-cast region; a running cast follows it."""
+    log.info(
+        "api POST /devices/{key}/display/screencast/region: key=%s "
+        "x=%s y=%s w=%s h=%s hide_border=%s",
+        key, body.x, body.y, body.w, body.h, body.hide_border,
+    )
+    result = request.app.state.trcc.dispatch(SetScreencastRegion(
+        key=key, x=body.x, y=body.y, w=body.w, h=body.h,
+        hide_border=body.hide_border,
+    ))
+    http_error_if_failed(result)
     return result
 
 
@@ -601,7 +625,6 @@ def screencast_stop(key: str, request: Request) -> ScreencastResult:
     Idempotent — returns ``ok=True`` even when no session was running.
     """
     log.info("api POST /devices/{key}/display/screencast/stop: key=%s", key)
-    request.app.state.trcc.dispatch(StopScreencastDriver(key=key))
     result = request.app.state.trcc.dispatch(StopScreencast(key=key))
     http_error_if_failed(result)
     return result
@@ -613,19 +636,23 @@ def media_player(key: str, body: MediaPlayerRequest,
     """Set the media-player source for *key* — a local file or a web URL/stream.
 
     Dispatches :class:`SetMediaPlayer`: a local file plays through the video
-    pipeline; a web URL is referenced (persisted so a theme save captures it).
+    pipeline; a web URL (http, https, rtsp) plays as a live stream.
     An empty ``uri`` clears the source.
     """
     log.info("api POST /devices/{key}/display/media-player: key=%s uri=%s",
              key, body.uri)
+    uri = body.uri.strip()
+    if uri and "://" not in uri:   # a local file: confined like every read
+        log.debug("media-player: %r is a local file — confining it", uri)
+        uri = str(owned_path(request, uri))
     result = request.app.state.trcc.dispatch(
-        SetMediaPlayer(key=key, uri=body.uri),
+        SetMediaPlayer(key=key, uri=uri),
     )
     http_error_if_failed(result)
     return result
 
 
-@router.post("/boot-animation", dependencies=[Depends(ensure_connected)])
+@router.post("/boot-animation")
 def upload_boot_animation(key: str, body: BootAnimationRequest,
                           request: Request) -> BootAnimationResult:
     """Upload a multi-frame compressed boot animation to a SCSI LCD's flash.
@@ -647,11 +674,15 @@ def upload_boot_animation(key: str, body: BootAnimationRequest,
         log.warning("frames dir: GetPaths returned no user_content_dir — "
                     "refusing (an empty path resolves to the process cwd)")
         raise HTTPException(500, "user content directory unavailable")
-    allowed_root = Path(user_content).resolve(strict=True)
+    # Not strict: on a fresh install ~/.trcc-user does not exist yet, and
+    # strict resolution raised straight through as a 500.  A missing root
+    # simply has no subdirectories, so the lookup below answers 400.
+    allowed_root = Path(user_content).resolve()
     requested_name = Path(body.frames_dir).name
     if not requested_name:
         raise HTTPException(400, "frames_dir required")
-    subdirs = {p.name: p for p in allowed_root.iterdir() if p.is_dir()}
+    subdirs = ({p.name: p for p in allowed_root.iterdir() if p.is_dir()}
+               if allowed_root.is_dir() else {})
     frames_path = subdirs.get(requested_name)
     if frames_path is None:
         raise HTTPException(
@@ -686,6 +717,37 @@ def upload_boot_animation(key: str, body: BootAnimationRequest,
 # accept a ``.gif`` upload that every Command downstream then rejected.
 _CREATE_THEME_IMG_EXTS = MEDIA.exts(MediaKind.IMAGE)
 _CREATE_THEME_VID_EXTS = MEDIA.exts(MediaKind.ANIMATED)
+
+
+def _stage_upload(upload: UploadFile, uploads_dir: Path, suffix: str,
+                  staged: list[Path]) -> Path:
+    """Write *upload* to a fresh name in ``uploads/``, recorded for cleanup."""
+    path = uploads_dir / f"{uuid.uuid4().hex}{suffix}"
+    staged.append(path)
+    with path.open("wb") as f:
+        shutil.copyfileobj(upload.file, f)
+    log.debug("_stage_upload: %s -> %s", upload.filename, path.name)
+    return path
+
+
+def _overlay_elements(overlay: UploadFile | None) -> tuple[dict, ...] | None:
+    """The ``elements`` of an uploaded overlay JSON; None when none was sent."""
+    if overlay is None or overlay.file is None:
+        log.debug("_overlay_elements: no overlay uploaded")
+        return None
+    try:
+        overlay_config = json.loads(overlay.file.read())
+    except (json.JSONDecodeError, ValueError) as e:
+        raise HTTPException(400, f"invalid overlay JSON: {e}") from e
+    if not isinstance(overlay_config, dict):
+        raise HTTPException(400, "overlay JSON must be an object")
+    raw_elements = overlay_config.get("elements", [])
+    if not isinstance(raw_elements, list):
+        raise HTTPException(
+            400, "overlay JSON 'elements' must be a list of element dicts")
+    elements = tuple(e for e in raw_elements if isinstance(e, dict))
+    log.debug("_overlay_elements: %d element(s)", len(elements))
+    return elements
 
 
 @router.post("/create-theme", response_model=CreateThemeResponse)
@@ -730,111 +792,89 @@ async def create_theme(
         loop,
     )
     uploads_dir = staging_dir(request)
-
-    bg_name = Path(background.filename or "background").name
-    bg_suffix = Path(bg_name).suffix.lower() or ".jpg"
-    if (bg_suffix not in _CREATE_THEME_IMG_EXTS
-            and bg_suffix not in _CREATE_THEME_VID_EXTS):
-        raise HTTPException(
-            400,
-            f"unsupported background extension {bg_suffix!r} "
-            f"(expected image {sorted(_CREATE_THEME_IMG_EXTS)} or "
-            f"video {sorted(_CREATE_THEME_VID_EXTS)})",
-        )
-    bg_path = uploads_dir / f"{uuid.uuid4().hex}{bg_suffix}"
-    with bg_path.open("wb") as f:
-        shutil.copyfileobj(background.file, f)
-
-    mask_path: Path | None = None
-    if mask is not None and mask.file is not None:
-        mask_suffix = Path(mask.filename or "mask.png").suffix.lower() or ".png"
-        if mask_suffix not in _CREATE_THEME_IMG_EXTS:
+    # Staged uploads a Command still reads stay: PlayVideo and ApplyMask
+    # persist the path they were given.  Everything else -- the image
+    # background LoadImage copied, anything a refused request staged --
+    # is removed: nothing else ever cleaned ``uploads/``.
+    staged: list[Path] = []
+    kept: set[Path] = set()
+    try:
+        bg_name = Path(background.filename or "background").name
+        bg_suffix = Path(bg_name).suffix.lower() or ".jpg"
+        if (bg_suffix not in _CREATE_THEME_IMG_EXTS
+                and bg_suffix not in _CREATE_THEME_VID_EXTS):
             raise HTTPException(
                 400,
-                f"unsupported mask extension {mask_suffix!r}",
+                f"unsupported background extension {bg_suffix!r} "
+                f"(expected image {sorted(_CREATE_THEME_IMG_EXTS)} or "
+                f"video {sorted(_CREATE_THEME_VID_EXTS)})",
             )
-        mask_target: Path = uploads_dir / f"{uuid.uuid4().hex}{mask_suffix}"
-        with mask_target.open("wb") as f:
-            shutil.copyfileobj(mask.file, f)
-        mask_path = mask_target
+        bg_path = _stage_upload(background, uploads_dir, bg_suffix, staged)
 
-    overlay_elements: tuple[dict, ...] | None = None
-    if overlay is not None and overlay.file is not None:
-        try:
-            overlay_config = json.loads(overlay.file.read())
-        except (json.JSONDecodeError, ValueError) as e:
-            raise HTTPException(
-                400, f"invalid overlay JSON: {e}",
-            ) from e
-        if not isinstance(overlay_config, dict):
-            raise HTTPException(400, "overlay JSON must be an object")
-        raw_elements = overlay_config.get("elements", [])
-        if not isinstance(raw_elements, list):
-            raise HTTPException(
-                400,
-                "overlay JSON 'elements' must be a list of element dicts",
+        mask_path: Path | None = None
+        if mask is not None and mask.file is not None:
+            mask_suffix = Path(mask.filename or "mask.png").suffix.lower() or ".png"
+            if mask_suffix not in _CREATE_THEME_IMG_EXTS:
+                raise HTTPException(
+                    400,
+                    f"unsupported mask extension {mask_suffix!r}",
+                )
+            mask_path = _stage_upload(mask, uploads_dir, mask_suffix, staged)
+
+        overlay_elements = _overlay_elements(overlay)
+
+        animated = bg_suffix in _CREATE_THEME_VID_EXTS
+        if animated:
+            # PlayVideo persists the background path itself (#249).
+            play_result = request.app.state.trcc.dispatch(
+                PlayVideo(key=key, path=bg_path),
             )
-        overlay_elements = tuple(
-            e for e in raw_elements if isinstance(e, dict)
-        )
+            http_error_if_failed(play_result)
+            kept.add(bg_path)
+            if not loop:
+                request.app.state.trcc.dispatch(
+                    LoopVideo(key=key, loop=False),
+                )
+        else:
+            load_result = request.app.state.trcc.dispatch(
+                LoadImage(key=key, path=bg_path),
+            )
+            http_error_if_failed(load_result)
 
-    animated = bg_suffix in _CREATE_THEME_VID_EXTS
-    if animated:
-        # PlayVideo persists the background path itself (#249).
-        play_result = request.app.state.trcc.dispatch(
-            PlayVideo(key=key, path=bg_path),
-        )
-        http_error_if_failed(play_result)
-        if not loop:
+        if mask_path is not None:
+            mask_result = request.app.state.trcc.dispatch(
+                ApplyMask(key=key, path=mask_path),
+            )
+            http_error_if_failed(mask_result)
+            kept.add(mask_path)
+
+        if overlay_elements is not None:
+            config_result = request.app.state.trcc.dispatch(
+                SetOverlayConfig(key=key, elements=overlay_elements),
+            )
+            http_error_if_failed(config_result)
             request.app.state.trcc.dispatch(
-                LoopVideo(key=key, loop=False),
+                EnableOverlay(key=key, enabled=True),
             )
-    else:
-        load_result = request.app.state.trcc.dispatch(
-            LoadImage(key=key, path=bg_path),
+
+        # The one ladder (DeviceCanvas); this route kept its own copy of it.
+        found = request.app.state.trcc.dispatch(DeviceCanvas(key=key))
+        w, h = (found.width, found.height) if found.ok else (0, 0)
+
+        return CreateThemeResponse(
+            ok=True,
+            key=key,
+            animated=animated,
+            resolution=f"{w}x{h}",
+            message=(f"theme created from {bg_name} "
+                     f"({'video' if animated else 'image'}, {w}x{h})"),
         )
-        http_error_if_failed(load_result)
-
-    if mask_path is not None:
-        mask_result = request.app.state.trcc.dispatch(
-            ApplyMask(key=key, path=mask_path),
-        )
-        http_error_if_failed(mask_result)
-
-    if overlay_elements is not None:
-        config_result = request.app.state.trcc.dispatch(
-            SetOverlayConfig(key=key, elements=overlay_elements),
-        )
-        http_error_if_failed(config_result)
-        request.app.state.trcc.dispatch(
-            EnableOverlay(key=key, enabled=True),
-        )
-
-    # Resolve the device's resolution for the response — same lookup
-    # ``_resolve_resolution`` does in core/commands.py, kept inline so
-    # the route doesn't reach into private helpers.
-    state = request.app.state.trcc.dispatch(DeviceState(key=key))
-    # Handshake resolution wins; the registry's native size is the fallback
-    # for an attached-but-not-yet-handshaken device.  `resolution is None`
-    # is what distinguishes those — a 0x0 panel would be a real answer.
-    if not state.ok:
-        w, h = 0, 0
-    elif state.resolution is not None:
-        w, h = state.resolution
-    else:
-        w, h = state.native_resolution
-
-    return CreateThemeResponse(
-        ok=True,
-        key=key,
-        animated=animated,
-        resolution=f"{w}x{h}",
-        message=(f"theme created from {bg_name} "
-                 f"({'video' if animated else 'image'}, {w}x{h})"),
-    )
-
-
-@router.post("/color", dependencies=[Depends(ensure_connected)])
+    finally:
+        for path in staged:
+            if path not in kept:
+                path.unlink(missing_ok=True)
+                log.debug("create_theme: removed staged %s", path.name)
+@router.post("/color")
 def send_color(key: str, body: ColorRequest, request: Request) -> SendResult:
     """Push a solid-color frame to a connected LCD device."""
     log.info(
@@ -861,7 +901,7 @@ def sleep(key: str, request: Request) -> SendResult:
     return result
 
 
-@router.post("/reset", dependencies=[Depends(ensure_connected)])
+@router.post("/reset")
 def reset(key: str, request: Request) -> SendResult:
     """Reset the display — stop any active video, then send a solid red frame.
 
@@ -885,20 +925,18 @@ def tick(key: str, request: Request) -> RenderResult:
     polls this at AppSettings.refresh_interval_s or whatever cadence
     they like.  Uses the scene cache so ticks are cheap.
 
-    Self-primes and advances video the way the CLI ``display play`` loop does,
-    so a headless poller Just Works (#239): (1) ``RestoreDeviceState`` is
-    idempotent — a no-op once a theme is active — so the first tick can't fail
-    "No active theme"; (2) ``TickDisplay`` advances a play-video override's
-    cursor before rendering, so successive ticks animate it.
+    Advances video the way the CLI ``display play`` loop does:
+    ``TickDisplay`` moves a play-video override's cursor before rendering, so
+    successive ticks animate it.
 
-    The restore stays HERE rather than inside ``TickDisplay``: a stateless
-    poller may arrive with nothing loaded, but the GUI's animation timer would
-    otherwise pay a restore 15-30 times a second.  Self-priming is this
-    route's concern; advancing is the Command's.
+    It no longer restores the saved theme on every poll (#239's self-prime).
+    The API runs a session now, like every UI, and the session primes a panel
+    when it connects (``App._prime``) — once, where a failing restore used to
+    cost 22 log records per POLL.  A push still holds the panel between ticks.
     """
-    log.info("api POST /devices/{key}/display/tick: key=%s", key)
+    frame_log.debug("api POST /devices/{key}/display/tick: key=%s", key)
+    request.state.per_frame = True     # the request log keeps it off INFO
     app = request.app.state.trcc
-    app.dispatch(RestoreDeviceState(key=key))
     result = app.dispatch(TickDisplay(key=key))
     http_error_if_failed(result)
     return result
@@ -909,9 +947,9 @@ def tick(key: str, request: Request) -> RenderResult:
 def restore_theme(key: str, request: Request) -> ThemeResponse:
     """Restore the device's display state (persisted theme + background).
 
-    Dispatches the unified ``RestoreDeviceState`` — persisted theme, or the
-    first available theme when none is saved, then replays the persisted
-    background video — the same path the GUI/CLI use at their display entry.
+    Dispatches ``RestoreDeviceState`` — the persisted theme, or ``Theme1``
+    when none is saved, then the persisted background video — the same
+    Command every UI's restore dispatches.  Restores even over a pushed image.
     """
     log.info("api POST /devices/{key}/display/restore-theme: key=%s", key)
     result = request.app.state.trcc.dispatch(RestoreDeviceState(key=key))
@@ -954,69 +992,30 @@ def background(key: str, body: BackgroundFileRequest,
     log.info("api POST /devices/{key}/display/background: key=%s path=%s",
              key, body.path)
     result = request.app.state.trcc.dispatch(
-        SetBackground(key=key, path=Path(body.path)),
-    )
-    http_error_if_failed(result)
-    return result
-
-
-@router.post("/push-image", dependencies=[Depends(ensure_connected)])
-def push_image(key: str, body: SendImageRequest,
-               request: Request) -> SendResult:
-    """Push a server-side image to the panel ONCE — nothing staged or persisted.
-
-    **Not** ``/send-image``, despite the names.  That route takes a multipart
-    upload and dispatches ``LoadImage``, which materialises a single-image theme
-    and updates ``DeviceSettings.current_theme``; its name predates the
-    distinction and is kept because renaming it would break clients.  This
-    dispatches ``SendImage``: open, resize, encode, send, once — the ephemeral
-    path the CLI has had all along and REST did not.
-    """
-    log.info("api POST /devices/{key}/display/push-image: key=%s path=%s",
-             key, body.path)
-    result = request.app.state.trcc.dispatch(
-        SendImage(key=key, path=Path(body.path)),
+        SetBackground(key=key, path=owned_path(request, body.path)),
     )
     http_error_if_failed(result)
     return result
 
 
 @router.post("/render-dc")
-def render_dc(body: RenderDcRequest, request: Request) -> RenderDcResult:
-    """Render a legacy DC config to an image with no device and no theme load.
+def render_dc(body: RenderDcRequest, request: Request) -> Response:
+    """Render a legacy DC config to a PNG with no device and no theme load.
 
     A diagnostic: it answers "what does this .dc actually draw?" without
     touching hardware, which is why it takes a size rather than a device key.
+    The PNG comes back in the response — the route wrote it to any server
+    path the client named until the trust-boundary pass.
     """
-    log.info("api POST /display/render-dc: dc=%s out=%s %dx%d",
-             body.dc_path, body.output_path, body.width, body.height)
-    result = request.app.state.trcc.dispatch(RenderDcStandalone(
-        dc_path=Path(body.dc_path), output_path=Path(body.output_path),
-        width=body.width, height=body.height,
-    ))
-    http_error_if_failed(result)
-    return result
-
-
-@router.post("/slideshow/drive")
-def slideshow_drive(key: str, body: SlideshowDriveRequest,
-                    request: Request) -> SlideshowResult:
-    """Start or stop actually ROTATING the configured slideshow.
-
-    ``POST /slideshow`` only persists the setting.  Nothing advanced it outside
-    the gui, which runs its own timer — so a slideshow configured over REST was
-    saved, reported back correctly, and never switched a theme.  This registers
-    the driver that rotates it.
-    """
-    log.info(
-        "api POST /devices/{key}/display/slideshow/drive: key=%s drive=%s",
-        key, body.drive,
-    )
-    cmd = (StartSlideshowDriver(key=key) if body.drive
-           else StopSlideshowDriver(key=key))
-    result = request.app.state.trcc.dispatch(cmd)
-    http_error_if_failed(result)
-    return result
+    log.info("api POST /display/render-dc: dc=%s %dx%d",
+             body.dc_path, body.width, body.height)
+    with temp_output(".png") as out:
+        result = request.app.state.trcc.dispatch(RenderDcStandalone(
+            dc_path=owned_path(request, body.dc_path), output_path=out,
+            width=body.width, height=body.height,
+        ))
+        http_error_if_failed(result)
+        return Response(out.read_bytes(), media_type="image/png")
 
 
 @router.put("/slideshow")
@@ -1147,21 +1146,19 @@ def overlay_delete(key: str, element_id: str,
     return result
 
 
-@router.post("/overlay-elements/{element_id}/flash")
-def overlay_flash(key: str, element_id: str,
-                  body: OverlayFlashRequest,
-                  request: Request) -> OverlayElementResult:
-    """Briefly highlight an overlay element in the GUI."""
-    log.info(
-        "api POST /devices/{key}/display/overlay-elements/{element_id}/flash: "
-        "key=%s element_id=%s duration_ms=%s",
-        key, element_id, body.duration_ms,
-    )
-    result = request.app.state.trcc.dispatch(FlashOverlayElement(
-        key=key, element_id=element_id, duration_ms=body.duration_ms,
-    ))
-    http_error_if_failed(result)
-    return result
+@router.get("/overlay-elements")
+def overlay_layout(key: str, request: Request) -> OverlayLayoutResult:
+    """What is currently drawn on the device -- the read half of overlay.
+
+    Every other overlay route mutates.  Without this one a client could PUT a
+    whole layout but never see the one it was replacing, and the element ids
+    that PATCH / DELETE / flash take had no source but the client's own memory
+    of an earlier POST.  ``source`` names the winning layer and ``enabled`` the
+    device's toggle, so an empty list can be told apart from an overlay that is
+    simply switched off.
+    """
+    log.info("api GET /devices/{key}/display/overlay-elements: key=%s", key)
+    return request.app.state.trcc.dispatch(ResolveOverlay(key=key))
 
 
 @router.put("/overlay-elements")
@@ -1234,7 +1231,7 @@ def upload_mask(key: str, body: MaskUploadRequest,
         key, body.source,
     )
     result = request.app.state.trcc.dispatch(
-        UploadCustomMask(key=key, source=Path(body.source)),
+        UploadCustomMask(key=key, source=owned_path(request, body.source)),
     )
     http_error_if_failed(result)
     return result
@@ -1255,7 +1252,8 @@ def video_duration(path: str, request: Request) -> VideoDurationResult:
     defaults its range rather than refusing to open.
     """
     log.info("api GET /display/video-duration: path=%s", path)
-    return request.app.state.trcc.dispatch(ProbeVideoDuration(path=Path(path)))
+    return request.app.state.trcc.dispatch(
+        ProbeVideoDuration(path=owned_path(request, path)))
 
 
 @meta_router.get("/masks")

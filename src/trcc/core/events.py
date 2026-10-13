@@ -13,7 +13,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .logs import per_frame
-from .models import HardwareMetrics, TempUnit
+from .models import (
+    IN_PROCESS_ONLY,
+    HardwareMetrics,
+    RamAccessState,
+    RgbFollowMode,
+    TempUnit,
+)
 
 log = logging.getLogger(__name__)
 frame_log = per_frame(__name__)
@@ -55,9 +61,23 @@ class FrameSent(Event):
     # went to the wire instead of re-rendering the whole pipeline a second
     # time (legacy's ``bus.publish('frame', …, Frame(native=img))`` shape).
     # In-process only: None on the pure-bytes send paths (SendFrame /
-    # SendColor / SendImage / keepalive) and would be None across IPC,
-    # where a remote client must fall back to a re-render.
-    surface: Any = None
+    # SendColor / SendImage / keepalive), and never sent across IPC, where a
+    # remote client falls back to a re-render.
+    surface: Any = field(default=None, metadata=IN_PROCESS_ONLY)
+    # ``surface`` for an observer on the far side of the daemon socket: the
+    # same frame, JPEG-encoded ONCE by the IPC fan-out (``ipc.IPCServer``) and
+    # only while a window is subscribed.  Empty in-process.  Without it a
+    # remote preview re-rendered and PNG-encoded every frame itself -- 25-29%
+    # of a core in the daemon with the gui open (measured 2026-10-06).
+    image: bytes = field(default=b"", repr=False)
+    # ``image`` without the encode, for an observer on the same machine: the
+    # slot of the device's shared frame file that holds this frame
+    # (``trcc.frame_share``) -- its sequence number and (width, height,
+    # stride).  Zero for a subscriber that did not ask for shared frames.
+    shared_seq: int = 0
+    shared_shape: tuple[int, int, int] = (0, 0, 0)
+    # The ARGB32 pixels the proxy read from that slot.  In-process only.
+    pixels: bytes = field(default=b"", repr=False, metadata=IN_PROCESS_ONLY)
     # LED twin of ``surface``: an LED render has no image, it has per-LED
     # colors.  Carried on the SAME event so LED uses the SAME preview path as
     # LCD (one render → FrameSent → handle_frame → preview), not a parallel
@@ -87,16 +107,36 @@ class FitModeChanged(Event):
 class OverlayChanged(Event):
     key: str
     enabled: bool
-    # When set, GUI subscribers temporarily highlight the named element
-    # for ``flash_duration_ms`` milliseconds.  Other UIs ignore.
-    flash_element_id: str = ""
-    flash_duration_ms: int = 0
 
 
 @dataclass(frozen=True, slots=True)
 class SplitModeChanged(Event):
     key: str
     mode: int
+
+
+@dataclass(frozen=True, slots=True)
+class GameModeChanged(Event):
+    """A device's game mode was switched or its CPU threshold changed.
+
+    By any UI, or by a rotation into a folder that keeps its own pair, so
+    every UI's game-mode controls follow the one saved state.
+    """
+    key: str
+    enabled: bool
+    threshold: int
+
+
+@dataclass(frozen=True, slots=True)
+class GameModeEngaged(Event):
+    """Game mode took the panel (``engaged``) or gave it back.
+
+    The setting is :class:`GameModeChanged`; this is the busy CPU acting on
+    it.  The C# shows no indicator, so no window draws one -- it is here for
+    the log, a script, or a UI that later wants one.
+    """
+    key: str
+    engaged: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,15 +177,54 @@ class ThemeImported(Event):
 
 
 @dataclass(frozen=True, slots=True)
+class ThemeDeleted(Event):
+    """A user theme was removed -- so every open theme list drops it."""
+    theme_name: str
+    path: str
+
+
+@dataclass(frozen=True, slots=True)
 class DataInstalled(Event):
     """A resolution's theme / cloud-preview / mask archives finished.
 
-    Published by the background installer, never on the caller's thread —
-    every UI listens for this to re-list its theme + mask grids, which are
-    empty until the first-run download lands.
+    Published by the background installer (on its worker thread) and by
+    ``EnsureDataDownload`` (on the dispatching one) -- so a subscriber must
+    not assume either thread.  Every UI listens for this to re-list its
+    theme + mask grids, which are empty until the first-run download lands.
     """
     resolution: tuple[int, int]
     ok: bool
+
+
+@dataclass(frozen=True, slots=True)
+class VideoAdvanced(Event):
+    """Published by ``TickDisplay`` after a video moves to its next frame.
+
+    The position a UI shows (the progress bar) used to come back as the
+    RESULT of the UI's own tick.  The core ticks now (``VideoLoop``, #249), so
+    the position is announced instead — by the Command, whoever dispatched it.
+    Per-frame, like ``FrameSent``.
+
+    ``fps`` is the playback's rate, so a UI turns a frame into a time from the
+    event alone -- one opened mid-playback included.  The same value
+    ``VideoStatusResult.fps`` reports.
+    """
+    key: str
+    cursor: int
+    frame_count: int
+    fps: int
+
+
+@dataclass(frozen=True, slots=True)
+class VideoPauseChanged(Event):
+    """A device's video was paused or resumed -- by any UI.
+
+    The playback stays loaded, so neither ``VideoStarted`` nor
+    ``VideoStopped`` fires; without this a window showed whatever ITS OWN
+    last toggle returned.
+    """
+    key: str
+    paused: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,10 +288,10 @@ class ScreencastStarted(Event):
     """Published by ``StartScreencast`` after a screen-capture session is
     requested for a device.
 
-    Mirrors :class:`VideoStarted` semantics: the GUI ``ScreencastHandler``
-    subscribes through ``BusBridge`` and only starts its capture timer
-    when this event fires — so daemon/CLI/API callers can drive
-    screencast through the same Command bus as the GUI.
+    The capturing is the App's (``StartScreencast`` starts its driver).  This
+    is how every UI learns a device began casting, whichever UI started it:
+    both Qt skins follow it through ``BusBridge`` and re-read the device's
+    ``LcdSnapshot.screencast_region``.
 
     ``x, y, w, h`` is the screen region (pixels).  ``audio`` toggles the
     microphone spectrum visualiser overlay on each captured frame.
@@ -226,9 +305,25 @@ class ScreencastStarted(Event):
 
 
 @dataclass(frozen=True, slots=True)
+class ScreencastRegionChanged(Event):
+    """A device's stored screencast region or hide-border flag changed.
+
+    Published by ``SetScreencastRegion`` and by a theme or mask seeding it, so
+    every UI's region fields and frame follow -- cast or not.  ``x, y, w, h``
+    is the box on SCREEN (``LcdSnapshot.screencast_rect``).
+    """
+    key: str
+    x: int
+    y: int
+    w: int
+    h: int
+    hide_border: bool
+
+
+@dataclass(frozen=True, slots=True)
 class ScreencastStopped(Event):
     """Published by ``StopScreencast`` after a device's capture session
-    is torn down.  ``ScreencastHandler`` stops its timer in response."""
+    is torn down.  Every UI follows it the way it follows ``ScreencastStarted``."""
     key: str
 
 
@@ -253,9 +348,26 @@ class ThemeLoaded(Event):
 
 
 @dataclass(frozen=True, slots=True)
+class SlideshowChanged(Event):
+    """A device's slideshow was configured, switched on or switched off.
+
+    By any UI, or by the driver ending it when another source took the panel,
+    so every UI's slideshow controls follow the one saved state.
+    """
+    key: str
+    enabled: bool
+    interval_s: float
+    themes: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class LedColorsChanged(Event):
     key: str
     color_count: int
+    #: The colours the cooler shows, BEFORE its segment mask: what another
+    #: RGB system follows (#160).  A segment display's dark digits would
+    #: otherwise put dark gaps along every follower.
+    colors: tuple[tuple[int, int, int], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -335,6 +447,56 @@ class TempUnitChanged(Event):
 
 
 @dataclass(frozen=True, slots=True)
+class RgbLightsChanged(Event):
+    """The RGB lights or their effects changed -- a scan, an effect saved --
+    from any UI; every window re-reads ``RgbLights``."""
+
+
+@dataclass(frozen=True, slots=True)
+class RamLightingChanged(Event):
+    """RAM lighting was switched on or off, from any UI -- so every window
+    shows the new state, not only the one whose button was pressed."""
+    state: RamAccessState
+
+
+@dataclass(frozen=True, slots=True)
+class RgbFollowChanged(Event):
+    """What follows the cooler changed (#160), from any UI.
+
+    Published by ``SetRgbFollow``; every window shows the choice from the
+    ``RgbFollow`` Query on it, so a change from the CLI, the API or the
+    other window shows up too.
+    """
+    mode: RgbFollowMode
+
+
+@dataclass(frozen=True, slots=True)
+class RgbFollowSent(Event):
+    """The colours following just sent (#160): light *i* got column *i*
+    (wrapping), top to bottom.
+
+    As a screen shows them -- before the LEDs' gamma -- so a window's preview
+    looks like the lights.  ``source`` is the device that led: the followed
+    LCD's key, or the cooler's.  Published only after a send succeeded, at
+    most as often as the follower sends.
+    """
+    source: str
+    columns: tuple[tuple[tuple[int, int, int], ...], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class UpdateChecked(Event):
+    """The App asked whether a newer TRCC exists (at session start, then
+    hourly); every window shows the answer -- none asks for itself."""
+    ok: bool
+    local_version: str = ""
+    latest_version: str = ""
+    release_url: str = ""
+    update_available: bool = False
+    message: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class HddEnabledChanged(Event):
     """User toggled HDD-metrics inclusion in the broadcast.
 
@@ -344,29 +506,6 @@ class HddEnabledChanged(Event):
     after a full refresh interval.
     """
     enabled: bool
-
-
-@dataclass(frozen=True, slots=True)
-class TimeFormatChanged(Event):
-    """User changed the 12h/24h clock format.
-
-    Per-device because :class:`DeviceSettings.time_format` is the
-    persisted source of truth — ``DisplayService.compute_clock``
-    reads it per render.  ``DeviceRenderObserver`` subscribes so
-    the LCD re-renders on the next tick.
-    """
-    key: str
-    fmt: str   # "12h" or "24h"
-
-
-@dataclass(frozen=True, slots=True)
-class DateFormatChanged(Event):
-    """User changed the date pattern (e.g. yyyy/MM/dd → dd.MM.yyyy).
-
-    Per-device for symmetry with :class:`TimeFormatChanged`.
-    """
-    key: str
-    fmt: str   # e.g. "yyyy/MM/dd"
 
 
 @dataclass(frozen=True, slots=True)
@@ -382,6 +521,24 @@ class GpuDeviceChanged(Event):
 @dataclass(frozen=True, slots=True)
 class RefreshIntervalChanged(Event):
     seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class DiskDeviceChanged(Event):
+    """The drive ``disk_temp`` follows; None is "the hottest"."""
+    disk_key: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class SensorDashboardChanged(Event):
+    """The System Info dashboard's panels were saved."""
+    panels: int
+
+
+@dataclass(frozen=True, slots=True)
+class AutostartChanged(Event):
+    """TRCC's start-at-login entry was added or removed."""
+    enabled: bool
 
 
 # ── Hotplug / power transitions ──────────────────────────────────────
@@ -415,6 +572,18 @@ class SystemSuspending(Event):
 @dataclass(frozen=True, slots=True)
 class SystemResumed(Event):
     """The OS just resumed from suspend.  Re-discover + reconnect."""
+
+
+@dataclass(frozen=True, slots=True)
+class AppStopping(Event):
+    """The App is stopping ON PURPOSE -- ``trcc kill``, SIGTERM, or a newer
+    version replacing it.  Quitting TRCC quits every open UI.
+
+    Written by the IPC server as the LAST line of every event stream, never
+    published on a bus: the queue the fan-out drains could still be holding it
+    when the sockets close.  Its absence is what tells a crash apart.  Read by
+    the face, through ``CommandBus.on_app_gone`` -- not by widgets.
+    """
 
 
 # =========================================================================
@@ -451,6 +620,12 @@ class EventBus:
             self._handlers[event_type].remove(handler)
         except ValueError:
             pass
+
+    def subscriber_count(self, event_type: type[Event]) -> int:
+        """How many handlers listen for *event_type* -- whether anyone does."""
+        count = len(self._handlers.get(event_type, ()))
+        log.debug("subscriber_count: %s -> %d", event_type.__name__, count)
+        return count
 
     def publish(self, event: Event) -> None:
         """Fan out *event* to every handler subscribed to its type.

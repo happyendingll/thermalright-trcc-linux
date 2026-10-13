@@ -57,9 +57,20 @@ import compileall
 import re
 import statistics
 import subprocess
+import os
 import sys
 import tempfile
 from pathlib import Path
+
+# dev/, for the side-effect-free check (NOT the bootstrap -- see main()).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from _refuse import refuse_while_trcc_runs
+
+# In-process on purpose: this measures the App's work in THIS process, and the
+# production default would hand it a proxy to a daemon doing the work elsewhere.
+# In-process measurement, whatever the shell exports: through the shared App
+# this would time a different process.  ``main`` refuses while one runs.
+os.environ["TRCC_DAEMON"] = "0"
 
 _RESULT = re.compile(r"RESULT requested=(\d+) sent=(\d+)")
 
@@ -455,6 +466,10 @@ def main() -> None:
             _run_arm(args.run, args.video)
         return
 
+    # The orchestrator only: a ``--run`` child may be ANOTHER tree's src
+    # (``--against``), and importing the dev bootstrap there would put this
+    # tree's src first on its path and measure the wrong build.
+    refuse_while_trcc_runs("glass_bench")
     workload = f"advancing video ({args.video.name})" if args.video else "static theme"
     workload += " · REAL GUI" if args.gui else " · headless"
     print(f"workload: {workload}   span: {args.lo} → {args.hi} frames   "

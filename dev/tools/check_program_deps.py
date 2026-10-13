@@ -51,8 +51,8 @@ import shutil
 import subprocess
 import sys
 import tarfile
-import tomllib
 import urllib.error
+import time
 import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -64,7 +64,7 @@ _PYPROJECT = _ROOT / "pyproject.toml"
 _RELEASE_YML = _ROOT / ".github" / "workflows" / "release.yml"
 
 _FEDORA_RELEASE = "f44"
-_UBUNTU_SERIES = "questing"
+_UBUNTU_SERIES = "resolute"      # 26.04 LTS: what the standard deb targets
 #: Alpine stable branch.  Pinned like the two above: "edge" would make
 #: the answer depend on the day the tool ran, and users are on a release.
 _ALPINE_BRANCH = "v3.22"
@@ -80,18 +80,29 @@ _PKG_NAMES: dict[str, tuple[str, str, str]] = {
     "psutil":           ("python-psutil", "python3-psutil", "python3-psutil"),
     "pyusb":            ("python-pyusb", "python3-pyusb", "python3-usb"),
     "pyudev":           ("python-pyudev", "python3-pyudev", "python3-pyudev"),
-    "hidapi":           ("python-hidapi", "python3-hid", "python3-hidapi"),
+    # (arch, fedora, deb): Fedora's binding is python3-hidapi, and the deb ships
+    # apmorton's as python3-hid.  These two were SWAPPED until 2026-09-29, so the
+    # matrix printed NO for two packages that declare it.
+    "hidapi":           ("python-hidapi", "python3-hidapi", "python3-hid"),
     "click":            ("python-click", "python3-click", "python3-click"),
     "typer":            ("python-typer", "python3-typer", "python3-typer"),
     "fastapi":          ("python-fastapi", "python3-fastapi", "python3-fastapi"),
+    "cryptography":     ("python-cryptography", "python3-cryptography",
+                         "python3-cryptography"),
     "prompt_toolkit":   ("python-prompt_toolkit", "python3-prompt-toolkit",
                          "python3-prompt-toolkit"),
-    "python-multipart": ("python-multipart", "python3-multipart",
-                         "python3-multipart"),
+    # The DISTRO name of PyPI's python-multipart is python-python-multipart /
+    # python3-python-multipart.  The shorter "python-multipart" (Arch) and
+    # "python3-multipart" (Fedora; Debian 13+, Ubuntu 25.10+) are defnull's
+    # ``multipart`` -- a different library FastAPI rejects ("It seems you
+    # installed 'multipart' instead").  Mapped to the short names, this table
+    # blessed exactly that on Arch and could never see Fedora (2026-09-29).
+    "python-multipart": ("python-python-multipart", "python3-python-multipart",
+                         "python3-python-multipart"),
     "certifi":          ("python-certifi", "python3-certifi", "python3-certifi"),
     "nvidia-ml-py":     ("python-nvidia-ml-py", "python3-nvidia-ml-py",
                          "python3-pynvml"),
-    "uvicorn":          ("python-uvicorn", "python3-uvicorn", "python3-uvicorn"),
+    "uvicorn":          ("uvicorn", "python3-uvicorn", "python3-uvicorn"),
     "sounddevice":      ("python-sounddevice", "python3-sounddevice",
                          "python3-sounddevice"),
 }
@@ -104,7 +115,7 @@ _PKG_NAMES: dict[str, tuple[str, str, str]] = {
 # check ("who provides pynvml?") cannot be fooled that way.
 _IMPORT_NAME = {
     "nvidia-ml-py": "pynvml",
-    "python-multipart": "multipart",
+    "python-multipart": "python_multipart",   # "multipart" is defnull's
     "PySide6": "PySide6",
     "prompt_toolkit": "prompt_toolkit",
 }
@@ -112,7 +123,7 @@ _IMPORT_NAME = {
 # Arch packages we knowingly do NOT declare, because Arch has no official
 # package and a `depend =` line would make `pacman -U` fail for everyone.
 # This tool exists to tell us when an entry here stops being true.
-ARCH_UNAVAILABLE = {"python-uvicorn", "python-sounddevice"}
+ARCH_UNAVAILABLE = {"python-sounddevice"}
 
 # Hard pyproject deps we DELIBERATELY do not declare for a distro, with the
 # reason.  Distinct from "unavailable": the package EXISTS, and depending on it
@@ -136,6 +147,21 @@ DELIBERATELY_OPTIONAL: dict[str, str] = {
         "shipped the apmorton binding for releases. Both are optdepends, and "
         "the no-binding warning names the package for each distro."
     ),
+    "certifi": (
+        "optional: UrllibHttpFetcher loads its bundle on top of the system "
+        "trust store when it is installed (the #109 macOS fix, restored "
+        "2026-10-07 after the cutover dropped it), so a frozen build carries "
+        "it. The deb and rpm need nothing from it -- the system store is right "
+        "there."
+    ),
+    "sounddevice": (
+        "only the audio visualizer uses it, and services/audio.py says so when "
+        "it is missing. Fedora 43 and Debian 13 have no package, so requiring "
+        "it made the RPM uninstallable on Fedora 43; bundling it instead "
+        "collided with the distro package where one exists (Ubuntu 26.04's "
+        "dpkg refused the deb, rc 100). A Recommends on the rpm and deb; Arch, "
+        "which has no package, still bundles it (2026-10-09)."
+    ),
     "nvidia-ml-py": (
         "pulls nvidia-utils (~938 MB) on Arch / libnvidia-ml1 from contrib on "
         "Debian -- an NVIDIA driver stack for every AMD and Intel owner (#216). "
@@ -151,6 +177,11 @@ DELIBERATELY_OPTIONAL: dict[str, str] = {
 # owns the same site-packages paths.
 FEDORA_VENDORED = {"nvidia-ml-py"}
 
+# Hard deps the STANDARD deb bundles instead of declaring: its build step
+# ``pip install``s them into the payload (release.yml, "not in Ubuntu/Debian
+# repos").  Recorded so the matrix says "vendor" rather than a false NO.
+DEB_VENDORED: set[str] = set()      # sounddevice: a Recommends since 2026-10-09
+
 
 def pyproject_runtime_deps(include_win32: bool = False) -> list[str]:
     """Hard runtime deps from pyproject.
@@ -160,6 +191,10 @@ def pyproject_runtime_deps(include_win32: bool = False) -> list[str]:
     passes True so wmi / tzdata / libusb-package stop being invisible: they are
     real dependencies of a real target, and nothing checked them before.
     """
+    # Here, not at the top: tomllib is 3.11+, and importing this module (its
+    # offline tests do) must work on the 3.10 the package still supports.
+    # The tool itself runs on 3.12, the dev gate.
+    import tomllib
     data = tomllib.loads(_PYPROJECT.read_text())
     out: list[str] = []
     for spec in data["project"]["dependencies"]:
@@ -203,7 +238,10 @@ def deb_declared_depends() -> set[str]:
     for line in re.findall(r"^\s*Depends: (.+)$", text, re.M):
         if "pyside6" not in line:
             continue                     # the legacy deb — vendors instead
-        return {re.split(r"\s*\(", tok.strip())[0] for tok in line.split(",")}
+        # ``a | b (<< 0.1)`` is ONE requirement with alternatives; each
+        # alternative counts as declared.
+        return {re.split(r"\s*\(", alt.strip())[0]
+                for tok in line.split(",") for alt in tok.split("|")}
     return set()
 
 
@@ -223,9 +261,38 @@ def _get(url: str) -> str | None:
         return None
 
 
+class Unreachable(Exception):
+    """A package index did not answer -- which says NOTHING about the package."""
+
+
+def _fetch(url: str, attempts: int = 3,
+           absent: tuple[int, ...] = (404,)) -> str | None:
+    """*url*'s body; None ONLY when the index says "not found" (*absent*).
+
+    ``_get`` returns None for every failure, and the package probes read that
+    as "absent": one dropped request to Fedora's mdapi on 2026-10-09 became a
+    STALE row for a package Fedora ships -- and a STALE row blocks a release.
+    A failure that is not a 404 is retried, then raised as ``Unreachable``.
+    """
+    reason = ""
+    for attempt in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=_TIMEOUT) as r:
+                return r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            if e.code in absent:
+                return None
+            reason = f"HTTP {e.code}"
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            reason = f"{type(e).__name__}: {e}"
+        if attempt < attempts:
+            time.sleep(2 * attempt)
+    raise Unreachable(f"{url} did not answer ({reason})")
+
+
 def in_arch(pkg: str) -> str | None:
     """Repo name if Arch ships *pkg* officially, else None."""
-    body = _get(f"https://archlinux.org/packages/search/json/?name={pkg}")
+    body = _fetch(f"https://archlinux.org/packages/search/json/?name={pkg}")
     if not body:
         return None
     try:
@@ -236,7 +303,9 @@ def in_arch(pkg: str) -> str | None:
 
 
 def in_fedora(pkg: str) -> str | None:
-    body = _get(f"https://mdapi.fedoraproject.org/{_FEDORA_RELEASE}/pkg/{pkg}")
+    # mdapi answers "400 Bad Request" for a package it does not have.
+    body = _fetch(f"https://mdapi.fedoraproject.org/{_FEDORA_RELEASE}/pkg/{pkg}",
+                  absent=(400, 404))
     if not body:
         return None
     try:
@@ -255,7 +324,7 @@ def in_ubuntu(pkg: str) -> str | None:
     stay green over #221 -- a bug the reporter found by hand. One wrong archive
     is the whole failure.
     """
-    body = _get(
+    body = _fetch(
         "https://api.launchpad.net/1.0/ubuntu/+archive/primary"
         "?ws.op=getPublishedBinaries&exact_match=true&status=Published"
         f"&binary_name={pkg}"
@@ -280,7 +349,7 @@ def in_debian(pkg: str) -> str | None:
     checker was blind to precisely the component our NVIDIA advice lives in,
     so it blessed whatever was written there.  Match the prefix.
     """
-    body = _get(
+    body = _fetch(
         f"https://api.ftp-master.debian.org/madison?package={pkg}&f=json"
     )
     if not body:
@@ -1483,12 +1552,19 @@ def check() -> list[Finding]:
             print(f"  {dep:16} {'(unmapped)':22}")
             continue
         a_name, f_name, d_name = names
-        a, f = in_arch(a_name), in_fedora(f_name)
-        # The deb targets Ubuntu 24.04+ AND Debian 13+ — two archives with
-        # different package sets.  Available in EITHER means the deb can and
-        # must declare it.  Checking Debian alone read python3-pynvml as
-        # 'absent', skipped the assertion, and stayed green over #221.
-        d_ubuntu, d_debian = in_ubuntu(d_name), in_debian(d_name)
+        try:
+            a, f = in_arch(a_name), in_fedora(f_name)
+            # The deb targets Ubuntu 24.04+ AND Debian 13+ — two archives
+            # with different package sets.  Available in EITHER means the deb
+            # can and must declare it.  Checking Debian alone read
+            # python3-pynvml as 'absent', skipped the assertion, and stayed
+            # green over #221.
+            d_ubuntu, d_debian = in_ubuntu(d_name), in_debian(d_name)
+        except Unreachable as e:
+            findings.append(Finding(
+                "UNVERIFIED", dep, f"not checked this run — {e}; rerun"))
+            print(f"  {dep:16} {'(an index did not answer)':22}")
+            continue
         d = d_ubuntu or d_debian
         d_src = "ubuntu" if d_ubuntu and not d_debian else ("debian" if d_debian else "")
         d_cell = f"{d} [{d_src}]" if d and d_src else (d or "— absent")
@@ -1511,7 +1587,9 @@ def check() -> list[Finding]:
                 f"ARCH_UNAVAILABLE and add `depend = {a_name}`"))
 
         # 3. A hard dep Arch ships but we never declare.
-        if a and a_name not in declared and a_name not in ARCH_UNAVAILABLE:
+        optional = dep in DELIBERATELY_OPTIONAL      # on record, with why
+        if (a and a_name not in declared and a_name not in ARCH_UNAVAILABLE
+                and not optional):
             findings.append(Finding(
                 "GAP", dep,
                 f"Arch ships {a_name} in [{a}] but release.yml does not "
@@ -1530,13 +1608,14 @@ def check() -> list[Finding]:
         #    --no-install-recommends) and a reporter found it by hand (#221),
         #    the day after the identical Arch `optdepend` bug (#207). One distro
         #    checked is not the class checked.
-        if d and d_name not in deb_declared:
+        if d and d_name not in deb_declared and not optional:
             findings.append(Finding(
                 "GAP", dep,
                 f"Debian/Ubuntu ships {d_name} ({d}) but the deb does not "
                 f"`Depends:` it — apt may skip it and the feature goes silently "
                 f"missing"))
-        if f and f_name not in rpm_declared and dep not in _RPM_VENDORED_OK:
+        if (f and f_name not in rpm_declared and dep not in _RPM_VENDORED_OK
+                and not optional):
             findings.append(Finding(
                 "GAP", dep,
                 f"Fedora ships {f_name} ({f}) but the RPM does not `Requires:` "
@@ -1578,24 +1657,46 @@ def check_pip_resolved_targets() -> list[Finding]:
     return findings
 
 
-def report_matrix() -> None:
-    """Every hard dep x every target that can drift."""
-    deps = pyproject_runtime_deps(include_win32=True)
+def matrix_rows() -> list[tuple[str, str, str, str]]:
+    """Every mapped hard dep x every hand-declared target -- offline.
+
+    Each cell is ``yes`` (declared), ``vendor`` (bundled or unavailable, on
+    record), ``optional`` (not declared on purpose -- ``DELIBERATELY_OPTIONAL``
+    says why) or ``NO``.  A ``NO`` is a package that installs without a
+    dependency the app needs: ``python-multipart`` sat at NO for the rpm and
+    deb while nothing ran this, and ``trcc api`` could not start on a fresh
+    Fedora (2026-09-29).  ``tests/test_packaging_entrypoints.py`` fails on any.
+    """
     arch, deb, rpm = arch_declared_depends(), deb_declared_depends(), rpm_declared_requires()
-    print(f"{'dependency':18} {'arch':10} {'deb':10} {'rpm':10}  (hand-declared targets)")
-    print("-" * 62)
-    for dep in deps:
-        names = _PKG_NAMES.get(dep)
-        if names is None:
-            print(f"  {dep:16} {'(win32/unmapped — pip-resolved targets only)'}")
+
+    def cell(declared: bool, vendored: bool, dep: str) -> str:
+        if declared:
+            return "yes"
+        if vendored:
+            return "vendor"
+        return "optional" if dep in DELIBERATELY_OPTIONAL else "NO"
+
+    rows = []
+    for dep in pyproject_runtime_deps(include_win32=True):
+        if (names := _PKG_NAMES.get(dep)) is None:
             continue
         a, f, d = names
-        cells = (
-            "yes" if a in arch else ("vendor" if a in ARCH_UNAVAILABLE else "NO"),
-            "yes" if d in deb else "NO",
-            "yes" if f in rpm else ("vendor" if dep in FEDORA_VENDORED else "NO"),
-        )
-        print(f"  {dep:16} {cells[0]:10} {cells[1]:10} {cells[2]:10}")
+        rows.append((dep, cell(a in arch, a in ARCH_UNAVAILABLE, dep),
+                     cell(d in deb, dep in DEB_VENDORED, dep),
+                     cell(f in rpm, dep in FEDORA_VENDORED, dep)))
+    return rows
+
+
+def report_matrix() -> None:
+    """Every hard dep x every target that can drift."""
+    rows = {row[0]: row[1:] for row in matrix_rows()}
+    print(f"{'dependency':18} {'arch':10} {'deb':10} {'rpm':10}  (hand-declared targets)")
+    print("-" * 62)
+    for dep in pyproject_runtime_deps(include_win32=True):
+        if dep not in rows:
+            print(f"  {dep:16} {'(win32/unmapped — pip-resolved targets only)'}")
+            continue
+        print(f"  {dep:16} " + " ".join(f"{c:10}" for c in rows[dep]))
     print()
     print("pip-resolved targets (deps come from the wheel — cannot drift):")
     for name in pip_resolved_targets():
@@ -1611,14 +1712,21 @@ def main() -> int:
     findings = check() + check_pip_resolved_targets()
     print()
     print("Install hints — does the command we print deliver the binary?\n")
-    findings += check_install_hints()
+    try:
+        findings += check_install_hints()
+    except Unreachable as e:
+        findings.append(Finding("UNVERIFIED", "install hints",
+                                f"not checked this run — {e}; rerun"))
     print()
     if not findings:
         print("All packaging claims still hold.")
         return 0
     for f in findings:
         print(f"  [{f.severity}] {f.dep}: {f.message}")
-    print(f"\n{len(findings)} claim(s) need attention.")
+    unverified = sum(f.severity == "UNVERIFIED" for f in findings)
+    print(f"\n{len(findings)} claim(s) need attention"
+          + (f" — {unverified} only because an index did not answer: rerun "
+             "before reading them as findings" if unverified else "") + ".")
     return 1
 
 

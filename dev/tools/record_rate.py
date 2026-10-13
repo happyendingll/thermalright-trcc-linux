@@ -33,12 +33,21 @@ import argparse
 import collections
 import logging
 import re
+import os
 import sys
 import tempfile
 from pathlib import Path
 
+# In-process on purpose: this measures the App's work in THIS process, and the
+# production default would hand it a proxy to a daemon doing the work elsewhere.
+# In-process measurement, whatever the shell exports: through the shared App
+# this would time a different process.  ``main`` refuses while one runs.
+os.environ["TRCC_DAEMON"] = "0"
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # dev/
+from _refuse import refuse_while_trcc_runs
 
 from _gui_drive import drive_gui
 from trcc._boot import trcc
@@ -250,6 +259,8 @@ def main() -> int:
         raise SystemExit("--sensors measures the sensor tick, not a render "
                          "workload; run it on its own")
 
+    if not args.sensors:                  # the sensor tick needs no device
+        refuse_while_trcc_runs("record_rate")
     if args.sensors:
         units, by_site = measure_sensors(args.frames)
         unit, workload = "tick", "sensor tick"

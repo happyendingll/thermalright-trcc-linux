@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
@@ -47,6 +48,7 @@ class DeviceSender(SendTask):
 
     __slots__ = (
         "_device",
+        "_failing",
         "_has_pending",
         "_interval",
         "_last",
@@ -93,11 +95,17 @@ class DeviceSender(SendTask):
         self._has_pending = False
         self._last: Any = None
         self._last_sent_at = 0.0
+        # True from the first failed write until one succeeds: each failing
+        # run is reported once, then per-frame.
+        self._failing = False
         # Optional one-shot result channel for ``submit(wait=True)`` callers
         # (CLI/API one-shots that report success).  ``(Event, box)`` where the
         # worker fills ``box["ok"]`` or ``box["exc"]`` — so a wire exception
         # propagates back to the caller's existing ``except`` (no Command churn).
         self._waiter: tuple[threading.Event, dict[str, Any]] | None = None
+        # No scheduler thread (``SyncSendScheduler``): a waiting submit runs
+        # the write itself, on the caller's thread.
+        self._on_caller = False
         log.info(
             "DeviceSender %s: created (volatile=%s interval=%.3fs)",
             device.key, volatile, keepalive_interval,
@@ -115,6 +123,12 @@ class DeviceSender(SendTask):
         frame_log.debug("wait: timeout=%s", timeout)
         self._wake.wait(timeout)
         self._wake.clear()
+
+    def runs_on_caller(self) -> None:
+        """No worker drives this sender: ``submit(wait=True)`` writes inline."""
+        log.debug("DeviceSender %s: runs on the caller's thread",
+                  self._device.key)
+        self._on_caller = True
 
     def wake(self) -> None:
         """Interrupt a pending :meth:`wait` (scheduler teardown)."""
@@ -172,12 +186,14 @@ class DeviceSender(SendTask):
         The keepalive ``is_connected`` guard above stops the ~150 ms flood once
         the device's recovery threshold has closed it.
         """
-        if exc is not None:
-            log.warning("DeviceSender %s: %s write failed: %s",
-                        self._device.key, reason, exc)
+        outcome = f"failed: {exc}" if exc is not None else "returned False"
+        if self._failing:
+            frame_log.debug("DeviceSender %s: %s write %s (still failing)",
+                            self._device.key, reason, outcome)
         else:
-            log.warning("DeviceSender %s: %s write returned False",
-                        self._device.key, reason)
+            self._failing = True
+            log.warning("DeviceSender %s: %s write %s", self._device.key,
+                        reason, outcome)
         if self._on_failure is not None:
             self._on_failure(self._device.key, exc)
 
@@ -217,6 +233,8 @@ class DeviceSender(SendTask):
         self._wake.set()
         if done is None:
             return True
+        if self._on_caller:
+            self.run_once(time.monotonic())     # the worker is us
         if not done.wait(timeout):
             log.warning("DeviceSender %s: submit(wait) timed out after %.1fs",
                         self._device.key, timeout)
@@ -260,6 +278,13 @@ class DeviceSender(SendTask):
             with self._lock:
                 self._last = payload
                 self._last_sent_at = now
+            if self._failing:
+                log.info("DeviceSender %s: writing again (%s)",
+                         self._device.key, reason)
+                self._failing = False
+        elif self._failing:
+            frame_log.debug("DeviceSender %s: device.send returned False (%s)",
+                            self._device.key, reason)
         else:
             log.warning("DeviceSender %s: device.send returned False (%s)",
                         self._device.key, reason)

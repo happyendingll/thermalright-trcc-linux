@@ -16,6 +16,9 @@ disambiguated to (1280, 480) or (1920, 440) for PMs 68/69 via _FBL_192_BY_PM.
 """
 from __future__ import annotations
 
+import logging
+from typing import Any
+
 import pytest
 
 from trcc.adapters.device.ly_lcd import LyLcd
@@ -317,3 +320,148 @@ def test_pm65_is_catalogued_not_guessed(caplog) -> None:
     assert [r for r in caplog.records if "UNKNOWN PM" in r.getMessage()], (
         "an uncatalogued PM must still warn — otherwise the test above passes "
         "because nothing warns at all")
+
+
+# ── #251: every ACK is timed, so a report can show what a freeze answers ────
+#
+# The reporter's panel froze for 10+ minutes while every send "succeeded", and
+# nothing recorded what the ACK looked like while it did.  The C# re-handshakes
+# when an ACK misses 100 ms; ours waits 1000 ms and ignores it.  Only the
+# first ACK and each crossing of that line log at INFO/WARNING -- the lines a
+# default `trcc report` keeps -- per-frame detail stays at -vvv.
+
+
+def _ack_ly(monkeypatch, fake_bulk, *latencies_ms: float) -> Any:
+    """An LY device whose ACK reads take the scripted latencies."""
+    from trcc.adapters.device import ly_lcd
+
+    clock: list[float] = []
+    for ms in latencies_ms:
+        clock += [0.0, ms / 1000]
+    ticks = iter(clock)
+    monkeypatch.setattr(ly_lcd.time, "monotonic", lambda: next(ticks))
+    fake_bulk.read = lambda ep, n, timeout_ms=100: bytes(range(16)) * 32  # type: ignore[method-assign]
+    return _make_ly(fake_bulk)
+
+
+def test_the_first_ack_is_the_reports_baseline(monkeypatch, fake_bulk, caplog) -> None:
+    ly = _ack_ly(monkeypatch, fake_bulk, 3.0, 4.0)
+    with caplog.at_level(logging.INFO, logger="trcc.adapters.device.ly_lcd"):
+        ly._write_frame(b"x" * 512)
+        ly._write_frame(b"x" * 512)
+    lines = [r.getMessage() for r in caplog.records]
+    assert lines == ["LyLcd 0416:5408: first ACK 512 byte(s) in 3.0 ms "
+                     "[00 01 02 03 04 05 06 07]"]
+
+
+def test_a_slow_ack_warns_once_and_recovery_is_noted(monkeypatch, fake_bulk, caplog) -> None:
+    ly = _ack_ly(monkeypatch, fake_bulk, 3.0, 250.0, 300.0, 5.0)
+    with caplog.at_level(logging.INFO, logger="trcc.adapters.device.ly_lcd"):
+        for _ in range(4):
+            ly._write_frame(b"x" * 512)
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "ACK took 250.0 ms, past the C#'s 100 ms" in warnings[0].getMessage()
+    assert "ACKs back under 100 ms (5.0 ms)" in caplog.records[-1].getMessage()
+
+
+def test_an_ack_record_never_carries_the_whole_buffer(monkeypatch, fake_bulk, caplog) -> None:
+    ly = _ack_ly(monkeypatch, fake_bulk, 250.0)
+    with caplog.at_level(logging.INFO, logger="trcc.adapters.device.ly_lcd"):
+        ly._write_frame(b"x" * 512)
+    assert all(len(r.getMessage()) < 200 for r in caplog.records)
+
+
+def _ack_contents_ly(monkeypatch, fake_bulk, acks: list[bytes]) -> Any:
+    """An LY device answering *acks* in turn, every one in 3 ms."""
+    ly = _ack_ly(monkeypatch, fake_bulk, *([3.0] * len(acks)))
+    replies = iter(acks)
+    fake_bulk.read = lambda ep, n, timeout_ms=100: next(replies)  # type: ignore[method-assign]
+    return ly
+
+
+def _content_lines(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records
+            if "ACK content changed" in r.getMessage()]
+
+
+def test_an_ack_that_answers_differently_is_logged(monkeypatch, fake_bulk, caplog) -> None:
+    ly = _ack_contents_ly(monkeypatch, fake_bulk,
+                          [bytes(512), bytes(512), b"\x01" * 512, b"\x01" * 512])
+    with caplog.at_level(logging.INFO, logger="trcc.adapters.device.ly_lcd"):
+        for _ in range(4):
+            ly._write_frame(b"x" * 512)
+    assert _content_lines(caplog) == [
+        "LyLcd 0416:5408: ACK content changed to [01 01 01 01 01 01 01 01] "
+        "(512 byte(s); distinct contents 2 of 4 logged) (#251)"]
+
+
+def test_an_ack_counter_cannot_make_the_line_per_frame(monkeypatch, fake_bulk, caplog) -> None:
+    """The C# never reads the ACK's bytes, so they may count frames."""
+    ly = _ack_contents_ly(monkeypatch, fake_bulk,
+                          [bytes([i]) * 512 for i in range(50)])
+    with caplog.at_level(logging.INFO, logger="trcc.adapters.device.ly_lcd"):
+        for _ in range(50):
+            ly._write_frame(b"x" * 512)
+    lines = _content_lines(caplog)
+    assert len(lines) == 3
+    assert lines[-1].endswith("distinct contents 4 of 4 logged; further "
+                              "changes only at -vvv) (#251)")
+
+
+# ── #248: the reply's bytes 24-31 are not the canvas ─────────────────
+#
+# Real replies, as their reporters pasted them.  The C# takes the canvas from
+# PM/SUB alone; bytes 24-31 and 44 are only logged.
+
+_REAL_REPLIES = {
+    # issue: (reply hex, PM, SUB, canvas)
+    "#129": ("03ff0000000000000100000000000000c5c493e00100020080070000e001000032"
+             "000000000000000000000012000000", 65, 3, (1920, 462)),
+    "#207": ("03ff0000000000000100000000000000436066970200040080070000570200003200"
+             "000000000000020000008900000000000000000000000000000000000000",
+             65, 5, (1920, 462)),
+    "#289": ("03ff00000000000001000000000000002b8a76420500010080070000e00100004100"
+             "000000000000000000002800000000000000000000000000000000000000000000"
+             "000000", 69, 2, (1920, 440)),
+}
+
+
+@pytest.mark.parametrize("issue", sorted(_REAL_REPLIES))
+def test_a_real_reply_takes_its_canvas_from_pm_and_sub(
+    fake_bulk: FakeBulkTransport, caplog: pytest.LogCaptureFixture, issue: str,
+) -> None:
+    """#207 is #248's own fingerprint (PM 65 SUB 5): its bytes 24-31 say
+    1920x599, so trusting them would not even give #248's 480.  On all three,
+    u32@28 minus byte 44 is the C#'s height -- logged, never obeyed."""
+    reply, pm, sub, canvas = _REAL_REPLIES[issue]
+    fake_bulk.read_script.append(bytes.fromhex(reply).ljust(512, b"\0"))
+    device = _make_ly(fake_bulk)
+
+    with caplog.at_level(logging.INFO, logger="trcc.adapters.device.ly_lcd"):
+        result = device.connect()
+
+    assert (result.pm_byte, result.sub_byte, result.resolution) == (pm, sub, canvas)
+    lines = [r for r in caplog.records if "byte 44" in r.getMessage()]
+    assert [r.levelno for r in lines] == [logging.INFO]
+    assert f"-> {canvas[0]}x{canvas[1]};" in lines[0].getMessage()
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_a_reply_off_the_pattern_asks_for_a_report(
+    fake_bulk: FakeBulkTransport, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#129's reply with byte 44 changed: the canvas stays the C#'s, and the
+    log says what to send."""
+    reply = bytearray(bytes.fromhex(_REAL_REPLIES["#129"][0]).ljust(512, b"\0"))
+    reply[44] = 0
+    fake_bulk.read_script.append(bytes(reply))
+    device = _make_ly(fake_bulk)
+
+    with caplog.at_level(logging.INFO, logger="trcc.adapters.device.ly_lcd"):
+        result = device.connect()
+
+    assert result.resolution == (1920, 462)
+    (warning,) = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert "1920x480 does not match the (1920, 462) canvas" in warning.getMessage()
+    assert "trcc report" in warning.getMessage()

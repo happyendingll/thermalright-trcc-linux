@@ -5,6 +5,8 @@ import ast
 import logging
 import os
 import re
+import socket
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -19,6 +21,7 @@ from trcc.adapters.diagnostics.doctor import (
     run_doctor,
 )
 from trcc.adapters.diagnostics.health import (
+    MIN_PYTHON,
     HealthCheckResult,
     check_gpu_sensors,
     check_log_writable,
@@ -555,6 +558,10 @@ def test_a_live_peer_keeps_its_run_so_we_append_to_latest(
          "sys.stdin.read()\n",
          str(tmp_path / "trcc.latest.log.run")],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        # The child imports trcc: give it THIS process's import path, which
+        # pytest extended with src/ -- it failed wherever the package was not
+        # also installed (a checkout run without PYTHONPATH).
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
     ) as peer:
         try:
             assert peer.stdout is not None
@@ -793,6 +800,7 @@ def test_the_windows_run_claim_uses_the_non_blocking_mode(
         os.close(fd)
 
 
+@pytest.mark.expects_logging_error
 def test_a_lock_that_cannot_be_taken_never_raises_into_the_caller(
     tmp_path: Path,
 ) -> None:
@@ -956,6 +964,31 @@ def test_logging_survives_a_platform_that_cannot_be_asked(
     )
 
 
+def test_the_cli_logs_where_its_platform_lives(tmp_path: Path) -> None:
+    """The CLI root callback re-configures logging (``force``) -- at the HOST
+    platform's path, whatever platform the CLI builds its App on.  So
+    ``dev/mock_cli.py`` wrote the user's real ``~/.trcc`` log on every run,
+    even ``--help``: mock lines appended to a running session's ``latest``, or
+    ``latest`` truncated when no TRCC ran -- the file ``trcc report`` sends.
+    """
+    from typer.testing import CliRunner
+
+    from trcc.ui.cli import _ctx
+    from trcc.ui.cli.main import app as cli
+
+    from .conftest import FakePlatform
+
+    platform = FakePlatform(tmp_path / "mock")
+    _ctx.set_platform(platform)
+
+    result = CliRunner().invoke(cli, ["theme", "list", "--help"])
+
+    assert result.exit_code == 0, result.output
+    logs = {Path(h.baseFilename) for h in logging.getLogger().handlers
+            if isinstance(h, logging.FileHandler)}
+    assert platform.paths().log_file() in logs, logs
+
+
 # =========================================================================
 # Action history — selecting by significance, not recency
 # =========================================================================
@@ -1061,10 +1094,34 @@ def test_tail_log_actions_is_bounded_and_keeps_the_most_recent(
 # =========================================================================
 
 
-def test_python_version_check_passes_on_311_plus(fake_platform) -> None:
+@pytest.mark.parametrize(("version", "severity"), [
+    (MIN_PYTHON, "OK"),
+    ((MIN_PYTHON[0], MIN_PYTHON[1] + 2), "OK"),
+    ((MIN_PYTHON[0], MIN_PYTHON[1] - 1), "FAIL"),
+])
+def test_python_version_check_uses_the_one_minimum(
+    fake_platform, monkeypatch, version, severity,
+) -> None:
+    """It said FAIL on 3.10, the Python the package promises (#3.10 users)."""
+    from trcc.adapters.diagnostics import health
+
+    monkeypatch.setattr(health.sys, "version_info", (*version, 0, "final", 0))
     result = check_python_version(fake_platform)
-    assert result.severity == "OK"
-    assert "Python" in result.message
+    assert result.severity == severity, result.message
+
+
+def test_min_python_is_what_the_package_declares() -> None:
+    """One minimum: the doctor's constant and pyproject's requires-python.
+
+    A regex, not tomllib -- this must run on the oldest Python it describes.
+    """
+    import re
+
+    pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(
+        encoding="utf-8")
+    declared = re.search(r'^requires-python\s*=\s*"([^"]+)"', pyproject, re.M)
+    assert declared is not None
+    assert declared.group(1) == f">={MIN_PYTHON[0]}.{MIN_PYTHON[1]}"
 
 
 def test_each_os_platform_answers_its_own_install_hint() -> None:
@@ -1370,12 +1427,12 @@ def test_debug_report_carries_the_settings_the_app_actually_saved(
     platform = MockPlatform([], tmp_path)
     settings = Settings(platform.paths())
     settings.set_language("de")
-    settings.set_global_time_format("24h")
+    settings.set_global_temp_unit("F")
 
     section = _report_settings_section(platform)
 
     assert '"language": "de"' in section
-    assert '"time_format": "24h"' in section
+    assert '"temp_unit": "F"' in section
 
 
 def test_debug_report_reads_the_pre_cutover_config_when_it_is_the_live_one(
@@ -1535,7 +1592,8 @@ def test_debug_report_captures_live_handshake(tmp_path: Path) -> None:
     the connect-time log line scrolls out of the tail (the #176/#186 blocker)."""
     from tests.mock_platform import MockPlatform
 
-    # GrandVision 360 (bulk, registry fbl 72) with a pinned PM=50 handshake.
+    # 87ad:70db (registry: GrandVision 360, fbl 72) answering PM=50 -- a
+    # 320x240 panel, not the catalog's 480x480 (#186).
     platform = MockPlatform([{"vid": "87ad", "pid": "70db", "pm": 50}], tmp_path)
     report = build_debug_report(platform)
 
@@ -1760,11 +1818,37 @@ def test_trace_helper_emits_only_when_enabled(tmp_path: Path) -> None:
 _PER_FRAME_RATE = 0.5
 
 
-def _records_by_site(log_file: Path, start: int) -> dict[str, int]:
-    """Count records appended after byte offset *start*, keyed by call site."""
+class _Mark(NamedTuple):
+    """Where a measurement starts: an offset IN ONE FILE."""
+
+    offset: int
+    inode: int          # -1: the file did not exist yet
+
+
+def _mark(log_file: Path) -> _Mark:
+    """Mark the end of *log_file* -- and which file it is."""
+    if not log_file.exists():
+        return _Mark(0, -1)
+    st = log_file.stat()
+    return _Mark(st.st_size, st.st_ino)
+
+
+def _records_by_site(log_file: Path, start: _Mark) -> dict[str, int]:
+    """Count records appended after *start*, keyed by call site.
+
+    Refuses a file that rotated since the mark.  A flood big enough to turn
+    the 1 MB file over inside the window used to leave the count seeking into
+    the NEW file and reporting nothing -- measured: a mutation printing a PNG
+    per field passed every gate.  Rotation inside a measurement IS a flood.
+    """
+    assert start.inode in (-1, log_file.stat().st_ino), (
+        "the log rotated while it was being measured — something wrote more "
+        "than a whole file inside the window, which is a flood the per-site "
+        "count can no longer see"
+    )
     counts: dict[str, int] = {}
     with log_file.open("r", encoding="utf-8", errors="replace") as fh:
-        fh.seek(start)
+        fh.seek(start.offset)
         for line in fh:
             m = re.match(r"^\S+ \w+\s+(\S+?):(\S+?):(\d+):", line)
             if m is not None:
@@ -1860,7 +1944,7 @@ def _frame_path_rates(tmp_path: Path, *, starve_cache: bool,
     for handler in logging.getLogger().handlers:
         handler.flush()
 
-    mark = log_file.stat().st_size
+    mark = _mark(log_file)
     for _ in range(frames):
         render_once()
     for handler in logging.getLogger().handlers:
@@ -1928,6 +2012,52 @@ class _TickRun(NamedTuple):
     writes: int
 
 
+_TICK_KEY = "0402:3922"
+_TICK_FPS = 15
+
+
+def _ticking_app(tmp_path: Path) -> tuple[Any, Path]:
+    """A real App over a fake 320x320 SCSI panel, playing a 3-frame video,
+    logging at DEFAULT verbosity into ``tmp_path/trcc.log`` -- what a user runs.
+
+    Shared by the tick-path and remote-preview gates so both measure the same
+    App; returns it with the log file.
+    """
+    from trcc.adapters.render.qt import QtRenderer
+    from trcc.app import App
+    from trcc.core.commands import ConnectDevice
+    from trcc.core.models import Theme
+    from trcc.services.media import Playback
+
+    from .conftest import FakePlatform
+    from .test_video_playback import _encoded_frame
+
+    ladder = levels_for(0)                       # what a user runs: no -v
+    log_file = tmp_path / "trcc.log"
+    configure_logging(log_file, level=ladder.file,
+                      stderr_level=logging.CRITICAL,
+                      per_frame=ladder.per_frame)
+
+    app = App(platform=FakePlatform(tmp_path))
+    # Scripted SCSI handshake: FBL=100 -> a 320x320 panel.
+    resp = bytearray(0xE100)
+    resp[0] = 100
+    app.platform.scsi.read_script.append(bytes(resp))   # type: ignore[attr-defined]
+    connected = app.dispatch(ConnectDevice(key=_TICK_KEY))
+    assert connected.ok, connected.message
+    app.set_renderer(QtRenderer())
+
+    app.active_themes[_TICK_KEY] = Theme(
+        path=tmp_path / "theme", name="t",
+        resolution=(320, 320), config={"elements": []},
+    )
+    app.media._playbacks[_TICK_KEY] = Playback(   # pyright: ignore[reportPrivateUsage]
+        frames=[_encoded_frame(v) for v in (0xFF000000, 0xFF404040, 0xFF808080)],
+        fps=_TICK_FPS,
+    )
+    return app, log_file
+
+
 def _tick_path_rates(tmp_path: Path, *, frames: int = 30) -> _TickRun:
     """Records-per-frame for a WHOLE animation tick: advance, render, encode, SEND.
 
@@ -1942,7 +2072,7 @@ def _tick_path_rates(tmp_path: Path, *, frames: int = 30) -> _TickRun:
     an incident held nothing but the tail of the send loop.
 
     This drives the body the GUI's ``_on_video_tick`` runs -- one
-    ``TickDisplay``, one ``progress_fraction`` -- on a real ``App`` over a fake
+    ``TickDisplay``, one ``playback_clock`` -- on a real ``App`` over a fake
     transport, so every layer beneath the Command is the shipping one.
 
     **Sends are forced synchronous, and that is load-bearing.**
@@ -1953,41 +2083,12 @@ def _tick_path_rates(tmp_path: Path, *, frames: int = 30) -> _TickRun:
     would then understate it ~50x and report a live flood as clean.  One write
     per tick is what makes records-per-frame mean anything here.
     """
-    from trcc.adapters.render.qt import QtRenderer
-    from trcc.app import App
-    from trcc.core.commands import ConnectDevice, TickDisplay
-    from trcc.core.models import Theme
-    from trcc.services.media import Playback
-    from trcc.ui.presentation.lcd_presentation_model import LcdPresentationModel
+    from trcc.core.commands import TickDisplay
+    from trcc.ui.presentation.video_clock import playback_clock
 
-    from .conftest import FakePlatform
-    from .test_video_playback import _encoded_frame
-
-    key = "0402:3922"
-    ladder = levels_for(0)                       # what a user runs: no -v
-    log_file = tmp_path / "trcc.log"
-    configure_logging(log_file, level=ladder.file,
-                      stderr_level=logging.CRITICAL,
-                      per_frame=ladder.per_frame)
-
-    app = App(platform=FakePlatform(tmp_path))
+    app, log_file = _ticking_app(tmp_path)
+    key = _TICK_KEY
     scsi = app.platform.scsi        # pyright: ignore[reportAttributeAccessIssue]
-    # Scripted SCSI handshake: FBL=100 -> a 320x320 panel.
-    resp = bytearray(0xE100)
-    resp[0] = 100
-    app.platform.scsi.read_script.append(bytes(resp))   # type: ignore[attr-defined]
-    connected = app.dispatch(ConnectDevice(key=key))
-    assert connected.ok, connected.message
-    app.set_renderer(QtRenderer())
-
-    app.active_themes[key] = Theme(
-        path=tmp_path / "theme", name="t",
-        resolution=(320, 320), config={"elements": []},
-    )
-    app.media._playbacks[key] = Playback(   # pyright: ignore[reportPrivateUsage]
-        frames=[_encoded_frame(v) for v in (0xFF000000, 0xFF404040, 0xFF808080)],
-        fps=15,
-    )
 
     # Force every submit to block until THIS frame is written -- see the
     # docstring: without it the denominator counts frames that never reached
@@ -2002,15 +2103,14 @@ def _tick_path_rates(tmp_path: Path, *, frames: int = 30) -> _TickRun:
     def tick_once() -> None:
         """Exactly what ``LCDHandler._on_video_tick`` does for an active UI."""
         result = app.dispatch(TickDisplay(key=key))
-        LcdPresentationModel.progress_fraction(result.cursor or 0,
-                                               result.frame_count or 0)
+        playback_clock(result.cursor or 0, result.frame_count or 0, _TICK_FPS)
 
     for _ in range(5):            # warm-up: first-frame lines are one-shot
         tick_once()
     for handler in logging.getLogger().handlers:
         handler.flush()
 
-    mark = log_file.stat().st_size
+    mark = _mark(log_file)
     writes = len(scsi.sent)
     for _ in range(frames):
         tick_once()
@@ -2077,6 +2177,631 @@ def test_the_tick_path_gate_actually_reaches_the_wire(tmp_path: Path) -> None:
     )
 
 
+#: The one record a sensor update may write: the snapshot, which carries the
+#: readings.  Everything a consumer does with them is per-update.
+_SENSOR_TICK_ALLOWED = "trcc.core.ports:BaselineSensors.snapshot:"
+
+
+def _sensor_tick_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *,
+                     video: bool, ticks: int = 20) -> tuple[_TickRun, str]:
+    """Records per SENSOR UPDATE on a panel drawing a user overlay layout.
+
+    Every update re-renders every LCD: the overlay resolves, draws, the
+    observer dispatches -- measured 2026-10-06 at 8-10 records per update per
+    panel, 69 lines a tick on the mock fleet.  The CPU temperature climbs one
+    degree a read so each update genuinely changes the overlay, and the cache
+    cannot answer for it.  ``video`` adds three frames between updates, the
+    case where the overlay cache flips MISS -> HIT on every update.
+
+    Returns the run and the whole log text, for the once-only checks.
+    """
+    from trcc.adapters.render.qt import QtRenderer
+    from trcc.app import App
+    from trcc.core.commands import ConnectDevice, TickDisplay
+    from trcc.core.models import OverlayElement, Theme
+    from trcc.services.media import Playback
+
+    from . import conftest
+    from .test_video_playback import _encoded_frame
+
+    temp = [40.0]
+
+    def climbing_temp(self: Any) -> float:
+        temp[0] += 1.0
+        return temp[0]
+
+    monkeypatch.setattr(conftest.FakeCpu, "temp", climbing_temp)
+
+    ladder = levels_for(0)                       # what a user runs: no -v
+    log_file = tmp_path / "trcc.log"
+    configure_logging(log_file, level=ladder.file,
+                      stderr_level=logging.CRITICAL,
+                      per_frame=ladder.per_frame)
+
+    platform = conftest.FakePlatform(tmp_path)
+    app = App(platform=platform)
+    resp = bytearray(0xE100)
+    resp[0] = 100                                 # FBL 100 -> 320x320
+    platform.scsi.read_script.append(bytes(resp))
+    assert app.dispatch(ConnectDevice(key=_TICK_KEY)).ok
+    app.set_renderer(QtRenderer())
+    app.active_themes[_TICK_KEY] = Theme(
+        path=tmp_path / "theme", name="t",
+        resolution=(320, 320), config={"elements": []},
+    )
+    # A USER layout, so the per-tick resolve runs OverlayElement.to_dict.
+    app.settings.set_user_overlay_elements(_TICK_KEY, [
+        OverlayElement(id="t", type="metric", metric="cpu:temp", x=10, y=10),
+        OverlayElement(id="u", type="metric", metric="cpu:usage", x=10, y=60),
+        OverlayElement(id="c", type="clock", x=10, y=110),
+    ])
+    if video:
+        app.media._playbacks[_TICK_KEY] = Playback(  # pyright: ignore[reportPrivateUsage]
+            frames=[_encoded_frame(v)
+                    for v in (0xFF000000, 0xFF404040, 0xFF808080)],
+            fps=_TICK_FPS,
+        )
+    real_send = app.send
+
+    def sync_send(key: str, payload: Any, *, wait: bool = False) -> bool:
+        return real_send(key, payload, wait=True)
+
+    app.send = sync_send        # type: ignore[method-assign]
+    sensors: Any = platform.sensors()
+
+    def sensor_update() -> None:
+        """One ``MetricsLoop._loop`` cycle: push the cadence, the poll-thread
+        sweep it waits for, then the broadcast."""
+        sensors.set_interval(float(app.settings.app.refresh_interval_s))
+        sensors._poll_once()
+        app.metrics_loop._publish_once(app.events)  # pyright: ignore[reportPrivateUsage]
+        for _ in range(3 if video else 0):
+            app.dispatch(TickDisplay(key=_TICK_KEY))
+
+    for _ in range(3):            # warm-up: first-render lines are one-shot
+        sensor_update()
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+
+    mark = _mark(log_file)
+    writes = len(platform.scsi.sent)
+    for _ in range(ticks):
+        sensor_update()
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+
+    run = _TickRun(
+        rates={site: n / ticks
+               for site, n in _records_by_site(log_file, mark).items()},
+        writes=len(platform.scsi.sent) - writes,
+    )
+    return run, log_file.read_text(encoding="utf-8", errors="replace")
+
+
+@pytest.mark.parametrize("video", [False, True], ids=["static", "video"])
+def test_a_sensor_update_writes_only_the_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, video: bool,
+) -> None:
+    """Per sensor update, the file gets the readings -- and nothing else."""
+    ticks = 20
+    run, text = _sensor_tick_run(tmp_path, monkeypatch, video=video,
+                                 ticks=ticks)
+    if not video:
+        # 320x320 RGB565 is 4 CDBs; each update must re-render and send ONE
+        # frame, or "nothing logged" is measured against renders that never ran.
+        assert run.writes == ticks * 4, (
+            f"{ticks} sensor updates sent {run.writes} CDB(s), expected "
+            f"{ticks * 4}: the update is not re-rendering the panel")
+    floods = {s: r for s, r in run.rates.items()
+              if r >= _PER_FRAME_RATE and not s.startswith(_SENSOR_TICK_ALLOWED)}
+    assert not floods, (
+        "these call sites write a record per SENSOR UPDATE at DEFAULT "
+        "verbosity — move each onto core.logs.per_frame(__name__):\n"
+        + "\n".join(f"  {rate:.2f}/update  {site}"
+                    for site, rate in sorted(floods.items(),
+                                             key=lambda kv: -kv[1]))
+    )
+    # The diagnosis lines still reach the file -- once, because nothing
+    # about the layout or the background changed after the first render.
+    for needle in (f"build_overlay {_TICK_KEY}: theme='t' layout=user",
+                   f"build_frame {_TICK_KEY}: background cache (first)"):
+        assert text.count(needle) == 1, (
+            f"{needle!r} appears {text.count(needle)} time(s), expected once: "
+            "the layout and background lines must log on CHANGE")
+
+
+def _records_per_parse(tmp_path: Path, name: str, data: bytes | None = None,
+                       config: dict[str, Any] | None = None) -> dict[str, int]:
+    """Records one layout-file parse writes at DEFAULT verbosity, by site."""
+    from trcc.services import _dc as Dc
+
+    ladder = levels_for(0)
+    log_file = tmp_path / "trcc.log"
+    configure_logging(log_file, level=ladder.file,
+                      stderr_level=logging.CRITICAL,
+                      per_frame=ladder.per_frame)
+    path = tmp_path / f"{name}.dc"
+    if config is not None:
+        Dc.File(path).write(config)
+    else:
+        assert data is not None
+        path.write_bytes(data)
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+    mark = _mark(log_file)
+    Dc.File(path).read()
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+    return _records_by_site(log_file, mark)
+
+
+#: Records one layout parse may write.  Measured 6-7 (entry, read, summary
+#: and a few one-shot branch lines); a per-field line adds ~90.
+_PARSE_RECORD_CAP = 10
+
+
+def _dd_layout(elements: int) -> dict[str, Any]:
+    return {"elements": [
+        {"type": "metric", "metric": "cpu:temp", "x": i, "y": i,
+         "color": "#ffffff", "size": 18.0}
+        for i in range(elements)]}
+
+
+@pytest.mark.parametrize("fmt", ["0xdd", "0xdc"])
+def test_a_layout_parse_writes_the_same_records_at_any_size(
+    tmp_path: Path, fmt: str,
+) -> None:
+    """Parsing a layout file costs a fixed handful of records, not one per byte.
+
+    Every theme in every library is parsed when the grids fill.  The reader
+    logged each byte, int, float, string and bool it read -- measured
+    2026-10-06 at ~94 records per file and ~40,000 lines in the first 8 s of
+    a 10-device mock -- so the startup lines a report is read for (handshake,
+    resolution, which library) were pushed out of the file before the window
+    was up.  The one summary line per file already names what was parsed.
+    """
+    from .test_dc_reader import _build_dc
+
+    if fmt == "0xdd":
+        small = _records_per_parse(tmp_path / "s", "small", config=_dd_layout(1))
+        large = _records_per_parse(tmp_path / "l", "large", config=_dd_layout(30))
+    else:
+        small = _records_per_parse(tmp_path / "s", "small",
+                                   data=_build_dc(flags=[True] + [False] * 7))
+        large = _records_per_parse(tmp_path / "l", "large",
+                                   data=_build_dc(flags=[True] * 8))
+    # An absolute cap as well as the comparison: 0xDC is FIXED-size -- all 13
+    # font records are written whether enabled or not -- so a per-field line
+    # costs the small and the large file the same and the comparison alone
+    # passed with one in place (a mutation caught it).  Measured 6-7 per parse.
+    assert sum(large.values()) <= _PARSE_RECORD_CAP, (
+        f"{fmt}: one parse wrote {sum(large.values())} record(s), cap "
+        f"{_PARSE_RECORD_CAP} — something logs per field at DEFAULT verbosity:\n"
+        + "\n".join(f"  {n}  {s}" for s, n in sorted(large.items(),
+                                                     key=lambda kv: -kv[1]))
+    )
+    assert large == small, (
+        f"{fmt}: the larger file wrote {sum(large.values())} record(s) against "
+        f"{sum(small.values())} — something logs per field or per element at "
+        "DEFAULT verbosity; move it onto core.logs.per_frame(__name__):\n"
+        + "\n".join(f"  {large.get(s, 0)} vs {small.get(s, 0)}  {s}"
+                    for s in sorted(set(large) | set(small))
+                    if large.get(s, 0) != small.get(s, 0))
+    )
+    text = (tmp_path / "l" / "trcc.log").read_text(encoding="utf-8")
+    assert re.search(r"Reader\.parse: \S+ → \d+ elements", text), (
+        "the per-file summary line (element count, source, overlay, …) no "
+        "longer reaches the file — it is what a parse is diagnosed from")
+
+
+#: One panel per LCD wire variant, from ``dev/devices.json``.  Each wire has
+#: its own send chain -- framing, chunking, the JPEG encode on bulk/LY -- and
+#: ``_ticking_app`` drives SCSI alone, which is how all of these flooded while
+#: the gate above stayed green (measured 2026-10-06: 75% of a mock fleet's
+#: steady-state log).
+_WIRE_SPECS: dict[str, dict[str, Any]] = {
+    "scsi": {"type": "lcd", "vid": "0402", "pid": "3922", "fbl": 100},
+    "hid-type2": {"type": "lcd", "vid": "0416", "pid": "5302", "pm": 5},
+    "hid-ali": {"type": "lcd", "vid": "0416", "pid": "5406", "pm": 32},
+    "hid-type3": {"type": "lcd", "vid": "0418", "pid": "5304", "fbl": 100},
+    "ly": {"type": "lcd", "vid": "0416", "pid": "5408", "pm": 65},
+    "ly1": {"type": "lcd", "vid": "0416", "pid": "5409", "pm": 65},
+    "bulk": {"type": "lcd", "vid": "87ad", "pid": "70db", "pm": 72},
+}
+
+
+def _wire_tick_rates(tmp_path: Path, spec: dict[str, Any], *,
+                     frames: int = 20) -> _TickRun:
+    """``_tick_path_rates`` on any wire: a playing video, one TickDisplay per
+    frame, sends forced synchronous, at DEFAULT verbosity."""
+    from trcc.adapters.render.qt import QtRenderer
+    from trcc.app import App
+    from trcc.core.commands import ConnectDevice, TickDisplay
+    from trcc.core.models import Theme
+    from trcc.services.media import Playback
+
+    from .mock_platform import MockPlatform
+    from .test_video_playback import _encoded_frame
+
+    ladder = levels_for(0)                       # what a user runs: no -v
+    log_file = tmp_path / "trcc.log"
+    configure_logging(log_file, level=ladder.file,
+                      stderr_level=logging.CRITICAL,
+                      per_frame=ladder.per_frame)
+
+    app = App(platform=MockPlatform([spec], tmp_path, host_sensors=False))
+    key = f"{spec['vid']}:{spec['pid']}"
+    connected = app.dispatch(ConnectDevice(key=key))
+    assert connected.ok and connected.handshake is not None, connected.message
+    app.set_renderer(QtRenderer())
+    app.active_themes[key] = Theme(
+        path=tmp_path / "theme", name="t",
+        resolution=connected.handshake.resolution, config={"elements": []},
+    )
+    app.media._playbacks[key] = Playback(   # pyright: ignore[reportPrivateUsage]
+        frames=[_encoded_frame(v) for v in (0xFF000000, 0xFF404040, 0xFF808080)],
+        fps=_TICK_FPS,
+    )
+    real_send = app.send
+
+    def sync_send(key: str, payload: Any, *, wait: bool = False) -> bool:
+        return real_send(key, payload, wait=True)
+
+    app.send = sync_send        # type: ignore[method-assign]
+    transport: Any = app.devices[key]._transport  # pyright: ignore[reportPrivateUsage]
+
+    def wire_writes() -> int:
+        return len(getattr(transport, "sent", None) or transport.writes)
+
+    for _ in range(5):            # warm-up: first-frame lines are one-shot
+        app.dispatch(TickDisplay(key=key))
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+
+    mark = _mark(log_file)
+    writes = wire_writes()
+    for _ in range(frames):
+        app.dispatch(TickDisplay(key=key))
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+
+    return _TickRun(
+        rates={site: n / frames
+               for site, n in _records_by_site(log_file, mark).items()},
+        writes=wire_writes() - writes,
+    )
+
+
+@pytest.mark.parametrize("wire", list(_WIRE_SPECS))
+def test_every_wire_sends_a_frame_without_a_record(
+    tmp_path: Path, wire: str,
+) -> None:
+    """The tick-path gate, on every LCD wire: nothing may scale with frames."""
+    frames = 20
+    run = _wire_tick_rates(tmp_path, _WIRE_SPECS[wire], frames=frames)
+    # The witness is the wire, not the log -- see _TickRun.
+    assert run.writes >= frames and run.writes % frames == 0, (
+        f"{wire}: {frames} frames made {run.writes} transport write(s) — not "
+        "a whole number per frame, so the verdict below is measured against "
+        "frames the wire never saw")
+    floods = {s: r for s, r in run.rates.items() if r >= _PER_FRAME_RATE}
+    assert not floods, (
+        f"{wire}: these call sites write a record per sent frame at DEFAULT "
+        "verbosity — move each onto core.logs.per_frame(__name__):\n"
+        + "\n".join(f"  {rate:.2f}/frame  {site}"
+                    for site, rate in sorted(floods.items(),
+                                             key=lambda kv: -kv[1]))
+    )
+
+
+#: Every state that puts an LED on the 150 ms animation tick
+#: (``led_animation_loop._ANIMATED_MODES``, the zone-sync carousel, test mode).
+#: Each reaches its own effect and encode functions.
+_LED_ANIMATING_STATES = ("breathing", "colorful", "rainbow", "zone_sync",
+                         "test_mode")
+
+
+def _first_pm_per_led_style() -> list[int]:
+    from trcc.core.led_protocol import _PM_REGISTRY
+
+    first: dict[Any, int] = {}
+    for pm, entry in sorted(_PM_REGISTRY.items()):
+        first.setdefault(entry.style, pm)
+    return list(first.values())
+
+
+def _led_tick_rates(tmp_path: Path, pm: int, state: str, *,
+                    ticks: int = 20) -> _TickRun:
+    """Records per ``LedAnimationLoop`` tick, at DEFAULT verbosity.
+
+    The tick runs every 150 ms for every attached device, so a line on it is
+    ~6.7 records a second.  Measured 2026-10-06 before the fix: 18-67 records
+    per tick on every style in every animating state -- up to ~450 a second,
+    turning the 1 MB log over in minutes for any LED owner.
+
+    A SCSI LCD rides along because the tick reads ``is_led`` on EVERY device,
+    LCDs included -- that one line was 37.6% of a real LCD-only log.
+
+    The sensor broadcast is seeded first, as the running ``MetricsLoop`` does in
+    production; without it ``RenderLed`` re-reads the sensors on every tick, a
+    fallback that never runs once the loop has published.
+    """
+    from trcc.app import App
+    from trcc.core.commands import (
+        ConnectDevice,
+        EnableLedTestMode,
+        SetLedMode,
+        SetLedZoneSync,
+    )
+    from trcc.core.led_models import LEDMode
+
+    from .conftest import FakePlatform, _CliRenderer
+    from .test_render_led import _LED_KEY, _attach_and_connect
+
+    ladder = levels_for(0)                       # what a user runs: no -v
+    log_file = tmp_path / "trcc.log"
+    configure_logging(log_file, level=ladder.file,
+                      stderr_level=logging.CRITICAL,
+                      per_frame=ladder.per_frame)
+
+    platform = FakePlatform(tmp_path)
+    app = App(platform, renderer=_CliRenderer())  # type: ignore[arg-type]
+    resp = bytearray(0xE100)
+    resp[0] = 100                                 # FBL 100 -> 320x320
+    platform.scsi.read_script.append(bytes(resp))
+    assert app.dispatch(ConnectDevice(key=_TICK_KEY)).ok
+    _attach_and_connect(app, platform, pm=pm)
+
+    match state:
+        case "zone_sync":
+            command: Any = SetLedZoneSync(key=_LED_KEY, enabled=True)
+        case "test_mode":
+            command = EnableLedTestMode(key=_LED_KEY, enabled=True)
+        case _:
+            command = SetLedMode(key=_LED_KEY, mode=LEDMode[state.upper()])
+    app.dispatch(command)
+    app.metrics_loop._publish_once(app.events)  # pyright: ignore[reportPrivateUsage]
+    assert app.led_animation_loop.animating_keys() == [_LED_KEY], (
+        f"pm={pm} {state}: the LED is not on the animation tick, so this run "
+        "would measure nothing")
+
+    # One wire write set per tick, as _tick_path_rates does for the LCD:
+    # asynchronous sends supersede each other and would undercount.
+    real_send = app.send
+
+    def sync_send(key: str, payload: Any, *, wait: bool = False) -> bool:
+        return real_send(key, payload, wait=True)
+
+    app.send = sync_send        # type: ignore[method-assign]
+
+    for _ in range(5):          # warm-up: first-tick lines are one-shot
+        app.led_animation_loop.tick()
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+
+    mark = _mark(log_file)
+    writes = len(platform.bulk.writes)
+    for _ in range(ticks):
+        app.led_animation_loop.tick()
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+
+    return _TickRun(
+        rates={site: n / ticks
+               for site, n in _records_by_site(log_file, mark).items()},
+        writes=len(platform.bulk.writes) - writes,
+    )
+
+
+@pytest.mark.parametrize("state", _LED_ANIMATING_STATES)
+@pytest.mark.parametrize("pm", _first_pm_per_led_style())
+def test_the_led_tick_writes_no_record_per_tick(
+    tmp_path: Path, pm: int, state: str,
+) -> None:
+    """Every LED style, every animating state: nothing may scale with ticks.
+
+    The static tick-closure gate below roots at ``LedAnimationLoop.tick`` and
+    still could not see any of this: its closure stops at
+    ``app.dispatch(RenderLed(...))``, and ``device.is_led`` is an attribute
+    read, not a call.  So this one DRIVES the tick.
+    """
+    ticks = 20
+    run = _led_tick_rates(tmp_path, pm, state, ticks=ticks)
+    # The witness is the wire, not the log: a tick that stopped rendering and
+    # a tick that correctly stopped logging read the same from the log.
+    assert run.writes >= ticks and run.writes % ticks == 0, (
+        f"pm={pm} {state}: {ticks} ticks made {run.writes} bulk write(s) — "
+        "not a whole number of frames per tick, so the 'no floods' verdict "
+        "below is measured against ticks the wire never saw")
+    floods = {s: r for s, r in run.rates.items() if r >= _PER_FRAME_RATE}
+    assert not floods, (
+        f"pm={pm} {state}: these call sites write a record per LED tick at "
+        "DEFAULT verbosity — move each onto core.logs.per_frame(__name__):\n"
+        + "\n".join(f"  {rate:.2f}/tick  {site}"
+                    for site, rate in sorted(floods.items(),
+                                             key=lambda kv: -kv[1]))
+    )
+
+
+class _RemoteRun(NamedTuple):
+    """What one remote-preview run measured, and its independent witnesses."""
+
+    rates: dict[str, float]
+    longest: int        # the longest record written, in characters
+    previews: int       # PNG previews the client actually decoded
+    advances: int       # VideoAdvanced events the client actually received
+    png_bytes: int      # the smallest preview PNG -- what a dump would carry
+
+
+#: A record longer than this is carrying a payload, not describing one.
+_RECORD_CAP = 2048
+#: The remote path needs a Unix socket.  Without AF_UNIX (Windows) the App
+#: never binds one and every UI runs in-process, so there is no path to gate.
+_needs_af_unix = pytest.mark.skipif(
+    not hasattr(socket, "AF_UNIX"),
+    reason="no AF_UNIX: the App binds no socket, every UI runs in-process")
+
+
+def _remote_preview_rates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                          *, frames: int = 20) -> _RemoteRun:
+    """Records per frame for the preview a UI follows over the socket.
+
+    The App runs in its own process by default, so a window's live preview is
+    the App ticking and the UI, per frame, receiving ``VideoAdvanced`` /
+    ``FrameSent`` and dispatching ``CurrentFrame`` -- whose surface cannot
+    cross JSON -- then ``BuildPreview(encode="png")``.  Neither sibling gate
+    reaches any of it.  Measured 2026-10-01 on the maintainer's box: ~2.6 MB/s,
+    99% of it three ``ipc`` helpers printing the base64 PNG, and the 6 MB ring
+    held about two seconds -- every ``trcc report`` was useless.
+
+    Both ends run in this process and write one file, as the App and a UI
+    share one log on a real machine.
+    """
+    import threading
+
+    from trcc import ipc
+    from trcc.core.commands import BuildPreview, CurrentFrame, TickDisplay
+    from trcc.core.events import VideoAdvanced
+    from trcc.proxy import AppProxy
+
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    app, log_file = _ticking_app(tmp_path)
+    # Noise, not the solid frames the tick gate plays: a solid preview
+    # compresses to a few hundred bytes, so a line dumping it whole still fit
+    # under the cap and the payload check was blind (measured: two mutations
+    # that printed the PNG stayed green).  A real theme's is ~55 KB.
+    app.media._playbacks[_TICK_KEY].frames = [   # pyright: ignore[reportPrivateUsage]
+        _noise_jpeg(seed) for seed in range(3)]
+    server = ipc.IPCServer(app)
+    server.start()
+    serving = threading.Thread(target=server.serve_forever, daemon=True)
+    serving.start()
+    proxy = AppProxy(timeout=10.0)
+    advances: list[VideoAdvanced] = []
+    proxy.events.subscribe(VideoAdvanced, advances.append)  # type: ignore[arg-type]
+    previews = 0
+    sizes: list[int] = []
+
+    def frame() -> int:
+        """The App's tick, then what the gui's ``rebuild_preview`` asks."""
+        app.dispatch(TickDisplay(key=_TICK_KEY))
+        proxy.dispatch(CurrentFrame(key=_TICK_KEY))
+        image = proxy.dispatch(BuildPreview(key=_TICK_KEY, encode="png")).image
+        sizes.append(len(image or b""))
+        return 1 if image else 0
+
+    try:
+        deadline = time.monotonic() + 10
+        while not advances and time.monotonic() < deadline:   # stream is up
+            frame()
+        for _ in range(5):            # warm-up: first-frame lines are one-shot
+            frame()
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+        mark = _mark(log_file)
+        seen = len(advances)
+        for _ in range(frames):
+            previews += frame()
+        deadline = time.monotonic() + 5
+        while len(advances) < seen + frames and time.monotonic() < deadline:
+            time.sleep(0.01)
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+    finally:
+        proxy.close()
+        server.shutdown()
+        serving.join(timeout=5)
+        app.close()
+
+    rates = {site: n / frames
+             for site, n in _records_by_site(log_file, mark).items()}
+    with log_file.open(encoding="utf-8", errors="replace") as fh:
+        fh.seek(mark.offset)
+        longest = max((len(line) for line in fh), default=0)
+    return _RemoteRun(
+        rates=rates, longest=longest, previews=previews, advances=len(advances) - seen,
+        png_bytes=min(sizes[-frames:], default=0),
+    )
+
+
+def _noise_jpeg(seed: int, w: int = 320, h: int = 320) -> bytes:
+    """An incompressible frame: its PNG re-encode stays tens of KB."""
+    import random
+
+    from PySide6.QtCore import QBuffer, QByteArray
+    from PySide6.QtGui import QImage
+
+    rng = random.Random(seed)
+    img = QImage(bytes(rng.getrandbits(8) for _ in range(w * h * 3)),
+                 w, h, w * 3, QImage.Format.Format_RGB888).copy()
+    data = QByteArray()
+    buf = QBuffer(data)
+    buf.open(QBuffer.OpenModeFlag.WriteOnly)
+    img.save(buf, "JPEG", 95)
+    buf.close()
+    return bytes(data)
+
+
+@_needs_af_unix
+def test_the_remote_preview_writes_no_record_per_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A window following the App over the socket, at DEFAULT verbosity:
+    nothing may scale with frames.
+
+    MUTATION CHECK -- MEASURED 2026-10-02: put ``ipc._send_json`` back on the
+    module logger → fails here only.  Restore ``_coerce``'s original
+    ``log.debug(... raw=%s, raw)`` → all three remote tests fail, on the
+    rotation check: a PNG per field turns the 1 MB file over inside the
+    window.  Before that check the same mutation passed every gate.
+    """
+    run = _remote_preview_rates(tmp_path, monkeypatch)
+    floods = {s: r for s, r in run.rates.items() if r >= _PER_FRAME_RATE}
+    assert not floods, (
+        "these call sites write a record per previewed frame at DEFAULT "
+        "verbosity — move each onto core.logs.per_frame(__name__):\n"
+        + "\n".join(f"  {rate:.2f}/frame  {site}"
+                    for site, rate in sorted(floods.items(),
+                                             key=lambda kv: -kv[1]))
+    )
+
+
+@_needs_af_unix
+def test_no_remote_preview_record_carries_a_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rare is not enough: one record holding a base64 PNG is 55 KB, and the
+    rate gate cannot see a line that fires once.
+
+    MUTATION CHECK -- MEASURED 2026-10-02: a ONE-OFF ``log.debug`` of the
+    decoded envelope in ``AppProxy.dispatch`` → fails here only.
+    """
+    run = _remote_preview_rates(tmp_path, monkeypatch)
+    assert run.longest <= _RECORD_CAP, (
+        f"a {run.longest}-character record — a log line is carrying a payload "
+        "(a base64 image, a whole envelope) instead of describing it"
+    )
+
+
+@_needs_af_unix
+def test_the_remote_preview_gate_actually_crosses_the_socket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate above is only as good as the traffic it drives.  The witnesses
+    are what the CLIENT received, never a log record: a chain that stopped
+    running and a chain that correctly stopped logging look identical from
+    the log, and the second is what this exists to produce."""
+    frames = 20
+    run = _remote_preview_rates(tmp_path, monkeypatch, frames=frames)
+    assert run.previews == frames, (
+        f"{run.previews} of {frames} PNG previews came back over the socket")
+    assert run.advances >= frames, (
+        f"{run.advances} of {frames} VideoAdvanced events reached the client")
+    assert run.png_bytes > 4 * _RECORD_CAP, (
+        f"the preview PNG is {run.png_bytes} B — a line dumping it would fit "
+        f"under the {_RECORD_CAP}-character cap, so the payload test is blind")
+
+
 def test_the_frame_path_gate_can_actually_see_a_flood(tmp_path: Path) -> None:
     """Mutation check: the rule must FAIL when a flood is present.
 
@@ -2096,7 +2821,7 @@ def test_the_frame_path_gate_can_actually_see_a_flood(tmp_path: Path) -> None:
     rare = logging.getLogger("trcc.services.pretend_rare")
 
     frames = 40
-    mark = log_file.stat().st_size if log_file.exists() else 0
+    mark = _mark(log_file)
     for i in range(frames):
         ordinary.debug("pretend per-frame line %d", i)
         if i == 0:
@@ -2437,6 +3162,7 @@ _ENUMERATOR_LOGGERS: dict[str, frozenset[str]] = {
     "disks": frozenset({"frame_log"}),
     "read_all": frozenset({"frame_log"}),
     "_refresh_if_stale": frozenset({"frame_log"}),
+    "_gpu_prefixes": frozenset({"frame_log"}),        # every poll, every GPU
     # Per-tick too, and NOT one-shot: qtgui's SensorPickerWidget dispatches
     # ReadSensors() on a 2-second QTimer.
     "discover": frozenset({"frame_log"}),
@@ -2996,3 +3722,273 @@ def test_handshake_scrape_survives_an_unreadable_segment(tmp_path: Path) -> None
     live.write_text("HidLcd handshake OK: PM=9\n", encoding="utf-8")
 
     assert len(_scrape_handshake_lines(live)) == 1
+
+
+def test_an_api_request_reaches_the_log_file(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``trcc api`` never wrote one request-time record to the file.
+
+    uvicorn's default ``log_config`` goes through ``dictConfig``, which CLOSES
+    every handler already attached — ours included — and leaves them on the
+    root logger, so nothing looks wrong.  Measured 2026-09-28: no log on the
+    dev box had ever held an ``api GET``/``POST`` line, and a reporter's
+    ``trcc report`` carried start-up only.
+
+    Real ``ApiUI.start`` → real ``uvicorn.run`` (which builds the ``Config``
+    where the handlers were closed); only ``Server.run`` is replaced, by one
+    request served through the app it was handed.
+    A ``/tick`` poller stays OFF INFO: at 1 Hz its lines rotated the diagnosis
+    out of the file within hours.
+    MUTATION CHECK: drop ``log_config=None`` from ``ApiUI.run``, or the
+    route's ``request.state.per_frame`` → this fails.
+    """
+    import uvicorn
+
+    from tests.conftest import FakePlatform, loopback_client
+    from trcc.ui._uis import ApiUI
+
+    log_file = tmp_path / "trcc.log"
+    configure_logging(log_file, level=logging.DEBUG)
+    served: list[int] = []
+
+    def serve_one_request(self: uvicorn.Server, sockets: object = None) -> None:
+        client = loopback_client(self.config.app)
+        served.append(client.get("/devices").status_code)
+        client.post("/devices/dead:beef/display/tick")
+        self.started = True        # uvicorn.run exits 3 without it
+
+    monkeypatch.setattr(uvicorn.Server, "run", serve_one_request)
+
+    assert ApiUI().start(FakePlatform(tmp_path)) == 0
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+
+    assert served == [200]
+    lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert [ln.split(": ", 1)[-1] for ln in lines
+            if ln.endswith("api GET /devices")] == ["api GET /devices"]
+    # TRCC's loggers only: the test's own client (httpx) logs every request.
+    assert [ln for ln in lines
+            if re.search(r" INFO +trcc\.", ln) and "/display/tick" in ln] == []
+
+
+# ── Dispatch origin: the bus's one line names the UI that asked ──────────
+
+
+def _dispatch_lines(caplog: pytest.LogCaptureFixture, name: str) -> list[str]:
+    """Every ``… dispatch <name>(`` message the bus wrote, in order."""
+    return [r.getMessage() for r in caplog.records
+            if f"dispatch {name}(" in r.getMessage()]
+
+
+def _ui_keys() -> list[str]:
+    """Every registered UI — derived, so a new UI is covered the day it lands."""
+    import trcc.ui._uis  # noqa: F401  — importing registers them
+    from trcc.ui._base import UIS
+    return sorted(UIS)
+
+
+@pytest.mark.parametrize("key", _ui_keys())
+def test_every_ui_names_itself_in_the_bus_line(
+        key: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture) -> None:
+    """``[api] dispatch ListDevices()`` — the child passes its registry key.
+
+    Every UI dispatches through the same bus, so the bus's line could not say
+    who asked: a CLI command, an API poll and the session's own restore all
+    read ``dispatch …``.  ``UserInterface.dispatch`` now names the UI.
+    MUTATION CHECK: drop ``with dispatch_origin(self.key)`` → every UI fails.
+    """
+    from tests.conftest import FakePlatform
+    from trcc.app import App
+    from trcc.core.commands import ListDevices
+    from trcc.ui._base import UIS
+
+    cls = UIS[key]
+    app = App(platform=FakePlatform(tmp_path))
+    monkeypatch.setattr(cls, "compose", lambda self, platform: app)
+    caplog.set_level(logging.INFO)
+    caplog.set_level(logging.DEBUG, logger=PER_FRAME_ROOT)  # Queries log there
+
+    cls().dispatch(ListDevices())
+
+    assert _dispatch_lines(caplog, "ListDevices") == [
+        f"[{key}] dispatch ListDevices()"]
+
+
+def test_a_childs_dispatch_carries_the_ui_and_core_carries_core(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """A Command's own dispatches inherit who asked; what nobody asked for —
+    a hotplug connect, a session restore on another thread — reads ``core``.
+    MUTATION CHECK: default the origin to anything but ``core`` → this fails.
+    """
+    from tests.conftest import FakePlatform
+    from trcc.adapters.render.qt import QtRenderer
+    from trcc.app import App
+    from trcc.core.commands import ListDevices, SendColor
+    from trcc.core.logs import dispatch_origin
+
+    app = App(platform=FakePlatform(tmp_path), renderer=QtRenderer())
+    caplog.set_level(logging.INFO)
+    caplog.set_level(logging.DEBUG, logger=PER_FRAME_ROOT)  # Queries log there
+
+    with dispatch_origin("api"):
+        app.dispatch(SendColor(key="0402:3922", r=1, g=2, b=3))
+    app.dispatch(ListDevices())
+
+    # SendColor uses its device, so the bus connects it first — a CHILD.
+    assert _dispatch_lines(caplog, "EnsureConnected") == [
+        "[api] dispatch EnsureConnected(key='0402:3922')"]
+    assert _dispatch_lines(caplog, "ListDevices") == [
+        "[core] dispatch ListDevices()"]
+
+
+def test_the_daemon_logs_the_clients_name(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture) -> None:
+    """Over the socket the DAEMON writes the line, so the client's name rides
+    the envelope; a client too old to send one reads ``ipc``.
+    MUTATION CHECK: stop writing ``origin`` in ``AppProxy.dispatch``, or stop
+    restoring it in ``_dispatch_envelope`` → this fails.
+    """
+    from tests.conftest import FakePlatform
+    from trcc import ipc
+    from trcc.app import App
+    from trcc.core.commands import ListDevices
+    from trcc.core.logs import dispatch_origin
+    from trcc.proxy import AppProxy
+
+    server = ipc.IPCServer(App(platform=FakePlatform(tmp_path)))
+    sent: list[dict[str, Any]] = []
+
+    def over_the_socket(envelope: dict[str, Any], **_kw: Any) -> dict[str, Any]:
+        sent.append(envelope)
+        return server._dispatch_envelope(envelope)
+
+    monkeypatch.setattr(ipc, "one_shot_request", over_the_socket)
+    caplog.set_level(logging.INFO)
+    caplog.set_level(logging.DEBUG, logger=PER_FRAME_ROOT)  # Queries log there
+
+    with dispatch_origin("cli"):
+        AppProxy().dispatch(ListDevices())
+    AppProxy().dispatch(ListDevices())          # a client outside any UI
+    server._dispatch_envelope({"command": "ListDevices", "kwargs": {}})
+
+    assert [e.get("origin") for e in sent] == ["cli", "core"]
+    # ``[core]`` in the daemon's log is the DAEMON; an unnamed caller is ipc.
+    assert _dispatch_lines(caplog, "ListDevices") == [
+        "[cli] dispatch ListDevices()", "[ipc] dispatch ListDevices()",
+        "[ipc] dispatch ListDevices()"]
+
+
+# ── A report never opens a second handle on a panel the App holds ─────────
+#
+# ``trcc report`` runs in the caller's process and used to open a fresh
+# transport on every LCD.  Under the shared App that is a second owner of a
+# panel the App is driving: it usually failed busy (so the report showed the
+# catalog name), and on a HID-report panel the probe's kernel-driver detach
+# pulled usbhid from under the App's open hidraw handle.  The App knows each
+# device's handshake already, so the report asks it.
+
+_HELD_SPEC = {"type": "lcd", "name": "bulk panel", "vid": "87ad",
+              "pid": "70db", "pm": 4, "sub": 5}
+_HELD_BYTES = {"pm": "4", "sub": "5", "fbl": "?", "resolution": "480x480",
+               "raw": "(held by the running App)"}
+
+
+def _report_platform(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from .mock_platform import MockPlatform
+
+    platform = MockPlatform([_HELD_SPEC], tmp_path)
+
+    def no_second_handle(*a: Any, **k: Any) -> Any:
+        raise AssertionError("the report opened a panel the App holds")
+
+    monkeypatch.setattr(platform, "open_transport", no_second_handle)
+    return platform
+
+
+def test_a_held_panel_is_reported_from_the_app_not_probed(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """MUTATION CHECK: probe every device again -> the sentinel raises."""
+    from trcc.adapters.diagnostics.debug_report import _collect_devices
+
+    platform = _report_platform(tmp_path, monkeypatch)
+
+    rows, error = _collect_devices(platform, held={"87ad:70db": _HELD_BYTES})
+
+    assert error == ""
+    assert (rows[0]["hs_pm"], rows[0]["hs_sub"]) == ("4", "5")
+    assert rows[0]["product"].startswith("Peerless Vision 360")
+
+
+def test_a_silent_app_means_no_probe_at_all(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A running App that does not answer may still hold every panel."""
+    from trcc.adapters.diagnostics.debug_report import _collect_devices
+
+    platform = _report_platform(tmp_path, monkeypatch)
+
+    rows, _ = _collect_devices(platform, probe=False)
+
+    assert "hs_pm" not in rows[0]
+
+
+def _report_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                running: bool, answer: list | None):
+    """An App whose report call is recorded, with a running App elsewhere
+    (``running``) that answers ``answer`` (None = did not answer)."""
+    from trcc import daemon, ipc
+    from trcc.app import App
+
+    from .mock_platform import MockPlatform
+
+    app = App(platform=MockPlatform([_HELD_SPEC], tmp_path))
+    calls: list[dict] = []
+
+    def record(log_tail_lines: int, **kw: Any) -> str:
+        calls.append(kw)
+        return "report"
+
+    monkeypatch.setattr(app.diagnostics, "debug_report", record)
+    monkeypatch.setattr(ipc, "daemon_running", lambda: running)
+    monkeypatch.setattr(daemon, "is_this_process_the_daemon", lambda: False)
+    monkeypatch.setattr(daemon, "held_devices", lambda: answer)
+    return app, calls
+
+
+def test_the_report_asks_the_running_app_what_it_holds(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from trcc.core.commands import GenerateDebugReport
+    from trcc.core.results import DeviceStateResult
+
+    held = DeviceStateResult(ok=True, key="87ad:70db", connected=True,
+                             pm_byte=4, sub_byte=5, fbl=None,
+                             resolution=(480, 480))
+    app, calls = _report_app(tmp_path, monkeypatch, True, [held])
+
+    GenerateDebugReport().execute(app)
+
+    assert calls == [{"held": {"87ad:70db": _HELD_BYTES}, "probe": True}]
+
+
+def test_a_running_app_that_does_not_answer_stops_every_probe(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from trcc.core.commands import GenerateDebugReport
+
+    app, calls = _report_app(tmp_path, monkeypatch, True, None)
+
+    GenerateDebugReport().execute(app)
+
+    assert calls == [{"held": {}, "probe": False}]
+
+
+def test_with_no_app_elsewhere_the_report_probes_as_before(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from trcc.core.commands import GenerateDebugReport
+
+    app, calls = _report_app(tmp_path, monkeypatch, False, None)
+
+    GenerateDebugReport().execute(app)
+
+    assert calls == [{"held": {}, "probe": True}]

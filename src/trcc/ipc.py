@@ -1,8 +1,8 @@
-"""IPC for the next/ daemon — manifold dispatch over a Unix socket.
+"""IPC for the shared App — manifold dispatch over a Unix socket.
 
 The daemon (`trcc daemon`) owns one ``App`` and serves requests
-through ``IPCServer``.  Clients (``AppProxy`` returned by
-``_boot.trcc()`` when ``TRCC_DAEMON=1``) call ``dispatch(cmd)``
+through ``IPCServer``.  Clients (the ``AppProxy`` that ``_boot.trcc()``
+returns by default) call ``dispatch(cmd)``
 and the proxy turns each call into one socket round-trip.
 
 Wire format — one line of JSON per request.
@@ -62,9 +62,11 @@ from .core import events as _events_module
 from .core import results as _results_module
 from .core.commands import Command
 from .core.commands._base import Query
-from .core.events import Event
-from .core.logs import per_frame
+from .core.events import AppStopping, Event, FrameSent
+from .core.logs import dispatch_origin, per_frame, recurring_warning
+from .core.models import IN_PROCESS_ONLY_KEY
 from .core.results import Result
+from .frame_share import FrameWriter
 
 if TYPE_CHECKING:
     from .app import App
@@ -100,11 +102,34 @@ _SUBSCRIBER_SEND_TIMEOUT_S = 0.5
 # =========================================================================
 
 
+def runtime_dir() -> Path:
+    """This user's base directory for every TRCC socket.
+
+    ``$XDG_RUNTIME_DIR``, else ``~/.cache`` — never ``/tmp``.  ``/tmp`` is
+    shared by every account, so another user could create ``/tmp/trcc.sock``
+    first and each TRCC UI would dispatch to THEIR process; and
+    systemd-tmpfiles ages ``/tmp`` out (10 days on Fedora), orphaning a
+    long-running App's socket.  No other account can create files in your home,
+    and nothing ages ``~/.cache``.  macOS never sets ``XDG_RUNTIME_DIR``, so
+    this fallback is every Mac session.
+
+    Root always takes ``~/.cache``: a root login gets ``/run/user/0`` from
+    pam_systemd and a root service gets nothing, so honouring the variable
+    put the two on different sockets and a root client never found the root
+    App a service started (#246).
+    """
+    root = hasattr(os, "geteuid") and os.geteuid() == 0
+    xdg = None if root else os.environ.get("XDG_RUNTIME_DIR")
+    base = Path(xdg) if xdg else Path.home() / ".cache"
+    frame_log.debug("runtime_dir: %s (%s)", base,
+              "XDG_RUNTIME_DIR" if xdg else "fallback")
+    return base
+
+
 def socket_path() -> Path:
-    """Return the canonical Unix-socket path for this user's next/ daemon."""
-    log.debug("socket_path: called")
-    runtime = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
-    return Path(runtime) / _SOCK_NAME
+    """Return the canonical Unix-socket path for this user's daemon."""
+    frame_log.debug("socket_path: called")
+    return runtime_dir() / _SOCK_NAME
 
 
 def daemon_running() -> bool:
@@ -120,6 +145,60 @@ def daemon_running() -> bool:
         return True
     except OSError:
         return False
+
+
+class AppLock:
+    """One App per user: an ``flock`` the App holds for its whole life.
+
+    The socket alone could not say "an App is starting": it appears only when
+    the App binds, and two UIs launched together both found none, both
+    spawned, and the second App unlinked the first one's socket (#314).  The
+    kernel releases the lock when the holder exits or crashes, so held means
+    alive.  Absent ``fcntl`` (Windows, where every UI runs its own App) it is
+    always free.
+    """
+
+    def __init__(self, path: Path | None = None) -> None:
+        self._path = path or runtime_dir() / "trcc.lock"
+        self._fd: int | None = None
+        log.debug("AppLock.__init__: %s", self._path)
+
+    def acquire(self) -> bool:
+        """Take the lock; False when another process holds it."""
+        try:
+            import fcntl
+        except ImportError:
+            log.debug("AppLock.acquire: no fcntl — nothing to hold")
+            return True
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            log.info("AppLock.acquire: %s is held by another App", self._path)
+            return False
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode())
+        self._fd = fd
+        log.info("AppLock.acquire: %s held by pid %d", self._path, os.getpid())
+        return True
+
+    def release(self) -> None:
+        """Drop the lock (the kernel does it anyway when this process exits)."""
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+            log.info("AppLock.release: %s", self._path)
+
+    @classmethod
+    def held(cls) -> bool:
+        """True while some App -- starting, or serving -- holds the lock."""
+        probe = cls()
+        free = probe.acquire()
+        probe.release()
+        log.debug("AppLock.held: %s", not free)
+        return not free
 
 
 # =========================================================================
@@ -182,17 +261,17 @@ def _to_wire(value: Any) -> Any:
         return {_BYTES_MARKER: base64.b64encode(value).decode("ascii")}
     if dataclasses.is_dataclass(value):
         return {f.name: _to_wire(getattr(value, f.name))
-                for f in dataclasses.fields(value)}
+                for f in dataclasses.fields(value)
+                if not f.metadata.get(IN_PROCESS_ONLY_KEY)}
     if isinstance(value, (list, tuple)):
         return [_to_wire(v) for v in value]
     if isinstance(value, dict):
         return {str(k): _to_wire(v) for k, v in value.items()}
-    # Unserializable at the JSON boundary (e.g. a renderer surface on an
-    # in-process-only event field like FrameSent.surface).  Warn loudly
-    # and drop to None rather than let json.dumps crash the whole call —
-    # the receiver treats None as "not available" (the preview re-renders).
-    log.warning("_to_wire: non-serializable %s dropped to None at IPC "
-                "boundary", type(value).__name__)
+    # Unserializable and NOT declared in-process only (``IN_PROCESS_ONLY``):
+    # a surprise.  Dropped to None rather than let json.dumps crash the call,
+    # and warned once per type -- this runs per frame.
+    recurring_warning(log, "_to_wire: non-serializable %s dropped to None at "
+                      "IPC boundary", type(value).__name__)
     return None
 
 
@@ -202,7 +281,7 @@ def _from_wire(raw: Any) -> Any:
     Enums and dataclasses need their target type (see ``_coerce``) — this
     walker only handles the type-blind bytes marker.
     """
-    log.debug("_from_wire: raw=%s", raw)
+    frame_log.debug("_from_wire: %s", type(raw).__name__)
     if isinstance(raw, dict) and len(raw) == 1 and _BYTES_MARKER in raw:
         return base64.b64decode(raw[_BYTES_MARKER])
     if isinstance(raw, list):
@@ -219,7 +298,7 @@ def _from_wire(raw: Any) -> Any:
 
 def _coerce(hint: Any, raw: Any) -> Any:
     """Convert a JSON-decoded value into the type the field expects."""
-    log.debug("_coerce: hint=%s raw=%s", hint, raw)
+    frame_log.debug("_coerce: hint=%s raw=%s", hint, type(raw).__name__)
     if raw is None:
         return None
     origin = typing.get_origin(hint)
@@ -304,7 +383,7 @@ def _hints(cls: type) -> dict[str, Any]:
 
 def _build_dataclass(cls: type, data: dict[str, Any]) -> Any:
     """Reconstruct a dataclass instance from a JSON-decoded dict."""
-    log.debug("_build_dataclass: data=%s", data)
+    frame_log.debug("_build_dataclass: %s fields=%s", cls.__name__, sorted(data))
     hints = _hints(cls)
     kwargs: dict[str, Any] = {}
     for field in dataclasses.fields(cls):
@@ -321,7 +400,7 @@ def _build_dataclass(cls: type, data: dict[str, Any]) -> Any:
 
 def encode_command(cmd: Command[Any]) -> dict[str, Any]:
     """Serialize a Command into a dispatch envelope."""
-    log.debug("encode_command: cmd=%s", type(cmd).__name__)
+    frame_log.debug("encode_command: cmd=%s", type(cmd).__name__)
     # Every concrete Command is a frozen dataclass; the runtime check
     # narrows the type for the static checker too.
     assert dataclasses.is_dataclass(cmd), (
@@ -333,7 +412,7 @@ def encode_command(cmd: Command[Any]) -> dict[str, Any]:
 
 def decode_command(envelope: dict[str, Any]) -> Command[Any]:
     """Reconstruct a Command from a dispatch envelope."""
-    log.debug("decode_command: keys=%s", sorted(envelope))
+    frame_log.debug("decode_command: keys=%s", sorted(envelope))
     name = envelope.get("command")
     if not isinstance(name, str):
         raise ValueError("envelope missing 'command' key")
@@ -348,13 +427,13 @@ def decode_command(envelope: dict[str, Any]) -> Command[Any]:
 
 def encode_result(result: Result) -> dict[str, Any]:
     """Serialize a Result into a response envelope (carries the class name)."""
-    log.debug("encode_result: result=%s", type(result).__name__)
+    frame_log.debug("encode_result: result=%s", type(result).__name__)
     return {"type": type(result).__name__, **_to_wire(result)}
 
 
 def decode_result(envelope: dict[str, Any]) -> Result:
     """Reconstruct a Result from a response envelope."""
-    log.debug("decode_result: keys=%s", sorted(envelope))
+    frame_log.debug("decode_result: keys=%s", sorted(envelope))
     type_name = envelope.get("type", "Result")
     cls = RESULT_TYPES.get(str(type_name), Result)
     body = {k: v for k, v in envelope.items() if k != "type"}
@@ -405,13 +484,13 @@ def decode_event(envelope: dict[str, Any]) -> Event:
 
 
 def _send_json(sock: socket.socket, payload: dict[str, Any]) -> None:
-    log.debug("_send_json: keys=%s", sorted(payload))
+    frame_log.debug("_send_json: keys=%s", sorted(payload))
     sock.sendall(json.dumps(payload).encode() + b"\n")
 
 
 def _recv_json(sock: socket.socket, *, max_bytes: int = 8 * 1024 * 1024) -> dict[str, Any]:
     """Read one newline-delimited JSON object from *sock*."""
-    log.debug("_recv_json: max_bytes=%d", max_bytes)
+    frame_log.debug("_recv_json: max_bytes=%d", max_bytes)
     chunks: list[bytes] = []
     received = 0
     while received < max_bytes:
@@ -431,13 +510,38 @@ def _recv_json(sock: socket.socket, *, max_bytes: int = 8 * 1024 * 1024) -> dict
     return decoded
 
 
+def _recv_ack(sock: socket.socket, *, max_bytes: int = 4096) -> dict[str, Any]:
+    """Read the subscribe ack -- one line, and not one byte past it.
+
+    ``_recv_json`` reads 64 KiB and keeps the first line, which is right for
+    a request/response socket and wrong for a stream: events the App writes
+    straight after the ack arrive in the same read and were thrown away with
+    the rest of it.  Measured: a reopened stream lost the first event 1 run
+    in 7.  The ack is a few dozen bytes, so reading it a byte at a time costs
+    nothing and leaves every event in the socket for the reader.
+    """
+    log.debug("_recv_ack: max_bytes=%d", max_bytes)
+    line = bytearray()
+    while len(line) < max_bytes:
+        byte = sock.recv(1)
+        if not byte or byte == b"\n":
+            break
+        line += byte
+    if not line:
+        raise ConnectionError("peer closed without sending data")
+    decoded = json.loads(line.decode())
+    if not isinstance(decoded, dict):
+        raise ValueError("response was not a JSON object")
+    return decoded
+
+
 def one_shot_request(
     payload: dict[str, Any],
     *,
-    timeout: float = _DEFAULT_TIMEOUT_S,
+    timeout: float | None = _DEFAULT_TIMEOUT_S,
 ) -> dict[str, Any]:
     """Send one envelope over the daemon socket, return the response."""
-    log.info("one_shot_request: keys=%s timeout=%s",
+    frame_log.debug("one_shot_request: keys=%s timeout=%s",
              sorted(payload), timeout)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
         sock.settimeout(timeout)
@@ -450,6 +554,7 @@ def open_event_stream(
     types: list[str] | None = None,
     *,
     timeout: float = _DEFAULT_TIMEOUT_S,
+    shared_frames: bool = False,
 ) -> socket.socket:
     """Connect, subscribe, and hand back the still-open stream socket.
 
@@ -459,13 +564,17 @@ def open_event_stream(
     stay silent forever.
     """
     wanted = types or ["*"]
-    log.info("open_event_stream: types=%s", wanted)
+    log.info("open_event_stream: types=%s shared_frames=%s", wanted,
+             shared_frames)
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         sock.settimeout(timeout)
         sock.connect(str(socket_path()))
-        _send_json(sock, {"subscribe": wanted})
-        ack = _recv_json(sock)
+        request: dict[str, Any] = {"subscribe": wanted}
+        if shared_frames:
+            request["frames"] = "shared"     # pixels via trcc.frame_share
+        _send_json(sock, request)
+        ack = _recv_ack(sock)
     except OSError:
         sock.close()
         raise
@@ -486,10 +595,6 @@ def open_event_stream(
 # =========================================================================
 
 
-class _ShutdownRequested(Exception):
-    """Internal marker — the request handler asked the server to exit."""
-
-
 class _Subscriber:
     """One connected client that asked for an event stream.
 
@@ -500,14 +605,19 @@ class _Subscriber:
     encodes for N clients is still N times nothing for no reason).
     """
 
-    __slots__ = ("sock", "types", "wants_all")
+    __slots__ = ("shared_frames", "sock", "types", "wants_all")
 
-    def __init__(self, sock: socket.socket, types: set[str]) -> None:
+    def __init__(self, sock: socket.socket, types: set[str],
+                 shared_frames: bool = False) -> None:
         self.sock = sock
         self.types = types
         self.wants_all = "*" in types
-        log.info("_Subscriber: %d type(s)%s",
-                 len(types), " (all)" if self.wants_all else "")
+        # Frames as a slot of the shared frame file, not JPEG: a client on
+        # this machine that asked for it (``trcc.frame_share``).
+        self.shared_frames = shared_frames
+        log.info("_Subscriber: %d type(s)%s%s",
+                 len(types), " (all)" if self.wants_all else "",
+                 ", shared frames" if shared_frames else "")
 
     def close(self) -> None:
         log.info("_Subscriber.close: dropping subscriber")
@@ -535,11 +645,15 @@ class IPCServer:
         # if the environment moved between start and shutdown we would delete
         # a path we never owned -- plausibly a live daemon's socket.
         self._bound_path: Path | None = None
+        self._bound_ino = 0
         self._stop = False
         # Event fan-out state.  A subscriber connection is long-lived, unlike
         # the one-shot dispatch connections, so it is tracked here rather than
         # living and dying inside ``_serve_client``.
         self._subscribers: list[_Subscriber] = []
+        # The shared frame files, made on the first shared frame; deleted on
+        # shutdown.  Only the fan-out thread writes them.
+        self._frame_writer: FrameWriter | None = None
         self._sub_lock = threading.Lock()
         self._event_q: queue.Queue[Event] = queue.Queue(maxsize=EVENT_QUEUE_MAX)
         self._fanout_thread: threading.Thread | None = None
@@ -568,12 +682,18 @@ class IPCServer:
         path.chmod(0o600)
         self._sock = sock
         self._bound_path = path
+        # The file THIS server made, so shutdown never removes another's.
+        self._bound_ino = path.stat().st_ino
         log.info("IPC server listening on %s", path)
 
     def serve_forever(self) -> None:
         """Accept connections until ``shutdown`` is called or a kill arrives."""
         log.info("serve_forever: called")
         import threading
+        if self._stop:
+            # ``shutdown`` came first -- a SIGTERM while the daemon bound.
+            log.info("serve_forever: shut down before serving — returning")
+            return
         if self._sock is None:
             raise RuntimeError("serve_forever called before start")
         while not self._stop:
@@ -606,19 +726,47 @@ class IPCServer:
                           exc_info=True)
             self._sock.close()
             self._sock = None
+        # Joined first: it re-reads ``_stop`` every 0.25 s, and a write it
+        # still has in flight must not interleave with the notice below.
+        # Alive only: ``_ensure_fanout`` assigns the thread a moment before it
+        # starts it, and joining one not yet started raises.  One that starts
+        # after this sees ``_stop`` and returns before writing anything.
+        fanout = self._fanout_thread
+        if (fanout is not None and fanout.is_alive()
+                and fanout is not threading.current_thread()):
+            fanout.join(timeout=1.0)
+        with self._sub_lock:
+            subs, self._subscribers = self._subscribers, []
+        if self._frame_writer is not None:
+            self._frame_writer.close()
+            self._frame_writer = None
+        # The last line of every stream says WHY it ends, so a UI can tell a
+        # quit (close with it) from a crash (the stream just stops).
+        notice = json.dumps(encode_event(AppStopping())).encode() + b"\n"
+        for sub in subs:
+            self._write_or_evict(sub, notice)
+            sub.close()
+        if subs:
+            log.info("shutdown: told %d subscriber stream(s) the App is "
+                     "stopping, then closed them", len(subs))
+        # Last: ``trcc kill`` returns when this file is gone, so every UI has
+        # been told by then.
         path = self._bound_path
-        if path is not None and path.exists():
+        try:
+            ours = path is not None and path.stat().st_ino == self._bound_ino
+        except OSError:
+            ours = False
+        if path is not None and ours:
             try:
                 path.unlink()
             except OSError:
                 log.debug("shutdown: socket unlink failed", exc_info=True)
+        elif path is not None:
+            # An orphaned App removing the LIVE one's socket left no App to
+            # find, and the next UI started a third (#314).
+            log.info("shutdown: %s is not the socket this server made — "
+                     "left in place", path)
         self._bound_path = None
-        with self._sub_lock:
-            subs, self._subscribers = self._subscribers, []
-        for sub in subs:
-            sub.close()
-        if subs:
-            log.info("shutdown: closed %d subscriber stream(s)", len(subs))
         log.info("IPC server shut down")
 
     def _serve_client(self, client: socket.socket) -> None:
@@ -632,7 +780,9 @@ class IPCServer:
                 # A stream, not a request/response: hand the socket over and
                 # return WITHOUT closing it (the ``finally`` below is skipped
                 # via ``keep_open``).  The fan-out thread owns it from here.
-                keep_open = self._handle_subscribe(client, envelope["subscribe"])
+                keep_open = self._handle_subscribe(
+                    client, envelope["subscribe"],
+                    shared_frames=envelope.get("frames") == "shared")
                 return
             if envelope.get("kill") is True:
                 _send_json(client, {"ok": True, "message": "shutting down"})
@@ -663,7 +813,8 @@ class IPCServer:
 
     # ── Event fan-out ────────────────────────────────────────────────
 
-    def _handle_subscribe(self, client: socket.socket, raw: Any) -> bool:
+    def _handle_subscribe(self, client: socket.socket, raw: Any, *,
+                          shared_frames: bool = False) -> bool:
         """Turn *client* into a long-lived event subscriber.
 
         Returns True when the stream was ACCEPTED and this server now owns the
@@ -694,7 +845,7 @@ class IPCServer:
 
         wanted = set(names)
         self._bridge_events(wanted)
-        sub = _Subscriber(client, wanted)
+        sub = _Subscriber(client, wanted, shared_frames)
         # Register and acknowledge under ONE lock, registration first.  Each
         # ordering on its own breaks a different invariant:
         #   ack-then-register loses every event published in the gap, to a
@@ -790,13 +941,81 @@ class IPCServer:
                            if s.wants_all or name in s.types]
             if not targets:
                 continue
-            # ONE encode, N writes -- the whole reason the fan-out is central.
-            line = json.dumps(encode_event(event)).encode() + b"\n"
-            frame_log.debug("_fanout_loop: %s -> %d subscriber(s), %d bytes",
-                            name, len(targets), len(line))
+            # ONE encode per kind, N writes -- the whole reason the fan-out
+            # is central.
+            lines = self._wire_lines(event, targets)
+            frame_log.debug("_fanout_loop: %s -> %d subscriber(s), %s bytes",
+                            name, len(targets),
+                            [len(line) for line in lines.values()])
             for sub in targets:
-                self._write_or_evict(sub, line)
+                self._write_or_evict(sub, lines[sub.shared_frames])
         log.info("_fanout_loop: stopped")
+
+    def _wire_lines(self, event: Event,
+                    targets: list[_Subscriber]) -> dict[bool, bytes]:
+        """The line each kind of subscriber gets, keyed by ``shared_frames``.
+
+        Only a ``FrameSent`` with a picture differs: shared-frame subscribers
+        get a slot of the frame file, the rest a JPEG -- each built only if
+        someone of that kind is listening.
+        """
+        frame_log.debug("_wire_lines: %s", type(event).__name__)
+        kinds = {sub.shared_frames for sub in targets}
+        framed = (isinstance(event, FrameSent) and event.surface is not None
+                  and not event.image)
+        if not framed:
+            line = json.dumps(encode_event(event)).encode() + b"\n"
+            return dict.fromkeys(kinds, line)
+        lines: dict[bool, bytes] = {}
+        if True in kinds:
+            shared = self._shared_frame(event)
+            lines[True] = json.dumps(encode_event(
+                shared if shared is not None else self._for_the_wire(event)
+            )).encode() + b"\n"
+        if False in kinds:
+            lines[False] = json.dumps(encode_event(
+                self._for_the_wire(event))).encode() + b"\n"
+        return lines
+
+    def _shared_frame(self, event: Event) -> Event | None:
+        """The frame written to its device's shared file, or None to fall back."""
+        assert isinstance(event, FrameSent)
+        try:
+            pixels, width, height, stride = self._app.display.raw_argb32(
+                event.surface)
+            if self._frame_writer is None:
+                self._frame_writer = FrameWriter(runtime_dir() / "trcc" / "frames")
+            seq = self._frame_writer.write(event.key, pixels, width, height,
+                                           stride)
+        except Exception as e:
+            recurring_warning(log, "_shared_frame: %s falls back to JPEG — "
+                              "%s: %s", event.key, type(e).__name__, e)
+            return None
+        frame_log.debug("_shared_frame: %s seq=%d", event.key, seq)
+        return dataclasses.replace(event, shared_seq=seq,
+                                   shared_shape=(width, height, stride))
+
+    def _for_the_wire(self, event: Event) -> Event:
+        """Carry what the socket cannot: a ``FrameSent``'s picture, as JPEG.
+
+        The live surface is in-process only, so a remote preview used to get
+        a FrameSent with no picture and ask for a fresh render + PNG every
+        frame.  Encoded HERE, on the fan-out thread -- never on the render
+        thread that published it -- once for every subscriber, and only for
+        an event someone is subscribed to.
+        """
+        if not isinstance(event, FrameSent) or event.surface is None or event.image:
+            return event
+        try:
+            image = self._app.display.encode_jpeg(event.surface)
+        except Exception as e:
+            recurring_warning(log, "_for_the_wire: FrameSent for %s sent without "
+                              "its picture — %s: %s", event.key,
+                              type(e).__name__, e)
+            return event
+        frame_log.debug("_for_the_wire: FrameSent %s carries %d byte(s) of JPEG",
+                        event.key, len(image))
+        return dataclasses.replace(event, image=image)
 
     def _write_or_evict(self, sub: _Subscriber, line: bytes) -> None:
         """Send *line*; drop the subscriber on any failure."""
@@ -844,8 +1063,15 @@ class IPCServer:
             return {"type": "Result", "ok": False,
                     "message": f"Decode error: {e}",
                     _ERROR_KEY: f"Decode error: {e}"}
+        # The CLIENT's origin (``[cli]``, ``[api]``…), so a daemon log names who
+        # asked.  ``ipc`` for a caller with no name: a client too old to send
+        # one, or one that dispatched outside any UI (it sends the default,
+        # ``core``) — ``[core]`` in the DAEMON's log means the daemon itself.
+        origin = envelope.get("origin")
         try:
-            result = self._app.dispatch(cmd)
+            with dispatch_origin(origin if origin not in (None, "", "core")
+                                 else "ipc"):
+                result = self._app.dispatch(cmd)
         except Exception as e:
             log.exception("Command %s raised", type(cmd).__name__)
             return {"type": "Result", "ok": False,
@@ -922,7 +1148,10 @@ class SingleInstance:
     _RAISE_MESSAGE = b'{"raise": true}\n'
     _CONNECT_TIMEOUT_S = 1.0
 
-    def __new__(cls, name: str) -> SingleInstance | None:  # type: ignore[misc]
+    def __new__(cls, name: str, *,  # type: ignore[misc]
+                raise_peer: bool = True) -> SingleInstance | None:
+        """*raise_peer* False: a peer is left alone, for a launch that means to
+        stay hidden (``--resume``: autostart, session restore)."""
         path = _instance_socket_path(name)
         if not hasattr(socket, "AF_UNIX"):
             # Legacy Windows fallback (build < 17063 / Windows 10 pre-1803).
@@ -947,6 +1176,10 @@ class SingleInstance:
 
         # ── Peer alive? ──
         if _peer_alive(path, cls._CONNECT_TIMEOUT_S):
+            if not raise_peer:
+                log.info("SingleInstance(%r): peer alive — a hidden launch "
+                         "leaves its window as it is", name)
+                return None
             try:
                 _send_raise(path, cls._RAISE_MESSAGE, cls._CONNECT_TIMEOUT_S)
                 log.info("SingleInstance(%r): peer alive, raise sent", name)
@@ -969,10 +1202,10 @@ class SingleInstance:
         instance._bind(name, path)
         return instance
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, *, raise_peer: bool = True) -> None:
         # __new__ does all the work; __init__ runs again on re-entry but
         # binding already happened.  Keep this idempotent.
-        log.debug("__init__: name=%s", name)
+        log.debug("__init__: name=%s raise_peer=%s", name, raise_peer)
         if not hasattr(self, "_name"):
             self._name = name
 
@@ -1049,7 +1282,11 @@ class SingleInstance:
                     continue
                 if isinstance(payload, dict) and payload.get("raise"):
                     cb = self.on_raise
-                    if cb is not None:
+                    if cb is None:
+                        # The window is still starting: nothing to raise yet.
+                        log.info("SingleInstance: raise request before the "
+                                 "window exists — dropped")
+                    else:
                         try:
                             cb()
                         except Exception:
@@ -1061,12 +1298,7 @@ class SingleInstance:
 def _instance_socket_path(name: str) -> Path:
     """Per-UI socket path (one file per UI flavour)."""
     log.debug("_instance_socket_path: name=%s", name)
-    runtime = os.environ.get("XDG_RUNTIME_DIR")
-    if runtime:
-        base = Path(runtime) / SingleInstance._DIR_NAME
-    else:
-        base = Path.home() / ".cache" / SingleInstance._DIR_NAME
-    return base / f"{name}.sock"
+    return runtime_dir() / SingleInstance._DIR_NAME / f"{name}.sock"
 
 
 def _msvcrt_acquire(name: str) -> Any | None:

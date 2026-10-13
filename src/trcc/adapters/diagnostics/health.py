@@ -101,18 +101,26 @@ def check_install_integrity() -> HealthCheckResult:
     )
 
 
+#: The oldest Python TRCC supports -- ``requires-python`` in ``pyproject.toml``,
+#: which ``tests/test_diagnostics.py`` holds equal to this.  The doctor said 3.11
+#: while the package promised 3.10, so every Ubuntu 22.04 user was told their
+#: supported Python FAILED and ``trcc quickstart`` stopped at the doctor.
+MIN_PYTHON = (3, 10)
+
+
 def check_python_version(platform: Platform) -> HealthCheckResult:
-    """Python ≥ 3.11 is the project minimum (match-statement + slots)."""
+    """The running Python meets :data:`MIN_PYTHON`."""
     log.info("check_python_version: called")
     major, minor = sys.version_info[:2]
-    if (major, minor) >= (3, 11):
+    if (major, minor) >= MIN_PYTHON:
         return HealthCheckResult(
             name="python-version", severity="OK",
             message=f"Python {major}.{minor}",
         )
     return HealthCheckResult(
         name="python-version", severity="FAIL",
-        message=f"Python {major}.{minor} is below the 3.11 minimum",
+        message=(f"Python {major}.{minor} is below the "
+                 f"{MIN_PYTHON[0]}.{MIN_PYTHON[1]} minimum"),
         fix_hint=platform.software_install_hint("python"),
     )
 
@@ -213,23 +221,13 @@ def nvidia_gpu_present() -> bool:
     independently of the reader so we can advise *installing* the reader.
     Non-Linux falls back to the driver proc node.
     """
-    log.debug("nvidia_gpu_present")
-    if sys.platform != "linux":
+    from ..sensors.gpu_detect import nvidia_gpu_present as pci_probe
+
+    present = pci_probe()
+    log.debug("nvidia_gpu_present: PCI says %s", present)
+    if present is None:
         return Path("/proc/driver/nvidia/version").exists()
-    pci_root = Path("/sys/bus/pci/devices")
-    if not pci_root.is_dir():
-        return False
-    for dev in pci_root.iterdir():
-        try:
-            if dev.joinpath("vendor").read_text().strip().lower() != "0x10de":
-                continue
-            # PCI class 0x03xxxx == display controller (skip non-GPU NVIDIA
-            # functions like the bundled HDMI-audio device).
-            if dev.joinpath("class").read_text().strip().lower().startswith("0x03"):
-                return True
-        except OSError:
-            continue
-    return False
+    return present
 
 
 def check_gpu_sensors(
@@ -409,10 +407,33 @@ def check_udev_rules_linux() -> HealthCheckResult:
             fix_hint=f"Run `trcc system setup` (or install via the distro "
                      f"package) to lay down {RULES_PATH}",
         )
+    from ..system._udev import rules_state
+    state = rules_state()
+    if state.path is not None and state.current is False:
+        # udev reads only the highest-priority copy, so a stale one in /etc
+        # hides every rule fix a package ships (#201).
+        current_below = [p for p in state.shadowed if p.read_text(
+            encoding="utf-8", errors="replace") == _current_rules()]
+        return HealthCheckResult(
+            name="udev-rules", severity="WARN",
+            message=f"udev rules in {state.path} are from an older TRCC"
+                    + (f" and hide the current {current_below[0]}"
+                       if current_below else ""),
+            fix_hint=(f"sudo rm {state.path} && sudo udevadm control "
+                      "--reload-rules && sudo udevadm trigger"
+                      if current_below else "Run `trcc system setup`"),
+        )
     return HealthCheckResult(
         name="udev-rules", severity="OK",
-        message=f"udev rules installed: {found[0]}",
+        message=f"udev rules installed: {state.path or found[0]}",
     )
+
+
+def _current_rules() -> str:
+    """The rule file this version generates."""
+    from ..system._udev import build_udev_rules
+    log.debug("_current_rules: called")
+    return build_udev_rules()
 
 
 def check_seven_zip_present(platform: Platform) -> HealthCheckResult:

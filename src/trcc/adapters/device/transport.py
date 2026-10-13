@@ -19,9 +19,10 @@ import usb.core
 import usb.util
 
 from ...core.errors import PermissionError_, TransportError
-from ...core.logs import per_frame
+from ...core.logs import Blob, per_frame
 from ...core.ports import BulkTransport, WriteBuffer
 from ._pyusb_find import find as usb_find
+from ._pyusb_find import find_unit
 
 # Optional hidapi backend (the [hid] extra)
 try:
@@ -68,24 +69,8 @@ _RESET_SETTLE_S = 0.5
 _HID_OPEN_ATTEMPTS = 3
 _HID_OPEN_RETRY_S = 0.5
 
-#: Where ``LinuxOS.setup`` writes the rules.  Spelled ONCE in the tree --
-#: ``adapters/system/_udev.RULES_PATH`` -- and imported rather than restated,
-#: because a second spelling of this path has already been wrong once, and
-#: every correctly-installed system looked broken as a result.  (A gate now
-#: fails any user-facing text naming a rules file we do not write -- which is
-#: what caught this comment when it quoted the old name.)
-def _udev_rules_present() -> bool:
-    """True when the udev rules this error would blame are actually installed."""
-    try:
-        from ..system._udev import RULES_PATH
-    except ImportError:          # pragma: no cover - non-Linux
-        return False
-    present = RULES_PATH.is_file()
-    log.debug("_udev_rules_present: %s -> %s", RULES_PATH, present)
-    return present
-
 # Linux errno used by pyusb wraps over libusb.
-_ERRNO_EACCES = 13   # Permission denied — udev rules missing
+_ERRNO_EACCES = 13   # Permission denied
 _ERRNO_EBUSY = 16    # Interface claimed by another process
 
 
@@ -103,25 +88,43 @@ class PyUsbBulkTransport(BulkTransport):
     """
 
     def __init__(self, vid: int, pid: int,
-                 serial: str | None = None) -> None:
+                 serial: str | None = None, unit: str = "") -> None:
         self._vid = vid
         self._pid = pid
         self._serial = serial
+        #: Which physical unit, when several of the model are plugged in
+        #: (#287).  Empty means "the only one", which is every normal user.
+        self._unit = unit
         self._device: Any = None
         self._is_open = False
         self._ep_out: int | None = None
         self._ep_in: int | None = None
-        log.debug("PyUsbBulkTransport.__init__: %04x:%04x serial=%s",
-                  vid, pid, serial or "(any)")
+        log.debug("PyUsbBulkTransport.__init__: %04x:%04x serial=%s unit=%s",
+                  vid, pid, serial or "(any)", unit or "(only)")
 
-    def open(self) -> bool:
-        kwargs: dict[str, Any] = {'idVendor': self._vid, 'idProduct': self._pid}
+    def _find(self) -> Any:
+        """This transport's device, or None: its own unit when one is named.
+
+        A named unit is never satisfied by "whichever one libusb lists first"
+        — that is the bug (#287).  Missing means unplugged or moved, and the
+        sibling would be the wrong panel, or one another program holds.
+        """
+        if self._unit:
+            log.debug("_find: %04X:%04X at unit %s",
+                      self._vid, self._pid, self._unit)
+            return find_unit(self._vid, self._pid, self._unit)
+        kwargs: dict[str, Any] = {'idVendor': self._vid,
+                                  'idProduct': self._pid}
         if self._serial:
             kwargs['serial_number'] = self._serial
+        log.debug("_find: %04X:%04X (the only one)", self._vid, self._pid)
+        return usb_find(**kwargs)
 
-        self._device = usb_find(**kwargs)
+    def open(self) -> bool:
+        self._device = self._find()
         if self._device is None:
-            log.error("USB device %04X:%04X not found", self._vid, self._pid)
+            log.error("USB device %04X:%04X not found%s", self._vid, self._pid,
+                      f" at unit {self._unit}" if self._unit else "")
             return False
 
         # 1. Detach kernel drivers from interfaces 0..3.  USB cooler
@@ -142,8 +145,7 @@ class PyUsbBulkTransport(BulkTransport):
         except usb.core.USBError as e:
             if e.errno == _ERRNO_EACCES:
                 raise PermissionError_(
-                    f"USB access denied for {self._vid:04X}:{self._pid:04X} — "
-                    "check udev rules or run 'trcc system setup'"
+                    f"USB access denied for {self._vid:04X}:{self._pid:04X}"
                 ) from e
             log.warning(
                 "%04X:%04X: set_configuration failed (%s) — "
@@ -228,8 +230,11 @@ class PyUsbBulkTransport(BulkTransport):
         forces the kernel to re-enumerate; we then have to re-find
         because the original handle is now invalid, and re-detach
         kernel drivers on the new handle (the kernel will have
-        re-attached them during enumeration).
+        re-attached them during enumeration).  Re-found by the same rule as
+        :meth:`open`, so a reset of one twin never binds the other.
         """
+        log.info("_reset_and_refind: %04X:%04X unit=%s",
+                 self._vid, self._pid, self._unit or "(only)")
         try:
             self._device.reset()
         except usb.core.USBError as e:
@@ -238,16 +243,12 @@ class PyUsbBulkTransport(BulkTransport):
                 self._vid, self._pid, e,
             )
         time.sleep(_RESET_SETTLE_S)
-        kwargs: dict[str, Any] = {
-            'idVendor': self._vid, 'idProduct': self._pid,
-        }
-        if self._serial:
-            kwargs['serial_number'] = self._serial
-        new_device = usb_find(**kwargs)
+        new_device = self._find()
         if new_device is None:
             raise TransportError(
                 f"USB device {self._vid:04X}:{self._pid:04X} disappeared "
-                "after reset",
+                "after reset"
+                + (f" (unit {self._unit})" if self._unit else ""),
             )
         self._device = new_device
         self._detach_kernel_drivers()
@@ -457,11 +458,64 @@ class _HidBinding(ABC):
         Raises one of :meth:`open_errors` when the device is absent or
         inaccessible."""
 
+    @classmethod
+    @abstractmethod
+    def open_path(cls, path: bytes) -> Any:
+        """Open the ONE handle at *path*, hidapi's own device identifier.
+
+        ``open(vid, pid, serial)`` takes whichever unit hidapi lists first,
+        which is why two identical panels both opened the same one (#287).
+        Both supported bindings can do this — MEASURED: cython-hidapi exposes
+        ``device().open_path``, apmorton's constructor takes ``path=`` — so
+        this is a real abstraction over two real APIs, not a hook for one.
+        """
+
+    @classmethod
+    def path_for_unit(cls, vid: int, pid: int, unit: str) -> bytes | None:
+        """hidapi's path for the *unit* USB port, or ``None``.
+
+        Shared: ``hid.enumerate`` is identical in both bindings, and the
+        entry it returns carries ``bus_type``/``path`` but NOT the USB
+        topology — so the two are matched through PyUSB, which does know the
+        port.  One interface's path is enough, since every interface of one
+        physical device hangs off the same port.
+        """
+        from ._pyusb_find import find_unit
+        if not unit or not HIDAPI_AVAILABLE:
+            return None
+        if find_unit(vid, pid, unit) is None:
+            log.warning("path_for_unit: %04x:%04x is not at unit %s",
+                        vid, pid, unit)
+            return None
+        entries = [e for e in hidapi.enumerate(vid, pid) if e.get("path")]
+        log.info("path_for_unit: %04x:%04x unit=%s -> %d hid interface(s)",
+                 vid, pid, unit, len(entries))
+        if len(entries) <= 1:
+            return entries[0]["path"] if entries else None
+        # More than one unit of this model is present, so the first entry is
+        # exactly the coin-flip this exists to avoid.  Ordering hid's
+        # enumeration against PyUSB's is not a mapping either library
+        # promises, so refuse rather than guess wrong half the time.
+        log.warning(
+            "path_for_unit: %d hid entries for %04x:%04x — cannot say which "
+            "is the unit at %s, so it is not used (#287)",
+            len(entries), vid, pid, unit,
+        )
+        return None
+
 
 class _CythonHidBinding(_HidBinding):
     """PyPI ``hidapi`` (cython-hidapi) — ``hid.device``."""
 
     CLASS_ATTR: ClassVar[str] = "device"
+
+    @classmethod
+    def open_path(cls, path: bytes) -> Any:
+        log.info("_CythonHidBinding.open_path: %s", Blob(path))
+        handle = cls._require_class()()        # ctor takes no useful args
+        handle.open_path(path)
+        handle.set_nonblocking(0)
+        return handle
 
     @classmethod
     def open(cls, vid: int, pid: int, serial: str | None) -> Any:
@@ -477,6 +531,13 @@ class _ApmortonHidBinding(_HidBinding):
     """PyPI ``hid`` (apmorton) — ``hid.Device``, opens in its constructor."""
 
     CLASS_ATTR: ClassVar[str] = "Device"
+
+    @classmethod
+    def open_path(cls, path: bytes) -> Any:
+        log.info("_ApmortonHidBinding.open_path: %s", Blob(path))
+        handle = cls._require_class()(path=path)
+        handle.nonblocking = 0
+        return handle
 
     @classmethod
     def open(cls, vid: int, pid: int, serial: str | None) -> Any:
@@ -495,7 +556,8 @@ class HidApiTransport(BulkTransport):
     """
 
     def __init__(self, vid: int, pid: int,
-                 serial: str | None = None) -> None:
+                 serial: str | None = None, unit: str = "", *,
+                 report_id: int = 0x00) -> None:
         if not HIDAPI_AVAILABLE:
             raise ImportError(
                 "no hid binding installed — install EITHER python-hidapi or "
@@ -507,10 +569,16 @@ class HidApiTransport(BulkTransport):
         self._vid = vid
         self._pid = pid
         self._serial = serial
+        #: Which physical unit (#287); empty means "the only one".
+        self._unit = unit
+        #: The report every write goes out as: 0x00, the default report, for
+        #: the coolers; a device that numbers its reports names its own.
+        self._report_id = report_id
         self._device: Any = None
         self._is_open = False
-        log.debug("HidApiTransport.__init__: %04x:%04x serial=%s",
-                  vid, pid, serial or "(any)")
+        log.debug("HidApiTransport.__init__: %04x:%04x serial=%s unit=%s "
+                  "report=0x%02x", vid, pid, serial or "(any)",
+                  unit or "(only)", report_id)
 
     def open(self) -> bool:
         binding = _HidBinding.detect()
@@ -531,9 +599,26 @@ class HidApiTransport(BulkTransport):
         # time (#267, and a second user on the same panel) -- which is direct
         # evidence that trying again is all it needed.
         last: BaseException | None = None
+        unplaced = False
         for attempt in range(1, _HID_OPEN_ATTEMPTS + 1):
+            path = binding.path_for_unit(self._vid, self._pid, self._unit)
+            # A NAMED unit hidapi cannot place is never opened by vid:pid:
+            # that takes whichever one hidapi lists first -- the twin, or a
+            # panel another program holds (#287).  Retried, since a panel
+            # re-enumerating is briefly absent too.
+            unplaced = path is None and bool(self._unit)
+            if unplaced:
+                log.debug("HidApiTransport.open: unit %s not placeable "
+                          "(attempt %d/%d)", self._unit, attempt,
+                          _HID_OPEN_ATTEMPTS)
+                if attempt < _HID_OPEN_ATTEMPTS:
+                    time.sleep(_HID_OPEN_RETRY_S)
+                continue
             try:
-                self._device = binding.open(self._vid, self._pid, self._serial)
+                self._device = (
+                    binding.open_path(path) if path is not None
+                    else binding.open(self._vid, self._pid, self._serial)
+                )
                 if attempt > 1:
                     log.info("HidApiTransport.open: %04x:%04x opened on "
                              "attempt %d — the panel was re-enumerating",
@@ -547,20 +632,19 @@ class HidApiTransport(BulkTransport):
                               attempt, _HID_OPEN_ATTEMPTS, e, _HID_OPEN_RETRY_S)
                     time.sleep(_HID_OPEN_RETRY_S)
         else:
+            if unplaced:
+                raise TransportError(
+                    f"cannot open HID device {self._vid:04x}:{self._pid:04x} "
+                    f"at unit {self._unit}: hidapi cannot tell it from the "
+                    "other unit, and opening by id would drive that one (#287)")
             # hidapi reports "open failed" for absent, EACCES and a device
-            # mid-reboot alike.  Only name udev when the rules are actually
-            # missing -- #267's report says `[OK] udev-rules installed` while
-            # this message told him to install them, which sends a user to fix
-            # something that is not broken.
-            hint = ("device absent, or missing udev rules "
-                    "(run `trcc system setup`)"
-                    if not _udev_rules_present() else
-                    "udev rules ARE installed, so this is not permissions — "
-                    "the panel may be re-enumerating or held by another "
-                    "process (a running trccd, or another TRCC window)")
+            # mid-reboot alike, so this states what happened and nothing more.
+            # WHY is per-OS knowledge -- udev on Linux, WinUSB on Windows --
+            # and belongs to Platform.permission_denied_hint, which the caller
+            # adds (#173).  It used to name udev here, on every OS.
             raise PermissionError_(
                 f"cannot open HID device {self._vid:04x}:{self._pid:04x} "
-                f"({last}) after {_HID_OPEN_ATTEMPTS} attempts — {hint}"
+                f"({last}) after {_HID_OPEN_ATTEMPTS} attempts"
             ) from last
         self._is_open = True
         return True
@@ -587,9 +671,10 @@ class HidApiTransport(BulkTransport):
             log.warning("HidApiTransport.write: transport not open "
                         "(%04x:%04x)", self._vid, self._pid)
             raise TransportError("Transport not open")
-        # hidapi prepends a report ID byte (0x00 for default); bytes(data)
-        # normalizes any buffer (incl. a memoryview slice) before concat.
-        sent = self._device.write(bytes([0x00]) + bytes(data))
+        # hidapi takes the report ID as the first byte (0x00 for the default
+        # report); bytes(data) normalizes any buffer (incl. a memoryview
+        # slice) before concat.
+        sent = self._device.write(bytes([self._report_id]) + bytes(data))
         frame_log.debug("HidApiTransport.write: %d byte(s) + report id -> %s",
                         len(data), sent)
         return sent

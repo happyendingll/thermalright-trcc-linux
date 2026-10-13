@@ -13,7 +13,6 @@ import pytest
 
 from trcc.app import App
 from trcc.core.commands import ConnectDevice, UploadBootAnimation
-from trcc.core.models import RawFrame
 from trcc.core.ports import Renderer
 
 from .conftest import FakePlatform
@@ -64,9 +63,6 @@ class _AnimRenderer(Renderer):
     def rotate(self, surface: Any, degrees: int) -> Any:
         return surface
 
-    def flip_horizontal(self, surface: Any) -> Any:
-        return surface
-
     def apply_brightness(self, surface: Any, percent: int) -> Any:
         return surface
 
@@ -86,13 +82,6 @@ class _AnimRenderer(Renderer):
 
     def from_raw_rgb24(self, frame: Any) -> Any:
         return _AnimRenderer._Surface(100, 100, b"\x00")
-
-    def to_raw_rgb24(self, surface):
-        # The inverse the port now requires.  Test doubles carry no pixels,
-        # so this reports the surface's DIMENSIONS with blank bytes — enough
-        # for a caller that only needs a correctly-sized RawFrame.
-        w, h = self.surface_size(surface)
-        return RawFrame(data=bytes(w * h * 3), width=w, height=h)
 
     def decode_image(self, data: bytes) -> Any:
         return _AnimRenderer._Surface(100, 100, b"\x00")
@@ -160,12 +149,15 @@ def test_returns_error_for_unknown_key(
 def test_rejects_non_scsi_device(tmp_path: Path) -> None:
     """A HID device (0416:5302) must reject boot animation — SCSI-only feature.
 
-    Type-gate hits *before* the connected-check, so we don't need a fake
-    handshake — attach() alone is enough to trigger the bail-out.
+    ``UploadBootAnimation`` uses its device, so dispatch connects it first; the
+    mock scripts a HID handshake, and the type-gate refuses after it — as on
+    real hardware.
     """
-    platform = FakePlatform(tmp_path)
+    from tests.mock_platform import MockPlatform
+
+    platform = MockPlatform([{"vid": "0416", "pid": "5302", "pm": 128,
+                              "sub": 1}], tmp_path)
     app = App(platform=platform, renderer=_AnimRenderer())
-    app.attach(0x0416, 0x5302)              # HID Type 2 — not SCSI
 
     frames = _make_frames(tmp_path, 1)
     result = app.dispatch(UploadBootAnimation(

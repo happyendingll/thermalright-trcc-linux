@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, ClassVar, Generic, TypeVar
+from dataclasses import fields
+from typing import TYPE_CHECKING, ClassVar, Generic, TypeVar, cast, get_args
 
+from ..models import Capability
 from ..results import (
     Result,
 )
@@ -42,9 +44,55 @@ class Command(ABC, Generic[R_co]):
     """
 
     LOG_LEVEL: ClassVar[int] = logging.INFO
+    #: The Command acts on ``self.key``'s device, so ``App.dispatch`` connects
+    #: it first -- for every UI.  Each UI used to decide that for itself (the
+    #: CLI before 21 commands, the API before 9 routes, 6 routes not at all),
+    #: which is how a verb that worked in the CLI failed over the API.
+    #: One-shot Commands only: a per-tick one would retry a USB connect at
+    #: frame rate while a panel is unplugged; hotplug and the play loops own
+    #: reconnecting those.
+    USES_DEVICE: ClassVar[bool] = False
+    #: Runs in the CALLER's process, never the shared App's -- for every UI.
+    #: The App is a detached process with no terminal and its own working
+    #: directory, so a Command that is ABOUT that process (stop it, report
+    #: whether it runs), needs the user's terminal (``sudo``), or must work
+    #: while the App is hung (the debug report) cannot run inside it.  Measured
+    #: through the App: ``daemon-status`` STARTED one to answer, ``sudo`` could
+    #: not prompt, and ``report`` failed after 37.6 s against a hung App.
+    RUNS_IN_CALLER: ClassVar[bool] = False
+    #: What ``self.key``'s device must be able to do, or None.  ``App.dispatch``
+    #: refuses the Command, before it runs, for a device that provably lacks it.
+    #: Declared per Command rather than "is it an LCD": an LED took ``LoadTheme``
+    #: and ``SetBackground`` and wrote LCD settings under its key, and a device
+    #: that is neither (TR-VISION) has its own set.
+    REQUIRES: ClassVar[Capability | None] = None
+    #: The Command waits on the PERSON, not the machine -- a password prompt
+    #: -- so a client waits for its answer as long as the App does, instead of
+    #: the transport's usual limit.  The App's own wait always ends: the
+    #: person answers, closes the prompt, or there is no prompt to show.
+    WAITS_ON_USER: ClassVar[bool] = False
 
     @abstractmethod
     def execute(self, app: App) -> R_co: ...
+
+    def refusal(self, message: str) -> R_co:
+        """This Command's own Result, ``ok=False`` with *message*."""
+        result_cls = result_type(type(self))
+        names = {f.name for f in fields(result_cls)}
+        extra = {"key": getattr(self, "key", "")} if "key" in names else {}
+        log.info("%s.refusal: %s", type(self).__name__, message)
+        return cast("R_co", result_cls(ok=False, message=message, **extra))
+
+
+def result_type(cls: type) -> type[Result]:
+    """The Result a Command class is parameterised on -- ``Command[XResult]``."""
+    for klass in cls.__mro__:
+        for base in getattr(klass, "__orig_bases__", ()):
+            for arg in get_args(base):
+                if isinstance(arg, type) and issubclass(arg, Result):
+                    return arg
+    log.debug("result_type: %s declares none — the base Result", cls.__name__)
+    return Result
 
 
 class Query(Command[R_co]):

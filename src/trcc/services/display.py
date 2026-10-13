@@ -21,11 +21,16 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from ..core.geometry import content_is_portrait, fit_rect_for_mode, plan_orientation
+from ..core.geometry import (
+    content_is_portrait,
+    fit_rect_for_mode,
+    oriented_canvas,
+    plan_orientation,
+)
 from ..core.logs import per_frame
 from ..core.models import (
     MEDIA,
@@ -78,28 +83,13 @@ def _is_widescreen_split(visual_size: tuple[int, int]) -> bool:
     """True when ``visual_size`` is a widescreen panel that supports
     the Dynamic Island split overlay.  Gates ``_composite_split_overlay``
     so non-widescreen devices skip the load+composite entirely.
+
+    Per-frame logger: it ran only while ``split_mode`` was non-zero until the
+    default became 2, and from then on EVERY panel evaluates it every frame
+    (``test_diagnostics`` measured 1.00 record/frame at default verbosity).
     """
-    log.debug("_is_widescreen_split: visual_size=%s", visual_size)
+    frame_log.debug("_is_widescreen_split: visual_size=%s", visual_size)
     return visual_size in _WIDESCREEN_SPLIT_RESOLUTIONS
-
-
-def _cutout_is_right_side(
-    info: ProductInfo, visual_size: tuple[int, int],
-) -> bool:
-    """True when the device's PanelCutout sits past the canvas midline.
-
-    Mirrors legacy ``RenderPipeline._cutout_is_right_side`` — the
-    Levita SKU has its camera cutout on the right side of the panel,
-    so the left-side split assets need a horizontal flip.  Devices
-    without a PanelCutout (or whose cutout is left-of-midline) keep
-    the assets as-authored.
-    """
-    log.debug("_cutout_is_right_side: info=%s visual_size=%s", info, visual_size)
-    cutout = info.panel_cutout
-    if cutout is None:
-        return False
-    w, _ = visual_size
-    return cutout.x + cutout.w // 2 > w // 2
 
 
 # =========================================================================
@@ -122,7 +112,10 @@ class SceneCache:
     misses a cache of one on every tick because its cursor is part of
     the key.  It lives in ``BgMaskCache`` instead, which holds a bounded
     cycle of them.  One layer, one owner: a second copy here would be a
-    second answer to "what background is current".
+    second answer to "what background is current".  ``background`` is not
+    a copy and never serves a build: it is the very surface the last frame
+    was drawn on, kept so the RGB follower can read the picture without
+    the overlay's text (``background_surface``).
     """
 
     # overlay layer
@@ -132,13 +125,17 @@ class SceneCache:
     # Final wire-bytes cache — keyed on the full pipeline inputs so a
     # tick with no changes returns identical bytes without re-encoding.
     frame_key: tuple[Any, ...] | None = None
-    frame_bytes: bytes | None = None
+    frame_bytes: bytes | None = field(default=None, repr=False)
 
     # The final composited + rotated surface, captured just before the
     # wire encode.  The GUI preview reuses THIS instead of re-running the
     # whole pipeline a second time per tick (see ``rendered_surface``) —
     # it's byte-for-byte what the device received.
     preview_surface: Any = None
+
+    # The background (+ mask) layer the last frame was drawn on -- the frame
+    # without its overlay text.  See ``background_surface``.
+    background: Any = None
 
 
 # =========================================================================
@@ -184,13 +181,17 @@ class DisplayService:
         # Cache of loaded split-overlay surfaces keyed by
         # (style, rotation, mirrored).  Loaded lazily on first
         # widescreen render so non-Levita devices pay nothing.
-        self._split_cache: dict[tuple[int, int, bool], Any] = {}
-        # Per-device scene-cache hit/miss state — used to log INFO on
-        # TRANSITION only (matches Phase-0's ``_log_tick_skip``
-        # shape).  Per-tick HIT/MISS stays at DEBUG so 15 fps doesn't
-        # flood the log; transitions surface "froze on first frame"
-        # regressions in one grep.
-        self._cache_state: dict[str, tuple[bool, bool]] = {}
+        self._split_cache: dict[str, Any] = {}
+        # Per-device BACKGROUND cache hit/miss, logged on a flip only:
+        # a flip is what surfaces "froze on first frame" in one grep.
+        self._cache_state: dict[str, bool] = {}
+        # Per-device overlay layout last announced (theme, source, element
+        # count, switch), so build_overlay names its layout when it CHANGES
+        # instead of on every sensor tick.
+        self._overlay_layout: dict[str, tuple[str, str, int, bool]] = {}
+        # What each one-shot diagnostic last said, per (topic, device): a
+        # screen cast repeats them ~16 times a second, a single send once.
+        self._said: dict[tuple[str, str], object] = {}
         #: Devices whose profile came from a FALLBACK, so ``_resolve_profile``
         #: announces each one once instead of once per frame.
         self._profile_fallbacks: set[str] = set()
@@ -296,17 +297,9 @@ class DisplayService:
             s.orientation, s.brightness,
         )
 
-        clock = compute_clock(
-            time_format=s.time_format,
-            date_format=s.date_format,
-            language=self._settings.app.language,
-        )
-        frame_log.debug(
-            "build_frame %s: clock=%s (time_format=%s date_format=%s lang=%s)",
-            info.key, sorted(clock.keys()),
-            s.time_format, s.date_format,
-            self._settings.app.language,
-        )
+        clock = compute_clock(language=self._settings.app.language)
+        frame_log.debug("build_frame %s: clock=%s (lang=%s)", info.key, clock,
+                        self._settings.app.language)
 
         scene = self._scenes.get(info.key)
         bg_key = self._bg_mask_key(info, theme, visual_size)
@@ -353,19 +346,18 @@ class DisplayService:
         # Compose: bg+mask below, overlay on top
         surface = self._r.composite(bg_surface, overlay_surface, position=(0, 0))
 
-        # Split-mode overlay (Dynamic Island) — Levita / 1600x720
-        # widescreen only.  Picks an asset by (split_mode, rotation),
-        # mirrors it horizontally when the panel's cutout sits on the
-        # right side (PanelCutout from the variant override).  No-op
-        # when split_mode==0 or the LCD isn't widescreen.
+        # Split-mode overlay (Dynamic Island) — 1600x720 widescreen only.
+        # Picks an asset by (split_mode, rotation, SUB byte), as the C# does.
+        # No-op when split_mode==0 or the LCD isn't widescreen.
         if s.split_mode and _is_widescreen_split(visual_size):
             surface = self._composite_split_overlay(
-                info, s.split_mode, s.orientation, visual_size, surface,
+                info, s.split_mode, s.orientation,
+                profile.sub if profile is not None else 0, surface,
             )
 
         # Brightness dim (before rotation — matches C# order)
         if s.brightness != 100:
-            log.debug("build_frame %s: applying brightness %d%%",
+            frame_log.debug("build_frame %s: applying brightness %d%%",
                       info.key, s.brightness)
             surface = self._r.apply_brightness(surface, s.brightness)
 
@@ -386,7 +378,7 @@ class DisplayService:
             self._scenes[info.key] = SceneCache(
                 overlay_surface=overlay_surface, overlay_key=overlay_key,
                 frame_key=frame_key, frame_bytes=encoded,
-                preview_surface=preview_surface,
+                preview_surface=preview_surface, background=bg_surface,
             )
             return encoded
 
@@ -442,7 +434,7 @@ class DisplayService:
         self._scenes[info.key] = SceneCache(
             overlay_surface=overlay_surface, overlay_key=overlay_key,
             frame_key=frame_key, frame_bytes=encoded,
-            preview_surface=preview_surface,
+            preview_surface=preview_surface, background=bg_surface,
         )
         return encoded
 
@@ -462,7 +454,7 @@ class DisplayService:
         + device-side rotation so what the preview shows matches what
         the device would receive byte-for-byte.
         """
-        log.debug("build_preview_surface: key=%s theme=%s",
+        frame_log.debug("build_preview_surface: key=%s theme=%s",
                   info.key, theme.name)
         resolved_profile = self._resolve_profile(info, profile)
         s = self._settings.for_device(info.key)
@@ -474,11 +466,7 @@ class DisplayService:
             self._content_is_portrait(theme, resolved_profile, s),
         )
 
-        clock = compute_clock(
-            time_format=s.time_format,
-            date_format=s.date_format,
-            language=self._settings.app.language,
-        )
+        clock = compute_clock(language=self._settings.app.language)
 
         # Same cache lookup as build_frame so a preview tick doesn't
         # invalidate it for the wire path.
@@ -494,6 +482,7 @@ class DisplayService:
         )
         self._scenes[info.key] = SceneCache(
             overlay_surface=overlay_surface, overlay_key=overlay_key,
+            background=bg_surface,
         )
 
         surface = self._r.composite(bg_surface, overlay_surface, position=(0, 0))
@@ -505,7 +494,7 @@ class DisplayService:
             # into the portrait buffer as one unit, so the preview shows that
             # same spin — there is no upright portrait layout to show instead.
             # (The C# would draw solid black here; we do better on purpose.)
-            log.debug("build_preview_surface %s: post_rotate %d° "
+            frame_log.debug("build_preview_surface %s: post_rotate %d° "
                       "(landscape theme at a portrait angle)",
                       info.key, post_rotate)
             return self._r.rotate(surface, post_rotate)
@@ -513,10 +502,32 @@ class DisplayService:
         # canvas but never turns the picture — see build_frame for the C# call
         # sites.  Logged with the angle that did NOT move it, so a report can
         # prove which behaviour the user was running.
-        log.debug("build_preview_surface %s: composed upright, orientation=%d "
+        frame_log.debug("build_preview_surface %s: composed upright, orientation=%d "
                   "not applied to the preview (wire-only)",
                   info.key, s.orientation)
         return surface
+
+    def _reuse_or_build_overlay(
+        self,
+        info: ProductInfo,
+        theme: Theme,
+        sensors: dict[str, float],
+        visual_size: tuple[int, int],
+        clock: dict[str, str],
+        scene: SceneCache | None,
+        overlay_key: tuple[Any, ...],
+    ) -> tuple[Any, bool]:
+        """The overlay drawn for *overlay_key*: the scene's if it is that one.
+
+        The text, metric and clock layer changes when a reading, the clock or
+        the layout does -- every couple of seconds -- while a frame goes out
+        15-16 times a second.  One rule for the theme render and the cast.
+        """
+        if scene is not None and scene.overlay_key == overlay_key:
+            frame_log.debug("_reuse_or_build_overlay %s: reused", info.key)
+            return scene.overlay_surface, True
+        frame_log.debug("_reuse_or_build_overlay %s: drawing", info.key)
+        return self._build_overlay(info, theme, sensors, visual_size, clock), False
 
     def _resolve_bg_overlay(
         self,
@@ -572,13 +583,8 @@ class DisplayService:
             bg_cache.put(bg_key, bg_surface, nbytes,
                          working_set_bytes=frames * nbytes)
 
-        overlay_hit = scene is not None and scene.overlay_key == overlay_key
-        if overlay_hit:
-            overlay_surface = scene.overlay_surface   # type: ignore[union-attr]
-        else:
-            overlay_surface = self._build_overlay(
-                info, theme, sensors, visual_size, clock,
-            )
+        overlay_surface, overlay_hit = self._reuse_or_build_overlay(
+            info, theme, sensors, visual_size, clock, scene, overlay_key)
         # The two-layer decision the whole cache design exists for: a video
         # theme's bg cycles and its overlay moves with the sensors, so the pair
         # is what says whether a tick paid a dict lookup or a JPEG decode plus
@@ -619,12 +625,14 @@ class DisplayService:
         s = self._settings.for_device(info.key)
         # The ORIENTED canvas, not the native one — the canvas and the wire
         # angle are one pair (see ``_orient_for_wire``).
-        target_w, target_h = plan_orientation(
-            resolved, s.orientation, False).canvas
+        target_w, target_h = oriented_canvas(resolved, s.orientation)
         # Surface is opaque RGB; alpha not needed for solid fill.
         surface = self._r.create_surface(
             target_w, target_h, color=(*color, 255))
-        surface = self._apply_post_processing(surface, s, resolved)
+        # SendColor holds the panel like an image push, so the preview is this
+        # colour — without it /preview showed the dropped theme's last frame.
+        self._remember_preview(info.key, surface)
+        surface = self._apply_post_processing(surface, s, resolved, info.key)
         surface = self._orient_for_wire(surface, s, resolved, info)
         return self._encode_for_wire(surface, resolved)
 
@@ -660,21 +668,18 @@ class DisplayService:
         capture is then sent bare, which is the old behaviour and still beats
         dropping the frame.
 
-        **Geometry is deliberately untouched.**  The canvas stays
-        ``plan_orientation(..., False).canvas`` and rotation stays
-        ``_orient_for_wire``, so the wire bytes are unchanged on every panel
-        at every orientation.  The oracle composes on the ORIENTED canvas
-        instead (``GIFSize`` transposes at 90/270 for non-square panels,
-        FormCZTV.cs:3430-3512), which is a real divergence on 6 FBLs — but it
-        is coupled to the capture aspect, which the region picker does not yet
-        transpose, and changing both belongs in its own verified step.
+        **Geometry is the C#'s.**  The canvas is ``oriented_canvas`` -- the
+        oracle's ``GIFSize``, which it sizes to the capture box's own shape
+        and stretches the grab into (FormCZTV.cs:3100-3557) -- and rotation
+        is ``_orient_for_wire``.  A cast is a background, so at 90/270 it
+        takes the portrait-theme route; ``test_cast_takes_the_portrait_route``
+        holds it byte-identical to a portrait theme with the same picture.
         """
-        log.debug("build_screencast_frame: key=%s theme=%s",
-                  info.key, theme.name if theme else None)
+        frame_log.debug("build_screencast_frame: key=%s theme=%s",
+                        info.key, theme.name if theme else None)
         resolved = self._resolve_profile(info, profile)
         s = self._settings.for_device(info.key)
-        target_w, target_h = plan_orientation(
-            resolved, s.orientation, False).canvas
+        target_w, target_h = oriented_canvas(resolved, s.orientation)
 
         surface = self._r.from_raw_rgb24(frame)
         if (
@@ -684,14 +689,10 @@ class DisplayService:
 
         if theme is not None:
             surface = self._composite_mask(info, s, theme, surface)
-            clock = compute_clock(
-                time_format=s.time_format,
-                date_format=s.date_format,
-                language=self._settings.app.language,
-            )
-            overlay = self._build_overlay(
-                info, theme, sensors or {}, (target_w, target_h), clock)
-            surface = self._r.composite(surface, overlay, position=(0, 0))
+            surface = self._r.composite(
+                surface,
+                self._scene_overlay(info, theme, (target_w, target_h), sensors),
+                position=(0, 0))
 
         # Audio spectrum LAST, over everything, because it is a live meter
         # rather than part of the picture — the same order the gui's tick drew
@@ -711,13 +712,85 @@ class DisplayService:
         #
         # It has to be published or the preview shows a DIFFERENT PICTURE from
         # the panel: the gui painted its preview straight from the raw grab
-        # (``lcd_handler.on_screencast_frame``), so once the wire frame gained
+        # (its old capture tick), so once the wire frame gained
         # the mask and the metrics, the LCD had them and the preview did not.
         self._remember_preview(info.key, surface)
 
-        surface = self._apply_post_processing(surface, s, resolved)
+        surface = self._apply_post_processing(surface, s, resolved, info.key)
         surface = self._orient_for_wire(surface, s, resolved, info)
         return self._encode_for_wire(surface, resolved)
+
+    def build_game_frame(
+        self,
+        *,
+        info: ProductInfo,
+        theme: Theme | None,
+        sensors: dict[str, float] | None = None,
+        profile: DeviceProfile | None = None,
+    ) -> bytes:
+        """Encode game mode's frame: the overlay alone, on black.
+
+        The C# turns the background and the mask off, draws, and turns them
+        back on (FormCZTV.cs:2880-2891); its canvas starts black
+        (UCScreenImage.cs:903) and brightness still applies
+        (UCScreenImage.cs:1222).  So: the oriented canvas, black, the theme's
+        overlay, and the same preview and wire tail as every other frame.
+        With no theme there is nothing to draw on the black.
+        """
+        frame_log.debug("build_game_frame: key=%s theme=%s",
+                        info.key, theme.name if theme else None)
+        resolved = self._resolve_profile(info, profile)
+        s = self._settings.for_device(info.key)
+        size = oriented_canvas(resolved, s.orientation)
+        surface = self._r.create_surface(*size, color=(0, 0, 0, 255))
+        if theme is not None:
+            surface = self._r.composite(
+                surface, self._scene_overlay(info, theme, size, sensors),
+                position=(0, 0))
+        self._remember_preview(info.key, surface)
+        surface = self._apply_post_processing(surface, s, resolved, info.key)
+        surface = self._orient_for_wire(surface, s, resolved, info)
+        return self._encode_for_wire(surface, resolved)
+
+    def _scene_overlay(
+        self,
+        info: ProductInfo,
+        theme: Theme,
+        size: tuple[int, int],
+        sensors: dict[str, float] | None,
+    ) -> Any:
+        """The theme's text, metric and clock layer at *size*, kept in the
+        device's scene so a frame source that sends many times between two
+        sensor readings draws it once.
+
+        The cast drew every element again on every frame -- ~16 times a
+        second for numbers that change every two seconds -- until it kept its
+        overlay in the scene like a theme render; game mode does the same.
+        """
+        clock = compute_clock(language=self._settings.app.language)
+        readings = sensors or {}
+        overlay_key = self._overlay_key(info, theme, size, readings, clock)
+        scene = self._scenes.get(info.key)
+        overlay, reused = self._reuse_or_build_overlay(
+            info, theme, readings, size, clock, scene, overlay_key)
+        frame_log.debug("_scene_overlay: key=%s %dx%d reused=%s",
+                        info.key, *size, reused)
+        if not reused:
+            self._scenes[info.key] = (
+                replace(scene, overlay_surface=overlay,
+                        overlay_key=overlay_key) if scene is not None
+                else SceneCache(overlay_surface=overlay,
+                                overlay_key=overlay_key))
+        return overlay
+
+    def _sink(self, topic: tuple[str, str], value: object) -> logging.Logger:
+        """The plain logger when *value* changed since last said, else the
+        per-frame family: a cast repeats these every frame, a send says
+        them once."""
+        changed = self._said.get(topic) != value
+        self._said[topic] = value
+        frame_log.debug("_sink: %s changed=%s", topic, changed)
+        return log if changed else frame_log
 
     def _remember_preview(self, key: str, surface: Any) -> None:
         """Park *surface* where :meth:`rendered_surface` will find it.
@@ -731,8 +804,11 @@ class DisplayService:
         """
         frame_log.debug("_remember_preview: key=%s", key)
         scene = self._scenes.get(key)
+        # Not drawn on a theme's background: an earlier theme's must not be
+        # taken for this frame's (``background_surface``).
         self._scenes[key] = (
-            replace(scene, preview_surface=surface) if scene is not None
+            replace(scene, preview_surface=surface, background=None)
+            if scene is not None
             else SceneCache(overlay_surface=None, overlay_key=(),
                             preview_surface=surface)
         )
@@ -760,15 +836,18 @@ class DisplayService:
         resolved = self._resolve_profile(info, profile)
         s0 = self._settings.for_device(info.key)
         # The ORIENTED canvas, not the native one — see ``_orient_for_wire``.
-        target_w, target_h = plan_orientation(
-            resolved, s0.orientation, False).canvas
+        target_w, target_h = oriented_canvas(resolved, s0.orientation)
 
         surface = self._r.open_image(path)
         if self._r.surface_size(surface) != (target_w, target_h):
             surface = self._r.resize(surface, target_w, target_h)
+        # The pushed image IS the panel now (SendImage drops the active theme),
+        # so the preview is this surface — parked where the screencast frame
+        # parks its own, before the wire-only brightness and rotation.
+        self._remember_preview(info.key, surface)
 
         s = self._settings.for_device(info.key)
-        surface = self._apply_post_processing(surface, s, resolved)
+        surface = self._apply_post_processing(surface, s, resolved, info.key)
         surface = self._orient_for_wire(surface, s, resolved, info)
         return self._encode_for_wire(surface, resolved)
 
@@ -777,6 +856,7 @@ class DisplayService:
         surface: Any,
         s: DeviceSettings,
         resolved: DeviceProfile,
+        key: str,
     ) -> Any:
         """Apply user brightness, user orientation, and device-side rotation.
 
@@ -796,7 +876,8 @@ class DisplayService:
         caller now pairs this with that method, so there is one wire-rotation
         authority rather than a per-caller model.
         """
-        log.debug("_apply_post_processing: brightness=%d", s.brightness)
+        sink = self._sink(("brightness", key), s.brightness)
+        sink.debug("_apply_post_processing: brightness=%d", s.brightness)
         if s.brightness != 100:
             surface = self._r.apply_brightness(surface, s.brightness)
         return surface
@@ -814,32 +895,21 @@ class DisplayService:
         gets a 480x854 frame under an 854x480 header, and the firmware paints
         only the overlap (#262).
 
-        ``portrait_content=False``: these callers scale a supplied image onto
-        the device canvas rather than loading an authored portrait theme, so
-        the content is native-shaped by construction.
-
-        ``wire_angle`` ALONE, deliberately.  A ``post_rotate`` branch was
-        drafted here on the reasoning that ``plan_orientation`` answers 90/270
-        with post_rotate while leaving ``wire_angle`` at 0/180, so the latter
-        would emit 320x240 under a 240x320 header.  MEASURED 2026-08-19: it
-        does not.  On the 6 base-90 profiles (50/51/52/53/58 at 320x240, 64 at
-        640x480) -- the only 12 (panel, angle) pairs where post_rotate is
-        non-zero at all with ``portrait_content=False`` -- ``wire_angle``
-        answers **270 at 90deg and 90 at 270deg**, not 0/180.  Both swap the
-        axes, so the two paths emit the SAME shape on every live pair and the
-        branch changed no dimension anywhere.
-
-        What it did change is the rotation DIRECTION on those 12 pairs, by
-        180deg, for ``build_image_frame`` and ``build_screencast_frame``.
-        Whether the table's direction or post_rotate's is the one the glass
-        wants is a real question, but it is a direction question on the
-        base-90 family -- ``ENCODE_ROTATIONS`` territory, hardware-gated with
-        #169/#203 -- and no shape gate can see it.  It does not belong in a
-        shape fix, so it is not here.
+        ``wire_angle`` ALONE, deliberately, with no ``post_rotate``: these
+        callers compose on ``oriented_canvas``, which is upright at every angle
+        (the portrait canvas at 90/270), and the wire owns all rotation --
+        the route an authored portrait theme takes in ``build_frame``.  The
+        question once recorded here as hardware-gated -- landscape canvas plus
+        ``wire_angle``, or ``post_rotate``, on the base-90 panels -- was the
+        wrong question: the C# composes neither way.  Its ``GIFSize`` is
+        portrait at 90/270 and ``ImageTo565`` turns it 0 / 180 relative to the
+        0-degree frame's 90, the same steps our portrait route takes
+        (FormCZTV.cs:3518-3533, :4236-4243).  Settled 2026-09-30.
         """
         angle = wire_angle(resolved, s.orientation, False)
-        log.debug("_orient_for_wire %s: orientation=%d → wire %d°",
-                  info.key, s.orientation, angle)
+        sink = self._sink(("wire angle", info.key), (s.orientation, angle))
+        sink.debug("_orient_for_wire %s: orientation=%d → wire %d°",
+                   info.key, s.orientation, angle)
         if angle % 360:
             surface = self._r.rotate(surface, angle)
         return surface
@@ -856,6 +926,21 @@ class DisplayService:
         surface = scene.preview_surface if scene is not None else None
         frame_log.debug("rendered_surface: key=%s available=%s",
                   key, surface is not None)
+        return surface
+
+    def background_surface(self, key: str) -> Any | None:
+        """The background (+ mask) the last frame for *key* was drawn on --
+        the picture without the overlay's text -- or None.
+
+        What the RGB follower samples: a theme's clock and readings are
+        white text, and a light following the picture should take the
+        video's colours, not the digits'.  Upright, before brightness and
+        any wire rotation.
+        """
+        scene = self._scenes.get(key)
+        surface = scene.background if scene is not None else None
+        frame_log.debug("background_surface: key=%s available=%s", key,
+                        surface is not None)
         return surface
 
     def _bg_cache(self, key: str) -> BgMaskCache:
@@ -887,6 +972,7 @@ class DisplayService:
         # this key logs INFO when the cache state first appears
         # post-invalidation (instead of comparing against stale state).
         self._cache_state.pop(key, None)
+        self._overlay_layout.pop(key, None)
 
     def invalidate_all(self) -> None:
         log.info("invalidate_all: scenes=%d bg_caches=%d",
@@ -894,30 +980,31 @@ class DisplayService:
         self._scenes.clear()
         self._bg_caches.clear()
         self._cache_state.clear()
+        self._overlay_layout.clear()
 
     def _log_cache_transition(self, key: str, bg_hit: bool,
                               ovl_hit: bool) -> None:
-        """Log on the first call AND every cache state flip per device.
+        """Log the first background-cache state per device, and every flip.
 
-        DEBUG, not INFO: on animated / cloud-background content the state flips
-        EVERY frame, so at INFO this floods the log and scrolls the once-per-
-        connect handshake line (PM/SUB/resolution) out of the report's tail.
-        The "frozen on frame N" diagnostic (a missing flip) is still here at
-        ``-v``; per-tick HIT/MISS already logs at DEBUG in ``build_frame``.
+        The OVERLAY state is reported but is not part of the transition: it
+        MISSes on every new sensor reading and HITs on the next frame by
+        design, so keying on it logged two "flips" per sensor tick on any
+        playing video -- 4.6% of a real log, every one of them expected.
         """
-        new_state = (bg_hit, ovl_hit)
-        prev_state = self._cache_state.get(key)
-        if prev_state == new_state:
+        prev = self._cache_state.get(key)
+        if prev == bg_hit:
+            frame_log.debug("build_frame %s: bg=%s overlay=%s", key,
+                            "HIT" if bg_hit else "MISS",
+                            "HIT" if ovl_hit else "MISS")
             return
         log.debug(
-            "build_frame %s: cache state %s → bg=%s overlay=%s",
+            "build_frame %s: background cache %s → %s (overlay %s)",
             key,
-            "(first)" if prev_state is None
-            else f"bg={prev_state[0]} overlay={prev_state[1]}",
+            "(first)" if prev is None else ("HIT" if prev else "MISS"),
             "HIT" if bg_hit else "MISS",
             "HIT" if ovl_hit else "MISS",
         )
-        self._cache_state[key] = new_state
+        self._cache_state[key] = bg_hit
 
     # ── One-off encoding (used by Commands that bypass the scene cache) ──
 
@@ -925,20 +1012,23 @@ class DisplayService:
         self,
         image_path: Path,
         resolution: tuple[int, int],
+        byte_order: str,
     ) -> bytes:
         """Encode one image to RGB565 bytes at the given resolution.
 
         Used by UploadBootAnimation — boot-animation frames are always
-        RGB565 regardless of the device's normal wire format, and the
-        firmware applies its own rotation, so we skip both the JPEG
-        branch and the profile's portrait-rotation step.
+        RGB565 regardless of the device's normal wire format, so we skip
+        the JPEG branch and the profile's portrait-rotation step.
+        *byte_order* is the panel's: ``GifTo565`` packs big-endian only for
+        320x320 and SPI mode 2 (FormCZTV.cs:2027), and a fixed ``>`` sent
+        FBL 36/37/50 panels their boot animation with colours swapped.
         """
-        log.info("encode_boot_anim_frame: path=%s resolution=%dx%d",
-                 image_path, *resolution)
+        log.info("encode_boot_anim_frame: path=%s resolution=%dx%d order=%s",
+                 image_path, *resolution, byte_order)
         surface = self._r.open_image(image_path)
         if self._r.surface_size(surface) != resolution:
             surface = self._r.resize(surface, *resolution)
-        return self._r.encode_rgb565(surface)
+        return self._r.encode_rgb565(surface, byte_order)
 
     def encode_png(self, surface: Any) -> bytes:
         """PNG-encode a preview surface (lossless — API preview snapshot).
@@ -946,12 +1036,17 @@ class DisplayService:
         A public encode seam over the Renderer so callers (the preview
         routes) don't reach the private ``_r``.
         """
-        log.debug("encode_png: encoding preview surface")
+        frame_log.debug("encode_png: encoding preview surface")
         return self._r.encode_png(surface)
+
+    def raw_argb32(self, surface: Any) -> tuple[bytes, int, int, int]:
+        """A preview surface's raw pixels, for a window on the same machine."""
+        frame_log.debug("raw_argb32")
+        return self._r.raw_argb32(surface)
 
     def encode_jpeg(self, surface: Any, quality: int = 95) -> bytes:
         """JPEG-encode a preview surface (the WebSocket preview stream)."""
-        log.debug("encode_jpeg: quality=%d", quality)
+        frame_log.debug("encode_jpeg: quality=%d", quality)
         return self._r.encode_jpeg(surface, quality)
 
     # ── Layer 1: background + mask ────────────────────────────────────
@@ -1260,7 +1355,7 @@ class DisplayService:
             # Rendering is a READ.  ``PlayVideo`` is the single decoder — it
             # owns the decode-size policy (oriented canvas, native for user
             # assets), and every path that wants a video playing dispatches it
-            # (LoadTheme, SetBackground, LoadCloudTheme, RestoreLastTheme).
+            # (LoadTheme, SetBackground, LoadCloudTheme, RestoreDeviceState).
             #
             # This branch used to call ``load_video`` itself, which meant a
             # render could cost a full decode.  Two renders racing (the GUI
@@ -1328,7 +1423,13 @@ class DisplayService:
             "overlay_enabled": s.overlay_enabled,
         }
         layout = overlay_source(s.user_overlay_elements)
-        log.debug(
+        # Which layout a panel draws is the line that diagnoses a missing
+        # clock, so it reaches the file whenever it CHANGES; the identical
+        # repeat on every sensor tick goes to the frame family.
+        announced = (theme.name, layout, len(elements), s.overlay_enabled)
+        sink = log if self._overlay_layout.get(info.key) != announced else frame_log
+        self._overlay_layout[info.key] = announced
+        sink.debug(
             "build_overlay %s: theme=%r layout=%s (%d element(s)) "
             "[theme=%d user=%s] overlay_enabled=%s",
             info.key, theme.name, layout, len(elements),
@@ -1467,19 +1568,24 @@ class DisplayService:
         info: ProductInfo,
         split_mode: int,
         rotation: int,
-        visual_size: tuple[int, int],
+        sub: int,
         surface: Any,
     ) -> Any:
         """Composite the Dynamic Island PNG over ``surface`` (in place).
 
         Picks the asset by ``(split_mode, rotation)`` from
-        ``SPLIT_OVERLAY_MAP``.  Mirrors the asset horizontally when the
-        device's PanelCutout sits past the canvas midline (Levita's
-        cutout is on the right side; the assets are authored for the
-        left side).  Cached after first load so non-Levita devices
-        pay nothing and Levita devices only pay once per (style,
-        rotation, mirrored) tuple.
+        ``SPLIT_OVERLAY_MAP`` — with the C#'s one exception: style 2 on a
+        SUB 3 panel takes the asset 180° round (``UCScreenImage.cs``
+        ``myLddVal == 2 && myLddValSub == 3``; ``myLddValSub = pmSub``,
+        ``FormCZTV.cs:893``).  That panel's wire angle is 180° off its
+        siblings', and the C# compensates by choosing the island, never by
+        flipping it.  This tree used to MIRROR the asset instead, on a cutout
+        position we invented, through a ``QImage.mirrored`` keyword PySide6
+        rejects — so every split-mode frame on that panel raised and the
+        screen froze (#149).  Cached per asset, so each costs one load.
         """
+        if split_mode == 2 and sub == 3:
+            rotation = (rotation + 180) % 360
         asset_name = SPLIT_OVERLAY_MAP.get((split_mode, rotation))
         if asset_name is None:
             log.warning(
@@ -1487,20 +1593,14 @@ class DisplayService:
                 info.key, split_mode, rotation,
             )
             return surface
-        mirrored = _cutout_is_right_side(info, visual_size)
-        cache_key = (split_mode, rotation, mirrored)
-        overlay = self._split_cache.get(cache_key)
+        overlay = self._split_cache.get(asset_name)
         if overlay is None:
             overlay = self._load_split_asset(asset_name)
             if overlay is None:
                 return surface
-            if mirrored:
-                overlay = self._r.flip_horizontal(overlay)
-            self._split_cache[cache_key] = overlay
-            log.info(
-                "split overlay %s: cached (%s, mirrored=%s)",
-                info.key, asset_name, mirrored,
-            )
+            self._split_cache[asset_name] = overlay
+            log.info("split overlay %s: cached %s (style=%d sub=%d)",
+                     info.key, asset_name, split_mode, sub)
         try:
             return self._r.composite(surface, overlay, position=(0, 0))
         except (OSError, ValueError, RuntimeError) as e:

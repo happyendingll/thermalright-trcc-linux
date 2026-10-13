@@ -64,6 +64,11 @@ class DeviceProfile:
     # its native landscape size, so ``resolution`` and the wire header are
     # unchanged.  (#262, #203)
     portrait_mounted: bool = False
+    # The handshake's raw SUB byte (the C#'s ``pmSub`` / ``myLddValSub``).  The
+    # derived answers above are what most consumers want; this is kept for the
+    # ones the C# keys on the byte itself — the Dynamic Island picks a
+    # 180°-offset asset on SUB 3 (UCScreenImage.cs, FormCZTV.cs:893).  (#149)
+    sub: int = 0
     # Resolved device-only encode rotation, applied to the WIRE frame only (not
     # the preview) in _encode_for_wire.  Resolved at handshake from
     # encode_pm_bases via resolve_encode_base() once the PM byte is known.  0 =
@@ -105,6 +110,18 @@ class DeviceProfile:
     # A degraded frame beats a frozen panel, which is what #251 asked for.
     # Only the ceiling and its universality are ported, not the drop.
     max_frame_bytes: int = 450_000
+    # The panel's RGB565 framebuffer row, in pixels, when it is wider than the
+    # encoded frame's row; 0 = the rows match.  Each row is centred in it.
+    # The C#'s ``is640x172`` step in ImageTo565 (FormCZTV.cs:4285): every
+    # 172-px row of the turned frame is copied into a 176-px row 4 bytes in,
+    # a 225280-byte buffer.  Renderer.encode_payload applies it.
+    wire_row_px: int = 0
+    # SUB bytes on which a JPEG panel's firmware takes RGB565 instead.  The C#
+    # picks the encoder on ``myDeviceMode == 2``, and ``FormCZTVInit`` can leave
+    # a panel in mode 3 for one SUB: 2.1.8's fan hub, fbl 54, stays mode 3 at
+    # SUB 4 (FormCZTV.cs:1019) and so takes ``ImageTo565``.  get_profile
+    # applies it before resolving the rotation, which is keyed by encoder.
+    rgb565_subs: frozenset[int] = frozenset()
 
     @property
     def resolution(self) -> tuple[int, int]:
@@ -129,30 +146,44 @@ FBL_PROFILES: dict[int, DeviceProfile] = {
     #          W      H     jpeg    BE      rotate   notes
     36:  DeviceProfile(240,  240),
     37:  DeviceProfile(240,  240),
+    # A Frozen Warframe on the type-2 HID list (UCDevice.cs:463 `case 49: case
+    # 50:`).  No is{W}x{H} flag, so the C# draws its 320x240 fallback
+    # (UCScreenImage.cs:1095) and shares every path with FBL 50 but one:
+    # `mode == 3 && fbl == 49` sets SPIMode=2 (FormCZTV.cs:1069), the
+    # big-endian branch of ImageTo565, sent unchanged through UsbHid.  Missing
+    # until 2026-10-06, so it fell back to 320x320 unrotated (audit G3).
+    # From the C# alone -- no PM 49 panel has been seen on glass.
+    49:  DeviceProfile(320,  240,  big_endian=True, rotate=True),   # HID Type 2 → SPIMode=2
     50:  DeviceProfile(320,  240,  rotate=True),
     51:  DeviceProfile(320,  240,  rotate=True),                    # HID Type 2 → SPIMode=1
     52:  DeviceProfile(320,  240,  rotate=True),                    # BA120 Vision (#100)
     53:  DeviceProfile(320,  240,  rotate=True),                    # HID Type 2 → SPIMode=1
-    54:  DeviceProfile(360,  360,  jpeg=True),
+    54:  DeviceProfile(360,  360,  jpeg=True, rgb565_subs=frozenset({4})),  # CORE VISION SUB 4
     58:  DeviceProfile(320,  240,  rotate=True),                    # AussieMakerGeek's Frozen Warframe SE
     # `mode == 3 && pm == 100 && fbl == 60` -> is176x320 (FormCZTV.cs:1041),
-    # the sibling of the fbl 59 rewrite directly above it in the C#.  The only
-    # family the vendor stores (short, long): its long axis is the HEIGHT,
-    # which `UCTouPingXianShi.cs:370` confirms independently with the aspect
-    # constant 0.55 == 176/320, where every landscape panel there uses
-    # short/long.  RGB565, because the mode-3 route never reaches ImageToJpg
-    # (all four encode sites are guarded `myDeviceMode == 2`), and
+    # the sibling of the fbl 59 rewrite directly above it in the C#.  Stored
+    # (long, short) like every other row, although the C# flag is spelled
+    # short-first: the C# composes it LANDSCAPE at 0 degrees -- the `320176`
+    # catalog (:1289-1311), GIFSize 320x176 (:3160) -- and turns it 90 into
+    # the wire like the 320x240 family (ImageTo565's default arm, :4236).
+    # The W/H lock constant 0.55 == 176/320 (`UCTouPingXianShi.cs:370`) is
+    # short/long, exactly as for every landscape panel.  Stored (176, 320)
+    # until 2026-09-30, every orientation came out transposed: a 320x176
+    # buffer where the C# sends 176x320.  RGB565, because the mode-3 route
+    # never reaches ImageToJpg (all four encode sites are guarded
+    # `myDeviceMode == 2`), and
     # little-endian, because the big-endian arm needs
     # `is320x320 || mode == 10 || SPIMode == 2` and this panel is none of them
     # (SPIMode is set only at mode1/fbl51 and mode3/fbl49).  Falling through to
     # DEFAULT_PROFILE got the size AND the byte order wrong.
     #
-    # NOTE, undetermined: `theme176320` ships 176x320 backgrounds with 172x320
-    # MASKS -- the ONLY catalog in the set where the two differ, and the same
-    # 172-in-176 pair as the `is640x172` stride repack (FormCZTV.cs:4190),
-    # which centres with a +2px offset.  Our compositor places masks top-left
-    # unscaled, so this panel's mask may sit 2px off.  Not guessed here.
-    60:  DeviceProfile(176,  320,  rotate=True),
+    # `theme176320` ships 176x320 backgrounds with 172x320 masks.  Measured
+    # 2026-09-30, all 10 (both catalogs): each DC stores the mask centre
+    # (86, 160) / (160, 86), so the C# draws it at XvalMB - W/2 = 0 -- the
+    # top-left, 4px short on the right -- and so do we.  The +2px centring of
+    # the `is640x172` repack (FormCZTV.cs:4190) is a WIRE step for that panel,
+    # not a mask rule.
+    60:  DeviceProfile(320,  176,  rotate=True),
     64:  DeviceProfile(640,  480,  rotate=True),
     72:  DeviceProfile(480,  480,
                        encode_pm_bases=((6, 180),)),                # FW360 Ultra PM=6 → 180° baseline (#137)
@@ -182,13 +213,18 @@ FBL_PROFILES: dict[int, DeviceProfile] = {
 #     { is640x172 = true; fbl = 224; }
 #
 # Without this row that handshake fell to ``DEFAULT_PROFILE`` -- 320x320
-# RGB565 for a 640x172 JPEG panel, wrong on both axes and wrong encoder.
+# for a 640x172 panel, wrong on both axes.
 #
 # Derived from the 224 base rather than written out, because the two routes
 # describe ONE panel: a flag added to 224 that this row spelled by hand would
 # silently apply to the PM-15 device and not this one.
+#
+# The ENCODER is the route's, not the panel's.  Every C# encode site is
+# ``myDeviceMode == 2 ? ImageToJpg : ImageTo565`` (FormCZTV.cs:2825-3586), so
+# the mode-2 PM-15 device ships JPEG and this mode-3 one RGB565 -- with the
+# ``is640x172`` row repack (``wire_row_px``) that only ImageTo565 performs.
 FBL_PROFILES[59] = dataclasses.replace(
-    FBL_PROFILES[224], width=640, height=172)
+    FBL_PROFILES[224], width=640, height=172, jpeg=False, wire_row_px=176)
 
 
 #: The geometry to assume when the catalog identifies NOTHING.  Public
@@ -249,8 +285,12 @@ class EncodeRotation:
 
 # (width, height, jpeg) → the C# rotation for that panel.
 #
-# Source: TRCC 2.1.6, TRCC.CZTV/FormCZTV.cs — ``ImageToJpg`` (the jpeg=True
-# rows) and ``ImageTo565`` (the jpeg=False rows).  The encoder is part of the
+# Source: TRCC.CZTV/FormCZTV.cs — ``ImageToJpg`` (the jpeg=True rows, as of
+# TRCC 2.1.6) and ``ImageTo565`` (the jpeg=False rows, as of 2.1.8).  The newer
+# ``ImageToJpg`` arms are NOT followed — 960x320 SUB 5/6, 1920x462/440 SUB 3,
+# square SUB 7, 854/800 SUB 2 and the FlipX mirrors — each labelled
+# ``not_ported`` with its evidence in ``dev/decompiler/encode_reference.py``,
+# which is what the parity tests read.  The encoder is part of the
 # key because the two switches disagree on the same resolution: 320×240 is
 # base 0 under JPEG (the ``myDevicePingMu == 5`` Mjolnir arm) and base 90 under
 # RGB565 (the default arm), and 640×172 is base 0 under JPEG and base 270 under
@@ -328,15 +368,17 @@ ENCODE_ROTATIONS: dict[tuple[int, int, bool], EncodeRotation] = {
     (640, 480, _JPEG): EncodeRotation(0),
     (360, 360, _JPEG): EncodeRotation(0),
     (640, 172, _JPEG): EncodeRotation(0),
-    # ── ImageTo565 ────────────────────────────────────────────────────────
-    # `is240x240 || is320x320 || is480x480` → 0/270/180/90.
+    # ── ImageTo565 (TRCC 2.1.8) ───────────────────────────────────────────
+    # `is240x240 || is320x320 || is480x480 || is360x360` → 0/270/180/90.
+    # 2.1.8 added 360×360 to the arm; no RGB565 360×360 panel is catalogued.
     (240, 240, _565): EncodeRotation(0),
     (320, 320, _565): EncodeRotation(0),
+    (360, 360, _565): EncodeRotation(0),
     (480, 480, _565): EncodeRotation(0),
-    # `is640x172` → 270/180/90/0.  No panel reaches this today (PM 15 hands us
-    # a JPEG 640×172), but the switch has the arm and leaving it out would make
-    # the next RGB565 640×172 silently take the base-90 default.
-    (640, 172, _565): EncodeRotation(270),
+    # `is640x172`: mySubMode == 5 → 90/0/270/180, else 270/180/90/0.  Reached
+    # by the mode-3 FBL 59 route, whose branch assigns mySubMode = pmSub
+    # (FormCZTV.cs:1056) — new in 2.1.8, as is the SUB 5 arm.
+    (640, 172, _565): EncodeRotation(270, alt_base=90, alt_subs=frozenset({5})),
 }
 
 # Both switches end in the same default arm: 90/0/270/180.  It is what the
@@ -482,6 +524,20 @@ _SHARED_FBLS: dict[int, tuple[dict[int, tuple[int, int]], tuple[int, int]]] = {
 # =============================================================================
 
 
+def in_pm_ladder(pm: int, sub: int = 0) -> bool:
+    """Whether the C#'s ``FormCZTVInit`` pm ladder names this fingerprint.
+
+    The ladder IS the two override tables :func:`pm_to_fbl` reads, so this is
+    asked of them and never of a second list.  A mode-2 panel (bulk and LY,
+    ``FormCZTVInit(72, 2, pm, sub)`` at Form1.cs:1071) outside it stays on the
+    fbl 72 base.  The bulk wire kept a hand-written copy that had drifted to
+    11 of the ladder's 21 PMs, and LY kept none.
+    """
+    named = (pm, sub) in _PM_SUB_TO_FBL or pm in _PM_TO_FBL_OVERRIDES
+    log.debug("in_pm_ladder: pm=%d sub=%d → %s", pm, sub, named)
+    return named
+
+
 def pm_to_fbl(pm: int, sub: int = 0) -> int:
     """Map PM byte to FBL byte.
 
@@ -570,7 +626,6 @@ def get_profile(fbl: int, pm: int = 0, sub: int = 0) -> DeviceProfile:
     Defaulted so the eight existing call sites are unchanged; only a caller
     that KNOWS the byte should pass it.
     """
-    log.debug("get_profile: fbl=%d pm=%d sub=%d", fbl, pm, sub)
     profile = FBL_PROFILES.get(fbl, DEFAULT_PROFILE)
     if fbl not in FBL_PROFILES:
         _warn_unknown("FBL", fbl, f"pm={pm}", (profile.width, profile.height))
@@ -579,9 +634,13 @@ def get_profile(fbl: int, pm: int = 0, sub: int = 0) -> DeviceProfile:
         by_pm, fallback = shared
         w, h = _resolution_by_pm(by_pm, pm, fallback, fbl)
         profile = dataclasses.replace(profile, width=w, height=h)
-    rotation = resolve_encode_rotation(profile.resolution, profile.jpeg, sub)
+    jpeg = profile.jpeg and sub not in profile.rgb565_subs
+    log.debug("get_profile: fbl=%d pm=%d sub=%d → %dx%d %s", fbl, pm, sub,
+              profile.width, profile.height, "JPEG" if jpeg else "RGB565")
+    rotation = resolve_encode_rotation(profile.resolution, jpeg, sub)
     return dataclasses.replace(
-        profile, encode_base=rotation.base, encode_invert=rotation.invert,
+        profile, jpeg=jpeg,
+        encode_base=rotation.base, encode_invert=rotation.invert,
         # The SUB byte says TWO things, and this function used to spend it on
         # only one.  Besides the encode rotation above it says how the panel is
         # MOUNTED, and ``portrait_mounted`` was left at its dataclass default
@@ -592,7 +651,8 @@ def get_profile(fbl: int, pm: int = 0, sub: int = 0) -> DeviceProfile:
         # where the PS140 lives), so the same panel on the other wire started
         # the owner at 0° and showed them a sideways picture.  That is #203 /
         # #262 again, arriving by a different door.
-        portrait_mounted=is_portrait_mounted(profile.resolution, sub))
+        portrait_mounted=is_portrait_mounted(profile.resolution, sub),
+        sub=sub)
 
 
 def fbl_to_resolution(fbl: int, pm: int = 0) -> tuple[int, int]:
@@ -658,10 +718,10 @@ def resolve_encode_angle(profile: DeviceProfile, orientation: int) -> int:
 # are absent for the same reason.  Verified against ``control-flow.json`` by
 # ``tests/test_oracle_transcription_complete.py``.
 #
-# 176x320 is reachable only once ``FBL_PROFILES[60]`` exists; the row is the
-# C#'s rule, and costs nothing while no panel resolves to it.
+# 320x176 (the C#'s ``is176x320``, stored long side first like every
+# profile) is the C#'s rule; no reporter has presented this panel yet.
 _PORTRAIT_MOUNT_MIN_SUB: dict[tuple[int, int], int] = {
-    (176, 320): 5,
+    (320, 176): 5,
     (640, 172): 5,
     (640, 480): 5,
     (800, 480): 5,

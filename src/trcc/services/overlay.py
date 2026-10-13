@@ -11,15 +11,16 @@ Uses the Renderer port exclusively; knows nothing about Qt directly.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
 from ..core.errors import ThemeError
 from ..core.logs import per_frame
-from ..core.models import OverlayElement, ThemeDir, element_family
+from ..core.models import OverlayElement, ThemeDir, element_family, percent_only
 from ..core.ports import Renderer
 from . import _dc as Dc
-from ._clock import is_default_date_pattern, resolve_clock
+from ._clock import clock_text
 
 log = logging.getLogger(__name__)
 frame_log = per_frame(__name__)
@@ -35,10 +36,40 @@ _METRIC_UNITS = ("°C", "°F", "℃", "℉", " MHz", "MHz", " RPM", "RPM", "%")
 
 def _strip_metric_unit(text: str) -> str:
     """Return ``text`` with any trailing metric unit removed (bare number)."""
-    log.debug("_strip_metric_unit: text=%s", text)
+    frame_log.debug("_strip_metric_unit: text=%s", text)
     for unit in _METRIC_UNITS:
         text = text.replace(unit, "")
     return text.strip()
+
+
+def metric_text(element: Mapping[str, Any], sensors: Mapping[str, float],
+                temp_unit: str = "C") -> str | None:
+    """The text a metric element shows, or None when nothing reads it.
+
+    The ONE rule for it, shared by the panel render and the gui's overlay
+    grid tile (#301): the reading by sensor id, a duty-only GPU fan as "%"
+    (never "RPM", #145), the °C glyph swapped when the user picked °F (the
+    value is already converted upstream by ``personalize_readings``), and the
+    unit stripped when the element hides it (the unit is in the theme art).
+    """
+    metric_id = str(element.get("metric", ""))
+    value: float | None = sensors.get(metric_id)
+    fmt = str(element.get("format", "{value}"))
+    if value is None and (value := percent_only(sensors, metric_id)) is not None:
+        fmt = fmt.replace(" RPM", "%").replace("RPM", "%")
+    if value is None:
+        frame_log.debug("metric_text: %s has no reading", metric_id)
+        return None
+    text = fmt.format(value=value)
+    # ``show_unit`` mirrors the Windows unit-switch (myModeSub == 1): when set
+    # the unit glyph (°C / % / MHz / RPM) follows the number; otherwise the
+    # bare number, because the unit is baked into the theme art (#150/#203).
+    if not bool(element.get("show_unit", True)):
+        text = _strip_metric_unit(text)
+    elif temp_unit.upper() == "F":
+        text = text.replace("°C", "°F").replace("℃", "℉")
+    frame_log.debug("metric_text: %s -> %r", metric_id, text)
+    return text
 
 
 def resolve_overlay_elements(
@@ -76,7 +107,7 @@ def resolve_overlay_elements(
     # every element verbatim, so this line was 2,641 bytes per render.  What a
     # reader needs is which layer won and how many elements it has, and
     # ``_build_overlay`` already reports the winner beside this.
-    log.debug("resolve_overlay_elements: theme=%r theme_elements=%d "
+    frame_log.debug("resolve_overlay_elements: theme=%r theme_elements=%d "
               "user_elements=%s", theme_config.get("name"),
               len(theme_config.get("elements") or []),
               "none" if user_elements is None else len(user_elements))
@@ -93,7 +124,7 @@ def overlay_source(user_elements: list[OverlayElement] | None) -> str:
     rather than each restating the ternary.
     """
     source = "user" if user_elements is not None else "theme"
-    log.debug("overlay_source: %s", source)
+    frame_log.debug("overlay_source: %s", source)
     return source
 
 
@@ -147,8 +178,8 @@ class OverlayService:
     """Compose text/metric overlays onto a base surface."""
 
     def __init__(self, renderer: Renderer,
-                 unsupported: frozenset[str] = frozenset()) -> None:
-        log.debug("__init__: renderer=%s unsupported=%s", renderer, unsupported)
+                 unsupported: Callable[[], frozenset[str]] = frozenset) -> None:
+        log.debug("__init__: renderer=%s", renderer)
         self._r = renderer
         # Quantities NO backend on this host can read — ``SensorEnumerator.
         # unsupported()``, which is STATIC, so it is injected once rather than
@@ -156,6 +187,12 @@ class OverlayService:
         # Without it a missing metric warns identically whether the host has
         # no such sensor at all or this tick's read came back empty, and those
         # are different diagnoses with different replies to a reporter.
+        #
+        # Injected as a CALLABLE, asked only when a metric comes back blank:
+        # answering it builds the sensor stack, and taking the set at
+        # construction built it for every App -- a ``trcc kill`` included,
+        # which on a Windows install spawned LibreHardwareMonitor and waited
+        # for it.
         self._unsupported = unsupported
 
     @classmethod
@@ -247,6 +284,15 @@ class OverlayService:
             cx, cy = int(pos[0]), int(pos[1])
         except (TypeError, ValueError):
             return centered
+        if (cx, cy) == (0, 0):
+            # Never the vendor's: 0 of 1704 shipped DCs with a visible mask
+            # store it (2026-09-30).  It is what our user-mask writer left until
+            # then, unset; read it as the C#'s upload default, the mask's own
+            # centre (FormCZTV.cs:5821), so masks uploaded before the fix land
+            # at the top-left instead of a quarter of them on the panel.
+            log.info("calculate_mask_position: %s stores centre (0, 0) — "
+                     "the unset default, placing at the top-left", mask_dir)
+            return (0, 0)
         # DC stores CENTER coords; render at top-left = center - size/2.
         return (cx - mask_w // 2, cy - mask_h // 2)
 
@@ -283,10 +329,10 @@ class OverlayService:
         deliberately no separate user layer here; rendering theme + user as
         two stacked passes is what drew every edited element twice.
 
-        ``clock`` is a pre-resolved ``{"time": "14:58", "date": ...,
-        "weekday": ...}`` dict produced by DisplayService via
-        ``services._clock.compute_clock``.  When ``None``, clock
-        elements are skipped (e.g. test fixtures that don't care).
+        ``clock`` is ``services._clock.compute_clock``'s ``{"now": <the
+        frame's minute>, "weekday": ...}``; each time/date element draws that
+        moment in its own pattern.  When ``None``, clock elements are skipped
+        (e.g. test fixtures that don't care).
 
         ``temp_unit`` is "C" (default) or "F".  When "F",
         ``_draw_metric`` converts any temperature value
@@ -305,7 +351,7 @@ class OverlayService:
 
         elements: list[dict[str, Any]] = config.get("elements", [])
         clock_keys = list(clock.keys()) if clock else []
-        log.debug(
+        frame_log.debug(
             "render: %dx%d, elements=%d, sensors=%d, clock_sources=%s, "
             "temp_unit=%s",
             width, height, len(elements),
@@ -374,9 +420,9 @@ class OverlayService:
         temp_unit: str = "C",
     ) -> None:
         metric_id = str(element.get("metric", ""))
-        value: float | None = sensors.get(metric_id)
-        if value is None:
-            if metric_id in self._unsupported:
+        text = metric_text(element, sensors, temp_unit)
+        if text is None:
+            if metric_id in self._unsupported():
                 # Not a fault and not a slow tick: nothing on this host reads
                 # it, and it never will.  Saying so stops a reporter (and me)
                 # hunting a transient that cannot happen.
@@ -395,21 +441,6 @@ class OverlayService:
                     list(sensors.keys())[:5],
                 )
             return
-        fmt = str(element.get("format", "{value}"))
-        text = fmt.format(value=value)
-        # ``show_unit`` mirrors the Windows unit-switch (myModeSub == 1): when
-        # set, the unit glyph (°C / % / MHz / RPM) is drawn after the number;
-        # otherwise the bare number is drawn because the unit is baked into the
-        # theme art and drawing it here would double-print it (#150/#203).  89%
-        # of shipped masks show the unit; the 001-series (baked glyph) do not.
-        if bool(element.get("show_unit", True)):
-            # The value is already unit-converted upstream by
-            # ``personalize_readings`` (°F picked → value is Fahrenheit); swap
-            # the hard-coded °C glyph so the label matches the global unit.
-            if temp_unit.upper() == "F":
-                text = text.replace("°C", "°F").replace("℃", "℉")
-        else:
-            text = _strip_metric_unit(text)
         x = int(element.get("x", 0))
         y = int(element.get("y", 0))
         frame_log.debug("draw_metric %s: %s=%s at (%d, %d)",
@@ -433,21 +464,10 @@ class OverlayService:
         source: str = "?",
     ) -> None:
         clock_source = str(element.get("source", ""))
-        # Date format reconciliation (universal — every UI renders through here):
-        #   * A DELIBERATE non-default theme pattern (e.g. "%m/%d") is honoured —
-        #     a theme designed for a specific date layout keeps it.
-        #   * A default-equivalent pattern ("%Y/%m/%d" ≡ "yyyy/MM/dd") means the
-        #     theme didn't customise the date, so the user's global date_format
-        #     pref wins (it's already baked into the precomputed dict, per
-        #     device).  Time/weekday always use the dict (localised weekday, 12h
-        #     handling).  ``"%" in fmt`` excludes the metric default "{value}".
-        # (#format-prefs)
-        elem_fmt = str(element.get("format", ""))
-        if (clock_source == "date" and "%" in elem_fmt
-                and not is_default_date_pattern(elem_fmt)):
-            text = resolve_clock("date", date_format=elem_fmt)
-        else:
-            text = clock.get(clock_source, "")
+        # The element's OWN pattern, as the C# draws each element's text from
+        # its own myModeSub (UCScreenImage.cs:1130).  There is no global
+        # format: a theme shows the format its elements were saved with.
+        text = clock_text(clock_source, str(element.get("format", "")), clock)
         if not text:
             log.warning(
                 "draw_clock %s: source %r unresolved — skipping "

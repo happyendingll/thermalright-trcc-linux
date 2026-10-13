@@ -68,28 +68,43 @@ KNOWN_UI_ASYMMETRY: dict[str, tuple[frozenset[str], str]] = {
     # ── Turned by a service task, so NO UI dispatches them ────────────────
     "CaptureScreencastFrame": (frozenset(), (
         "scoped: ScreencastDriver turns it; every UI reaches the capability "
-        "through Start/StopScreencastDriver"
+        "through StartScreencast / StopScreencast"
     )),
-    "AdvanceSlideshow": (frozenset({"gui"}), (
-        "scoped: SlideshowDriver turns it (2026-08-30), and the gui also drives "
-        "it from its own QTimer. Every UI reaches the capability through "
-        "Start/StopSlideshowDriver -- before that driver existed a slideshow "
-        "configured from the CLI or API was persisted and never rotated"
+    "CaptureStreamFrame": (frozenset(), (
+        "scoped: StreamDriver turns it; every UI reaches the capability "
+        "through SetMediaPlayer with a web URL"
+    )),
+    "AdvanceSlideshow": (frozenset(), (
+        "scoped: SlideshowDriver turns it; every UI reaches the capability "
+        "through SetSlideshow, which owns the driver (2026-09-29) -- the gui's "
+        "own QTimer that also turned it is gone"
+    )),
+    "RenderAndSend": (frozenset(), (
+        "scoped: the App's MetricsLoop and render observer turn it; no UI "
+        "renders a panel itself.  qtgui's ticker went 2026-09-30 (it doubled "
+        "frames, 5 -> 10 in 5 s), then gui's hand renders (one colour edit sent "
+        "2, now 1) and its flash renders with FlashOverlayElement"
+    )),
+    "TickGameMode": (frozenset(), (
+        "scoped: GameModeTask turns it once a second; every UI reaches the "
+        "capability through SetGameMode, which owns the task"
     )),
     "SendFrame": (frozenset(), (
         "scoped: a deliberate scripting/daemon affordance -- ipc.py names it as "
         "the Command whose raw bytes survive JSON, and its own docstring says "
         "'useful for scripts and end-to-end smoke tests'"
     )),
-    "SendScreencastFrame": (frozenset({"gui"}), (
-        "scoped: the frame-push half of the gui's own capture timer; cli/api use "
-        "ScreencastDriver, and Start/StopScreencast reach all four"
+    "SendScreencastFrame": (frozenset(), (
+        "scoped: the encode-and-send half of CaptureScreencastFrame, turned by "
+        "ScreencastDriver; the gui's own capture timer that pushed frames "
+        "through it is gone (2026-09-29)"
     )),
 
     # ── Ergonomic composites -- both halves reachable separately ──────────
-    "InitializeLed": (frozenset({"cli"}), (
-        "scoped: the API initialises the LED via SendColor on connect/reset; "
-        "explicit init is a CLI setup step"
+    "InitializeLed": (frozenset({"cli", "api"}), (
+        "scoped: the ONE-SHOT LED render (2026-09-26) -- dispatch connects the "
+        "device (USES_DEVICE) and it renders one frame; cli `led initialize` / "
+        "`led render` and API `/led/render`.  The GUIs render LEDs per tick"
     )),
     "LoadVideo": (frozenset({"api", "cli", "qtgui"}), (
         "scoped: the API route landed 2026-09-08 — the old reason, that this "
@@ -103,17 +118,6 @@ KNOWN_UI_ASYMMETRY: dict[str, tuple[frozenset[str], str]] = {
     "ToggleVideo": (frozenset({"cli", "gui", "qtgui"}), (
         "scoped: verb sugar over PauseVideo (shared), which the API exposes "
         "directly"
-    )),
-    "RestoreLastTheme": (frozenset({"cli", "qtgui"}), (
-        "scoped: the CLI main connect path keeps the raw restore, and qtgui "
-        "exposes it as an explicit 'Restore last' button; the API and GUI "
-        "dispatch the unified RestoreDeviceState at display-start. "
-        "CORRECTED 2026-09-03: this reason claimed the GUI used "
-        "RestoreDeviceState while gui's ONLY site was the never-called "
-        "restore_inactive_state -- the recorded REACH was accurate, so "
-        "test_recorded_ui_reach_matches_reality passed while the prose beside "
-        "it was fiction. gui dispatches it for real now, which is what made "
-        "the reach change and this entry finally honest."
     )),
 
     # ``GetAutostartStatus`` sat here from 2026-07-12 to 2026-08-31, excused
@@ -132,19 +136,13 @@ KNOWN_UI_ASYMMETRY: dict[str, tuple[frozenset[str], str]] = {
     # The entry is retired rather than reworded: all four UIs reach it now.
 
     # ── Listings each surface answers its own way ─────────────────────────
-    "ListDevices": (frozenset({"api", "gui", "qtgui"}), (
-        "scoped: the CLI uses DiscoverDevices for `trcc device list`. NOT "
-        "redundancy -- that probes the bus and ATTACHES what it finds, this "
-        "reports what is already attached, and it exists because reaching "
-        "app.devices raises under TRCC_DAEMON=1. It is part of the "
-        "daemon-client fix. api and gui joined 2026-08-31: GET /system/status and "
-        "GET /trcc/status report state (a status route must not attach hardware "
-        "as a side effect -- the same distinction from the other end), and the "
-        "gui replays its initial fleet from it instead of iterating app.devices"
-    )),
-    "SetOverlayConfig": (frozenset({"api", "gui", "qtgui"}), (
-        "scoped: the CLI edits overlays element-wise (Add/Update/Delete"
-        "OverlayElement, shared); the API adds a bulk SetOverlayConfig"
+    # ListDevices: retired 2026-09-25 -- the CLI reaches it too now, through
+    # the exit hook that names panels which blank when frames stop (#228).
+    "SetOverlayConfig": (frozenset({"api"}), (
+        "scoped: a bulk replace for scripts; every UI edits overlays "
+        "element-wise (Add/Update/DeleteOverlayElement, all four).  The gui "
+        "left 2026-09-30 when its grid stopped re-sending the whole layout, "
+        "qtgui the same day when its editor stopped seeding the layer on open"
     )),
 
     # ── Cached vs rendered -- deliberately two questions ──────────────────
@@ -186,20 +184,29 @@ KNOWN_UI_ASYMMETRY: dict[str, tuple[frozenset[str], str]] = {
         "scoped: a hold/confirm LOOP, not a user capability -- the GUIs keep a "
         "device awake through their own render cadence"
     )),
-    "EnsureConnected": (frozenset({"cli", "api"}), (
-        "scoped: the attach-first PRECONDITION a wire command runs before itself "
-        "(31e7fcb4 gave the API what the CLI always had); the GUIs own "
-        "connection lifecycle in their per-device handlers"
+    "EnsureConnected": (frozenset(), (
+        "scoped: the App's own connect-first -- App.dispatch runs it for every "
+        "USES_DEVICE Command, so no UI decides it.  The last UI caller, the "
+        "cli's slideshow-run loop, was deleted 2026-09-29"
+    )),
+    "TickDisplay": (frozenset({"cli", "api"}), (
+        "scoped: the core ticks video in every session now (VideoLoop, #249) "
+        "and announces each frame as VideoAdvanced, which both GUIs observe. "
+        "cli `display play` and the stateless REST tick route still dispatch "
+        "it, because neither runs a session"
     )),
     "DaemonStatus": (frozenset({"cli", "api"}), (
         "scoped: the GUIs build the App in-process and can HOST the IPC server, so "
         "they are the daemon rather than a client asking after one"
     )),
-    "EnsureDaemon": (frozenset({"cli", "api"}), (
-        "scoped: same: a GUI that hosts the App has no daemon to start"
-    )),
     "StopDaemon": (frozenset({"cli", "api"}), (
         "scoped: same: closing the window ends the process that IS the daemon"
+    )),
+    "ProvideApiTls": (frozenset({"cli"}), (
+        "scoped: it provisions the API server's TLS BEFORE the server starts, and "
+        "`trcc api` is the only thing that starts it -- an API client cannot ask a "
+        "server for the certificate it is already talking to it over, and no GUI "
+        "launches the API"
     )),
     "RunDoctor": (frozenset({"cli", "api"}), (
         "scoped: renders a CLI-shaped summary AND an exit code; a GUI wants the "
@@ -210,18 +217,16 @@ KNOWN_UI_ASYMMETRY: dict[str, tuple[frozenset[str], str]] = {
         "scoped: a terminal onboarding walk (doctor -> scan) whose whole output is "
         "CLI text; the GUIs have their own first-run flow"
     )),
+    "SleepDevice": (frozenset({"cli", "api"}), (
+        "gap: turn a panel off -- neither window offers it.  The gui's only "
+        "dispatch was its window TEARDOWN, which blanked the daemon's panels "
+        "for every UI and undid disconnects (removed 2026-09-29); App.close "
+        "blanks on shutdown"
+    )),
     "ResetDevice": (frozenset({"cli", "api"}), (
         "gap: power-cycle + restore. It sat in exactly this blind spot, which is "
         "why nobody noticed it was DisconnectDevice byte-for-byte for the "
         "whole rebuild"
-    )),
-    "ExportConfig": (frozenset({"cli", "api"}), (
-        "gap: write a device's settings to JSON -- a GUI user cannot back up a "
-        "configuration"
-    )),
-    "ImportConfig": (frozenset({"cli", "api"}), (
-        "gap: restore settings from an ExportConfig JSON; the other half of the "
-        "same hole"
     )),
     "ExportDcTheme": (frozenset({"cli", "api"}), (
         "gap: write a theme as a legacy config1.dc"
@@ -263,8 +268,10 @@ KNOWN_UI_ASYMMETRY: dict[str, tuple[frozenset[str], str]] = {
         "gap: set the LED colour array + on/off + brightness; the GUIs have LED "
         "panels but reach the capability another way"
     )),
-    "RenderLed": (frozenset({"cli", "api"}), (
-        "gap: compute and send one LED frame from settings + sensors"
+    "RenderLed": (frozenset({"cli"}), (
+        "scoped: the PER-TICK LED render -- it must never connect a device, so "
+        "a one-shot render is InitializeLed.  Only the cli `led play` loop "
+        "dispatches it directly; the observer and the animation loop in core"
     )),
     "SendColor": (frozenset({"cli", "api"}), (
         "gap: push a solid-colour frame to an LCD"
@@ -278,20 +285,6 @@ KNOWN_UI_ASYMMETRY: dict[str, tuple[frozenset[str], str]] = {
     "LoopVideo": (frozenset({"cli", "api"}), (
         "gap: toggle whether playback wraps or sticks at the last frame"
     )),
-    "StartSlideshowDriver": (frozenset({"cli", "api", "qtgui"}), (
-        "gap: ui/gui ALONE still rotates from its own QTimer instead of the "
-        "shared driver.  qtgui adopted the driver 2026-09-15 -- its panel "
-        "already dispatched ConfigureSlideshow + SetSlideshow, which persist "
-        "the config and start nothing, so a slideshow set up there reported "
-        "itself enabled and never switched a theme.  gui is now the only "
-        "duplicated mechanism left, and it goes when ui/gui does"
-    )),
-    "StopSlideshowDriver": (frozenset({"cli", "api", "qtgui"}), (
-        "gap: the other half of the same pair -- ui/gui only"
-    )),
-    "SetMediaPlayer": (frozenset({"cli", "api"}), (
-        "gap: set the device's media-player source URI"
-    )),
     "UploadBootAnimation": (frozenset({"cli", "api"}), (
         "gap: upload a boot animation to a SCSI LCD's flash"
     )),
@@ -304,9 +297,10 @@ KNOWN_UI_ASYMMETRY: dict[str, tuple[frozenset[str], str]] = {
         "DataInstalled (trcc_app.py:560) but dispatches nothing, so a GUI "
         "user cannot re-fetch archives whose first download failed"
     )),
-    "MarkFirstRunDone": (frozenset({"cli", "api"}), (
-        "gap: record that onboarding completed; the GUIs have a first-run flow "
-        "but do not close it through the bus"
+    "MarkFirstRunDone": (frozenset({"cli", "api", "qtgui"}), (
+        "scoped: qtgui closes its first-run welcome on the first launch "
+        "(2026-10-07; it showed at every launch before). ui/gui has no "
+        "first-run flow to close -- nor does the Windows app it copies"
     )),
     "RunSetup": (frozenset({"cli", "api"}), (
         "gap: OS-specific one-time setup (udev rules, WinUSB guide). A GUI-only "

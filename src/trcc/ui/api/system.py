@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import replace
-from pathlib import Path
 
 from fastapi import APIRouter, Request
 
@@ -27,15 +26,22 @@ from ...core.commands import (
     ListMemorySlots,
     ListSensors,
     MarkFirstRunDone,
+    RamLighting,
     ReadSensors,
     RefreshAutostart,
+    RgbFollow,
+    RgbLights,
     RunDoctor,
     RunHealthCheck,
     RunQuickstart,
     RunSetup,
     RunUpgrade,
+    ScanRgbLights,
     SetDiskDevice,
     SetHddEnabled,
+    SetRamEffect,
+    SetRamLighting,
+    SetRgbFollow,
     SetSensorDashboard,
 )
 from ...core.models import Kind, PanelConfig, SensorBinding
@@ -57,6 +63,9 @@ from ...core.results import (
     LanguagesListResult,
     MemorySlotsResult,
     QuickstartResult,
+    RamLightingResult,
+    RgbFollowResult,
+    RgbLightsResult,
     SensorDashboardResult,
     SensorsListResult,
     SensorsResult,
@@ -72,6 +81,10 @@ from .schemas import (
     DebugReportRequest,
     DiskDeviceRequest,
     HddEnabledRequest,
+    RamEffectRequest,
+    RamLightingRequest,
+    RgbFollowRequest,
+    RgbScanRequest,
     SensorDashboardRequest,
     UpgradeRequest,
 )
@@ -281,6 +294,80 @@ def hdd_enabled(body: HddEnabledRequest,
     return result
 
 
+@router.get("/rgb-follow")
+def rgb_follow_status(request: Request) -> RgbFollowResult:
+    """What follows the cooler's colours, and what it is doing (#160)."""
+    log.info("api GET /system/rgb-follow")
+    return request.app.state.trcc.dispatch(RgbFollow())
+
+
+@router.post("/rgb-follow")
+def rgb_follow_set(body: RgbFollowRequest,
+                   request: Request) -> RgbFollowResult:
+    """Pick what follows the cooler's colours: off, openrgb or ram (#160)."""
+    log.info("api POST /system/rgb-follow: mode=%s host=%r port=%s "
+             "mapping=%s colors=%s", body.mode.value, body.host, body.port,
+             body.mapping, body.colors)
+    result = request.app.state.trcc.dispatch(SetRgbFollow(
+        mode=body.mode, host=body.host, port=body.port, source=body.source,
+        mapping=body.mapping, colors=body.colors,
+        targets=None if body.targets is None else tuple(body.targets)))
+    http_error_if_failed(result)
+    return result
+
+
+@router.get("/rgb")
+def rgb_lights(request: Request) -> RgbLightsResult:
+    """The RGB lights from the last scan -- no bus traffic."""
+    log.info("api GET /system/rgb")
+    return request.app.state.trcc.dispatch(RgbLights())
+
+
+@router.post("/rgb/scan")
+def rgb_scan(request: Request,
+             body: RgbScanRequest | None = None) -> RgbLightsResult:
+    """Look for the lights: RGB memory, and OpenRGB's devices."""
+    scan = body or RgbScanRequest()
+    log.info("api POST /system/rgb/scan: openrgb %s:%d", scan.host or "(saved)",
+             scan.port)
+    result = request.app.state.trcc.dispatch(
+        ScanRgbLights(host=scan.host, port=scan.port))
+    http_error_if_failed(result)
+    return result
+
+
+@router.post("/ram-effect")
+def ram_effect_set(body: RamEffectRequest, request: Request) -> RgbLightsResult:
+    """Save one of the memory's own effects on the sticks."""
+    log.info("api POST /system/ram-effect: %s sticks=%s", body.effect.value,
+             body.sticks)
+    result = request.app.state.trcc.dispatch(SetRamEffect(
+        effect=body.effect, refs=tuple(body.sticks), speed=body.speed,
+        direction=body.direction, colors=tuple(body.colors),
+        random_colors=body.random_colors, brightness=body.brightness))
+    http_error_if_failed(result)
+    return result
+
+
+@router.get("/ram-lighting")
+def ram_lighting_status(request: Request) -> RamLightingResult:
+    """Whether TRCC may reach RGB memory -- read from files, no bus traffic."""
+    log.info("api GET /system/ram-lighting")
+    return request.app.state.trcc.dispatch(RamLighting())
+
+
+@router.post("/ram-lighting")
+def ram_lighting_set(body: RamLightingRequest,
+                     request: Request) -> RamLightingResult:
+    """Switch RAM lighting on or off: a password prompt at the desktop,
+    answered when it is typed or closed."""
+    log.info("api POST /system/ram-lighting: enabled=%s", body.enabled)
+    result = request.app.state.trcc.dispatch(
+        SetRamLighting(enabled=body.enabled))
+    http_error_if_failed(result)
+    return result
+
+
 @router.get("/fonts")
 def list_fonts(request: Request) -> FontsListResult:
     """List font families Qt can see."""
@@ -452,19 +539,16 @@ def quickstart(request: Request) -> QuickstartResult:
 @router.post("/debug-report")
 def debug_report(body: DebugReportRequest,
                  request: Request) -> DebugReportPayload:
-    """Generate a debug report bundle.
+    """Generate a debug report; the rendered text comes back in the body.
 
-    With ``output_path`` set, the report is also written to that
-    server-side path; without it, the rendered text comes back in the
-    response body only.
+    It took an ``output_path`` too, and wrote there — anywhere the process
+    could, over an existing file included — until the trust-boundary pass.
+    ``trcc report -o`` still writes a file, locally.
     """
-    log.info(
-        "api POST /system/debug-report: output_path=%s log_tail_lines=%s",
-        body.output_path, body.log_tail_lines,
-    )
-    out = Path(body.output_path) if body.output_path else None
+    log.info("api POST /system/debug-report: log_tail_lines=%s",
+             body.log_tail_lines)
     result = request.app.state.trcc.dispatch(GenerateDebugReport(
-        output_path=out, log_tail_lines=body.log_tail_lines,
+        log_tail_lines=body.log_tail_lines,
     ))
     http_error_if_failed(result)
     return result
@@ -481,15 +565,14 @@ def check_update(request: Request) -> UpdateCheckResult:
 @router.post("/upgrade")
 def upgrade(body: UpgradeRequest,
             request: Request) -> UpgradeResult:
-    """Upgrade trcc-linux via the detected package manager.
+    """The command that upgrades this TRCC install — returned, never run.
 
-    Pass ``dry_run=true`` to get the command without executing it —
-    GUIs should always probe with dry-run first and confirm before
-    running with sudo.
+    It used to run the OS package manager as root from this request.
+    ``dry_run`` in the body is still accepted and changes nothing.
     """
     log.info("api POST /system/upgrade: dry_run=%s", body.dry_run)
     result = request.app.state.trcc.dispatch(
-        RunUpgrade(dry_run=body.dry_run),
+        RunUpgrade(),
     )
     return result
 

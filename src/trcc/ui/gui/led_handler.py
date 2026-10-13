@@ -33,18 +33,25 @@ from ...core.commands import (
     SetMemoryRatio,
     SetWeekStart,
     ToggleLed,
-    ToggleSegment,
 )
-from ...core.led_models import LED_STYLES, LEGACY_STYLE_ID
+from ...core.led_models import (
+    LED_STYLES,
+    LEGACY_STYLE_ID,
+    zone_sync_ticks,
+    zone_sync_units,
+)
+from ...core.logs import per_frame
 from .base_handler import BaseHandler
 from .uc_led_control import UCLedControl
 
 if TYPE_CHECKING:
-    from ...app import App
+    from ...core.ports import CommandBus
 
 from ...core.models import LedStyle
 
 log = logging.getLogger(__name__)
+#: A follow runs on every move of an LED slider.
+frame_log = per_frame(__name__)
 
 
 class LEDHandler(BaseHandler):
@@ -63,7 +70,7 @@ class LEDHandler(BaseHandler):
         key: str,
         panel: UCLedControl,
         on_temp_unit_changed: Any,
-        app: App | None = None,
+        app: CommandBus | None = None,
     ) -> None:
         super().__init__(key, 'led')
         if app is None:
@@ -75,7 +82,7 @@ class LEDHandler(BaseHandler):
         self._on_temp_unit_changed = on_temp_unit_changed
         # The device KEY ("vid:pid") — never the Device itself.
         self._device_key: str = key or ''
-        self._app: App = app
+        self._app: CommandBus = app
         self._active = False
         self._style: Any = None       # LedStyle enum
         self._style_id_int = 0        # legacy 1..12 for uc_led_control
@@ -149,7 +156,7 @@ class LEDHandler(BaseHandler):
         log.info("LED: cleanup")
         self._active = False
 
-    def update_metrics(self, metrics: Any) -> None:
+    def update_metrics(self, metrics: Any, temp_unit: str = "C") -> None:
         """Update panel text (segment displays) on metrics tick."""
         log.debug("update_metrics")
         if not (self._active and self._app):
@@ -169,38 +176,39 @@ class LEDHandler(BaseHandler):
         """
         log.debug("LED: set_temp_unit %d (window-level Command handles propagation)", unit)
 
+    def follow_app(self) -> None:
+        """Show the LED settings the App now holds, changed here or elsewhere."""
+        frame_log.debug("LED: follow_app key=%s active=%s", self._device_key, self._active)
+        if self._active:   # inactive while an LCD owns the window; show() reloads
+            self._sync_panel_from_settings()
+
     # ── Internal — sync panel from persisted settings ────────────────
 
     def _sync_panel_from_settings(self) -> None:
-        """Populate the panel from ``app.settings.for_led(key)``."""
+        """Show the App's LED settings on the panel — READ only."""
         if self._app is None:
             return
         from ...core.led_models import LEDMode
 
         s = self._app.dispatch(LedSnapshot(key=self._device_key))
-        # Zone[0] for multi-zone, else the global mode/color/brightness.
-        # The snapshot spells a mode by NAME; the panel takes the IntEnum's
-        # number, so the lookup happens here rather than the Result carrying
-        # both and letting them drift.
-        if s.zones:
-            z = s.zones[0]
-            self._panel.load_zone_state(
-                0, LEDMode[z.mode].value, z.color, z.brightness, z.on,
-            )
-        else:
-            self._panel.load_zone_state(
-                0, LEDMode[s.mode].value, s.color, s.brightness, s.global_on,
-            )
+        frame_log.debug("_sync_panel_from_settings: %s", self._device_key)
+        # The GLOBAL values, for every style: FormLED shows them (FormLED.cs
+        # :1883-1897) and every control writes them, on a multi-zone cooler as
+        # well as its zones.  Zone 0 was shown before, which is not what an edit
+        # reaches once the zones are picked one by one.  The snapshot spells a
+        # mode by NAME; the panel takes the IntEnum's number.
+        self._panel.show_state(LEDMode[s.mode].value, s.color, s.brightness,
+                               s.global_on)
+        self._panel.show_prefs(s.clock_24h, s.week_sunday, s.memory_ratio)
         # Restore carousel mode + the saved per-page/zone enabled mask.  Page
         # styles never populate ``zones`` (their selector picks a metric page,
         # not a colour zone), so this must NOT gate on ``s.zones`` — it reads
         # ``zone_sync_zones``, the carousel's actual source of truth.  The zone
         # model clamps the mask to the configured slot count.
-        interval_secs = max(1, round(s.zone_sync_interval_ticks * 150 / 1000))
         self._panel.load_sync_state(
             s.zone_sync,
             list(s.zone_sync_zones),
-            interval_secs,
+            zone_sync_units(s.zone_sync_interval_ticks),
         )
 
     # ── Signal wiring ────────────────────────────────────────────────
@@ -218,7 +226,6 @@ class LEDHandler(BaseHandler):
         p.color_changed.connect(self._guard(self._on_color_changed))
         p.brightness_changed.connect(self._guard(self._on_brightness_changed))
         p.global_toggled.connect(self._guard(self._on_global_toggled))
-        p.segment_clicked.connect(self._guard(self._on_segment_clicked))
         p.zone_selected.connect(self._guard(self._on_zone_selected))
         p.zone_toggled.connect(self._guard(self._on_zone_toggled))
         p.carousel_changed.connect(self._guard(self._on_carousel_changed))
@@ -273,14 +280,6 @@ class LEDHandler(BaseHandler):
         log.info("_on_global_toggled: on=%s", on)
         self._dispatch(ToggleLed(key=self._device_key, on=on))
 
-    def _on_segment_clicked(self, idx: int) -> None:
-        # ToggleSegment toggles between on/off — the Command resolves
-        # the current state internally and inverts it.
-        log.info("_on_segment_clicked: idx=%s", idx)
-        self._dispatch(ToggleSegment(
-            key=self._device_key, index=idx, on=True,
-        ))
-
     def _on_zone_selected(self, zone_index: int) -> None:
         log.info("_on_zone_selected: zone_index=%s", zone_index)
         result = self._dispatch(SelectZone(
@@ -314,11 +313,9 @@ class LEDHandler(BaseHandler):
         ))
 
     def _on_carousel_interval_changed(self, secs: int) -> None:
-        # secs → ticks (150 ms tick base): ticks = secs * 1000 / 150
         log.info("_on_carousel_interval_changed: secs=%s", secs)
-        ticks = max(1, int(secs * 1000 / 150))
         self._dispatch(SetLedZoneSyncInterval(
-            key=self._device_key, ticks=ticks,
+            key=self._device_key, ticks=zone_sync_ticks(secs),
         ))
 
     def _on_clock_format_changed(self, is_24h: bool) -> None:

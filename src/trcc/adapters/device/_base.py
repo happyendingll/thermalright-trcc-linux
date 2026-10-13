@@ -20,16 +20,18 @@ class can register its own children without importing its own package (a cycle).
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 from abc import abstractmethod
 from collections.abc import Callable
 from functools import partial
+from pathlib import Path
 from typing import Any, ClassVar
 
 from ...core.errors import DeviceNotFoundError, HandshakeError, TransportError
 from ...core.factory import Registry, Reject
-from ...core.logs import per_frame, trace
+from ...core.logs import Blob, per_frame, trace
 from ...core.models import HandshakeResult, ProductInfo, Wire
 from ...core.ports import BulkTransport, Device, T
 from ...core.protocol import DeviceProfile
@@ -56,6 +58,34 @@ DEVICES: Registry[Wire, type[Device]] = Registry(
 # settle before the init write, let the firmware answer, retry a bad exchange.
 HANDSHAKE_TIMEOUT_MS = 5000
 _HANDSHAKE_MAX_RETRIES = 3
+
+
+def read_state(path: Path) -> dict[str, Any]:
+    """A device's JSON state file, or ``{}`` when absent or unreadable.
+
+    State a device remembers across launches (the LED probe cache, the HID
+    streaming-probe answer) is a hint, never an authority: a missing or
+    corrupt file means "nothing remembered", not a failure.
+    """
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        log.debug("read_state: %s absent", path)
+        return {}
+    except (OSError, ValueError) as e:
+        log.debug("read_state: %s unreadable (%s) — starting fresh", path, e)
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def write_state(path: Path, state: dict[str, Any]) -> None:
+    """Persist *state* best-effort: a failed write is logged, never raised."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        log.debug("write_state: %s (%d entr(y/ies))", path, len(state))
+    except OSError as e:
+        log.warning("write_state: %s failed: %s: %s", path, type(e).__name__, e)
 _HANDSHAKE_RETRY_DELAY_S = 0.5
 _DELAY_PRE_INIT_S = 0.050
 _DELAY_POST_INIT_S = 0.200
@@ -99,6 +129,9 @@ class BaseDevice(Device[T]):
         # this in ``_do_handshake``; LED leaves it None (no canvas), which is
         # exactly what the ``Device.profile`` port contract says.
         self._profile: DeviceProfile | None = None
+        # True from the first refused send until one gets through: a producer
+        # that does not ask ``is_connected`` first refuses on EVERY frame.
+        self._refusing = False
 
     @property
     def profile(self) -> DeviceProfile | None:
@@ -149,7 +182,7 @@ class BaseDevice(Device[T]):
         there, and the logger is the SUBCLASS's module so a report still says
         which wire spoke.
         """
-        log.debug("_trace_reply: resp=%s", resp)
+        log.debug("_trace_reply: resp=%s", Blob(resp))
         trace(logging.getLogger(type(self).__module__),
               "%s raw handshake reply (%d bytes, first %d): %s",
               self.info.key, len(resp), min(len(resp), _TRACE_REPLY_BYTES),
@@ -171,7 +204,8 @@ class BaseDevice(Device[T]):
         encoding it picked, the PID variant, the LED style.  Returns a string
         that already carries its own leading space, or empty.
         """
-        log.debug("_handshake_detail: result=%s", result)
+        log.debug("_handshake_detail: result=%s raw=%s",
+                  result, Blob(result.raw_response))
         return ""
 
     def _open_transport(self) -> None:
@@ -200,9 +234,13 @@ class BaseDevice(Device[T]):
            reconnect-and-retry / consecutive-failure escalation every wire
            shares (``core.ports.Device``).
         """
-        frame_log.debug("send: payload=%s", payload)
         self._require_connected()
         frame = self._prepare_frame(payload)
+        # The FRAME, not the payload: an LED payload is a dataclass, and
+        # ``Blob`` renders bytes only — at -vvv every LED frame raised inside
+        # the logger and the record was lost.
+        frame_log.debug("send: %s -> frame=%s", type(payload).__name__,
+                        Blob(frame))
         return self._send_with_recovery(partial(self._write_frame, frame))
 
     @abstractmethod
@@ -231,9 +269,17 @@ class BaseDevice(Device[T]):
         panel was plugged in.
         """
         if self._transport.is_open:
+            self._refusing = False
             return
-        log.error("%s %s: send() called before connect()",
-                  type(self).__name__, self.info.key)
+        if self._refusing:
+            frame_log.debug("%s %s: send() refused again — transport closed",
+                            type(self).__name__, self.info.key)
+        else:
+            # Once per closed spell, not per frame: on 2026-10-06 this line,
+            # repeated, was what rotated its own cause out of the log.
+            self._refusing = True
+            log.error("%s %s: send() called before connect()",
+                      type(self).__name__, self.info.key)
         raise TransportError(
             f"{type(self).__name__} {self.info.key} not connected — "
             f"call connect() first"

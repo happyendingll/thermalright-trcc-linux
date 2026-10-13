@@ -13,7 +13,6 @@ applies only the FormLED hardware perceptual scale, never brightness:
 """
 from __future__ import annotations
 
-import json
 import logging
 import struct
 import threading
@@ -31,11 +30,13 @@ from ...core.led_protocol import (
     resolve_model_name,
     resolve_pm,
 )
+from ...core.logs import Blob, per_frame
 from ...core.models import HandshakeResult, LedHandshakeResult, ProductInfo, Wire
 from ...core.ports import BulkTransport
-from ._base import BaseBulkDevice
+from ._base import BaseBulkDevice, read_state, write_state
 
 log = logging.getLogger(__name__)
+frame_log = per_frame(__name__)
 
 
 # ── Wire constants ─────────────────────────────────────────────────────
@@ -80,7 +81,7 @@ def _probe_cache_key(vid: int, pid: int, usb_path: str = "") -> str:
     devices on different bus positions.  Caller looks up the
     specific path first, falls back to the VID/PID-only key.
     """
-    log.debug("_probe_cache_key: vid=%s pid=%s", vid, pid)
+    log.debug("_probe_cache_key: vid=%s pid=%s usb_path=%s", vid, pid, usb_path)
     if usb_path:
         return f"{vid:04x}_{pid:04x}_{usb_path}"
     return f"{vid:04x}_{pid:04x}"
@@ -98,29 +99,13 @@ def _probe_cache_save(
     connect) calls this after a successful handshake so the next
     same-power-cycle restart skips the now-broken handshake step.
     """
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        cache: dict[str, dict[str, object]] = {}
-        if path.is_file():
-            try:
-                cache = json.loads(
-                    path.read_text(encoding="utf-8"),
-                )
-            except (OSError, ValueError):
-                log.debug("probe cache: corrupt at %s, rewriting fresh",
-                          path)
-                cache = {}
-        cache[_probe_cache_key(vid, pid, usb_path)] = {
-            "pm": pm, "sub": sub, "model_name": model_name,
-        }
-        path.write_text(
-            json.dumps(cache, indent=2) + "\n", encoding="utf-8",
-        )
-        log.info("probe cache: saved %04x:%04x pm=%d sub=%d → %s",
-                 vid, pid, pm, sub, path)
-    except OSError as e:
-        log.warning("probe cache: save failed for %04x:%04x: %s: %s",
-                    vid, pid, type(e).__name__, e)
+    cache = read_state(path)
+    cache[_probe_cache_key(vid, pid, usb_path)] = {
+        "pm": pm, "sub": sub, "model_name": model_name,
+    }
+    write_state(path, cache)
+    log.info("probe cache: saved %s pm=%d sub=%d → %s",
+             _probe_cache_key(vid, pid, usb_path), pm, sub, path)
 
 
 def _probe_cache_load(
@@ -130,19 +115,18 @@ def _probe_cache_load(
 
     Looks up the usb_path-specific key first; falls back to the
     VID/PID-only key so a device that was originally cached without
-    a bus path still resolves.
+    a bus path still resolves.  That fallback is a guess for a twin: the
+    plain entry belongs to whichever cooler was cached before the two were
+    told apart, so it is said out loud.
     """
-    try:
-        if not path.is_file():
-            return None
-        cache = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as e:
-        log.debug("probe cache: load failed: %s: %s",
-                  type(e).__name__, e)
-        return None
+    cache = read_state(path)
     entry = cache.get(_probe_cache_key(vid, pid, usb_path))
     if entry is None and usb_path:
         entry = cache.get(_probe_cache_key(vid, pid))
+        if entry is not None:
+            log.warning("probe cache: %04x:%04x unit %s has no entry of its "
+                        "own — using the shared one, which may be the other "
+                        "cooler's", vid, pid, usb_path)
     if entry is None:
         return None
     try:
@@ -174,13 +158,13 @@ class Led(BaseBulkDevice, wire=Wire.LED):
 
     @property
     def is_led(self) -> bool:
-        log.debug("is_led")
+        frame_log.debug("Led.is_led: True (%s)", self.info.key)
         return True
 
     @property
     def led_handshake(self) -> LedHandshakeResult | None:
         """LED-specific handshake info (pm, sub_type, style)."""
-        log.debug("led_handshake")
+        frame_log.debug("Led.led_handshake: %s (%s)", self._led_handshake is not None, self.info.key)
         return self._led_handshake
 
     def _reset_state(self) -> None:
@@ -211,7 +195,8 @@ class Led(BaseBulkDevice, wire=Wire.LED):
 
     def _handshake_detail(self, result: HandshakeResult) -> str:
         """The resolved style + model — an LED's whole identity."""
-        log.debug("_handshake_detail: result=%s", result)
+        log.debug("_handshake_detail: result=%s raw=%s",
+                  result, Blob(result.raw_response))
         if self._led_handshake is None:
             return ""
         style = self._led_handshake.style
@@ -291,7 +276,7 @@ class Led(BaseBulkDevice, wire=Wire.LED):
         if (cache_file := self._probe_cache_file()) is not None:
             _probe_cache_save(
                 cache_file, self.info.vid, self.info.pid,
-                self._pm, self._sub, model_name,
+                self._pm, self._sub, model_name, usb_path=self._unit,
             )
         return HandshakeResult(
             resolution=(0, 0),        # LEDs have no screen resolution
@@ -311,7 +296,7 @@ class Led(BaseBulkDevice, wire=Wire.LED):
         cache_file = self._probe_cache_file()
         cached = (None if cache_file is None
                   else _probe_cache_load(cache_file, self.info.vid,
-                                         self.info.pid))
+                                         self.info.pid, usb_path=self._unit))
         if cached is None:
             raise failure
 
@@ -399,13 +384,13 @@ class Led(BaseBulkDevice, wire=Wire.LED):
                 )
 
         packet = self._build_packet(payload)
-        log.debug("Led %s: sending %d-byte packet (%d colors)",
+        frame_log.debug("Led %s: sending %d-byte packet (%d colors)",
                   self.info.key, len(packet), len(payload.colors))
         return packet
 
     def _write_frame(self, frame: bytes) -> bool:
         """Stream the packet as 64-byte HID reports, zero-padding the last."""
-        log.debug("_write_frame: frame=%s", frame)
+        frame_log.debug("_write_frame: frame=%s", Blob(frame))
         remaining = len(frame)
         offset = 0
         while remaining > 0:
@@ -430,7 +415,7 @@ class Led(BaseBulkDevice, wire=Wire.LED):
 
     @staticmethod
     def _build_header(payload_length: int) -> bytes:
-        log.debug("_build_header: payload_length=%s", payload_length)
+        frame_log.debug("_build_header: payload_length=%s", payload_length)
         header = bytearray(_HEADER_SIZE)
         header[0:4] = _MAGIC
         header[12] = _CMD_DATA
@@ -439,7 +424,7 @@ class Led(BaseBulkDevice, wire=Wire.LED):
 
     @classmethod
     def _build_packet(cls, payload: LedPayload) -> bytes:
-        log.debug("_build_packet: payload=%s", payload)
+        frame_log.debug("_build_packet: payload=%s", payload)
         count = len(payload.colors)
         payload_len = count * 3
         header = cls._build_header(payload_len)
@@ -448,13 +433,8 @@ class Led(BaseBulkDevice, wire=Wire.LED):
         # service (apply_brightness); the wire applies only the FormLED
         # hardware perceptual scale + the on/off mask, never brightness.
         body = bytearray(payload_len)
-        for i, (r, g, b) in enumerate(payload.colors):
-            on = payload.global_on and (
-                payload.is_on[i] if payload.is_on is not None else True
-            )
-            if on:
-                body[i * 3] = min(255, max(0, int(r * _COLOR_SCALE)))
-                body[i * 3 + 1] = min(255, max(0, int(g * _COLOR_SCALE)))
-                body[i * 3 + 2] = min(255, max(0, int(b * _COLOR_SCALE)))
-            # else: stays 0,0,0 (off)
+        for i, (r, g, b) in enumerate(payload.shown):   # an off LED is (0, 0, 0)
+            body[i * 3] = min(255, max(0, int(r * _COLOR_SCALE)))
+            body[i * 3 + 1] = min(255, max(0, int(g * _COLOR_SCALE)))
+            body[i * 3 + 2] = min(255, max(0, int(b * _COLOR_SCALE)))
         return header + bytes(body)

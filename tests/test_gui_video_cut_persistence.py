@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import show_a_theme
 from tests.mock_platform import MockPlatform
 from trcc.adapters.render.qt import QtRenderer
 from trcc.app import App
@@ -40,9 +41,13 @@ def _jpeg(w: int = 320, h: int = 320) -> bytes:
     return bytes(ba)
 
 
-def test_cut_video_is_kept_under_user_content_and_survives_close(
+def test_a_cut_video_becomes_the_background_as_delivered_and_survives_close(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The export now arrives already in the user's background library, which
+    survives a reboot (#271).  gui used to copy it out of /tmp into a place of
+    its own choosing -- a decision no other UI made; it now persists exactly
+    the path it is handed, and makes no copy."""
     from trcc.ui.gui.trcc_app import TRCCApp
 
     # No ffmpeg in the loop: any .zt "decodes" to three black frames.
@@ -51,37 +56,34 @@ def test_cut_video_is_kept_under_user_content_and_survives_close(
         playback = Playback(frames=[_jpeg(w, h)] * 3, fps=15)
         self._playbacks[device_key] = playback
         return playback
-    monkeypatch.setattr(MediaService, "load_video", fake_load)
 
-    staged = tmp_path / "trcc-videoexport-staging" / "Theme.zt"
-    staged.parent.mkdir()
-    staged.write_bytes(b"ZT\x00staged-by-the-export")
+    monkeypatch.setattr(MediaService, "load_video", fake_load)
 
     app = App(MockPlatform([_SPEC], tmp_path), renderer=QtRenderer())
     try:
         assert app.dispatch(ConnectDevice(key=_KEY)).ok
-        window = TRCCApp(app=app, platform=app.platform)
+        show_a_theme(app, _KEY)
+        library = app.platform.paths().user_background_dir(320, 320)
+        library.mkdir(parents=True)
+        delivered = library / "0123456789abcdef.zt"
+        delivered.write_bytes(b"ZT\x00kept-by-the-export")
+        window = TRCCApp(app=app)
         window.replay_initial_devices()
 
-        window._on_video_cut_done(str(staged))
+        window._on_video_cut_done(str(delivered))
 
-        kept = (
-            Path(app.platform.paths().user_content_dir())
-            / "backgrounds" / "0402_3922.zt"
-        )
-        assert kept.read_bytes() == staged.read_bytes(), (
-            "the cut must be copied out of the export's staging dir")
-        assert app.settings.for_device(_KEY).background_path == str(kept), (
-            "the override must point at the kept copy, not the staging file")
-
+        assert app.settings.for_device(_KEY).background_path == str(delivered)
+        assert not (Path(app.platform.paths().user_content_dir())
+                    / "backgrounds").exists(), "gui made its own copy again"
         window.close()          # closeEvent -> every handler's cleanup()
-
-        assert app.settings.for_device(_KEY).background_path == str(kept), (
+        assert app.settings.for_device(_KEY).background_path == str(delivered), (
             "closing the GUI must not wipe the persisted background")
-        assert app.media.playback(_KEY) is None, (
-            "closing the GUI must still unload playback")
     finally:
         app.close()
+    # Playback is the App's: a window closing leaves it playing, and the App
+    # frees it when IT closes.
+    assert app.media.playback(_KEY) is None, "closing the App must unload playback"
+    assert app.settings.for_device(_KEY).background_path == str(delivered)
 
 
 # =========================================================================
@@ -134,3 +136,96 @@ def test_the_fit_buttons_carry_their_choice_out_of_the_panel(qtbot) -> None:
             "builds ExportVideoClip from these arguments"
         )
         assert sig.args[:3] == [0, 500, 0]
+
+
+def test_the_trimmer_exports_at_the_frame_rate_pressed(qtbot) -> None:
+    """The C#'s 15/24 buttons (UCVideoCut.cs:2712-2723), 15 untouched.
+
+    Every export was 24: the first commit hardcoded it and the selector was
+    never ported.  Driven through the real buttons and the real emitter.
+    """
+    from trcc.ui.gui.uc_video_cut import UCVideoCut
+
+    panel = UCVideoCut()
+    qtbot.addWidget(panel)
+    panel._video_path = "/nonexistent/clip.mp4"
+    panel._start_ms, panel._end_ms = 0, 500
+
+    for press, expected in ((None, 15), (24, 24), (15, 15)):
+        if press is not None:
+            panel._fps_btns[press].click()
+        panel._is_processing = False
+        with qtbot.waitSignal(panel.export_requested, timeout=1000) as sig:
+            panel._on_export()
+        assert sig.args[4] == expected
+
+
+def test_qtgui_exports_at_the_frame_rate_chosen(qtbot) -> None:
+    """qtgui's 15/24 actions reach ExportVideoClip, 15 untouched."""
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from PySide6.QtCore import QObject, Signal
+
+    from trcc.core.commands import DeviceCanvas, ExportVideoClip
+    from trcc.ui.qtgui.video_crop import VideoCropDialog
+
+    class _Bus(QObject):
+        video_export_progress = Signal(object)
+        video_export_finished = Signal(object)
+
+    sent: list = []
+
+    class _App:
+        def dispatch(self, cmd):
+            sent.append(cmd)
+            if isinstance(cmd, DeviceCanvas):
+                return SimpleNamespace(ok=False)
+            return SimpleNamespace(ok=False, message="recorded")
+
+    dialog = VideoCropDialog(_App(), _Bus(), "0402:3922")  # type: ignore[arg-type]
+    qtbot.addWidget(dialog)
+    dialog._video_path = Path("/nonexistent/clip.mp4")
+
+    def exported_fps() -> int:
+        dialog._on_export_clicked()
+        return [c for c in sent if isinstance(c, ExportVideoClip)][-1].fps
+
+    assert exported_fps() == 15
+    dialog._fps_box.setCurrentIndex(dialog._fps_box.findData(24))
+    assert exported_fps() == 24
+
+
+def test_qtgui_sends_a_real_fit_mode(qtbot) -> None:
+    """QAction.data() returns a str enum as a plain str: 'width' equals
+    FitMode.WIDTH but is not one, so ExportVideoClip refused every qtgui
+    export with a fit chosen, and the preview took the HEIGHT arm."""
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from PySide6.QtCore import QObject, Signal
+
+    from trcc.core.commands import ExportVideoClip
+    from trcc.core.models import FitMode
+    from trcc.ui.qtgui.video_crop import VideoCropDialog
+
+    class _Bus(QObject):
+        video_export_progress = Signal(object)
+        video_export_finished = Signal(object)
+
+    sent: list = []
+
+    class _App:
+        def dispatch(self, cmd):
+            sent.append(cmd)
+            return SimpleNamespace(ok=False, message="recorded")
+
+    dialog = VideoCropDialog(_App(), _Bus(), "0402:3922")  # type: ignore[arg-type]
+    qtbot.addWidget(dialog)
+    dialog._video_path = Path("/nonexistent/clip.mp4")
+    by_mode = {a.data(): a for a in dialog._fit_group.actions()}
+    for mode in FitMode:
+        by_mode[mode.value].trigger()
+        dialog._on_export_clicked()
+        sent_fit = [c for c in sent if isinstance(c, ExportVideoClip)][-1].fit_mode
+        assert type(sent_fit) is FitMode and sent_fit is mode

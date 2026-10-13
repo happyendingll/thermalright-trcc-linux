@@ -60,6 +60,7 @@ _ENTRIES: tuple[_Entry, ...] = (
     _Entry("screencast", "Screencast"),
     _Entry("config",     "Configuration"),
     _Entry("led",        "LED"),
+    _Entry("rgb",        "RGB Lighting"),
     _Entry("status",     "Status"),
     _Entry("system",     "System"),
     _Entry("about",      "About"),
@@ -234,9 +235,3 @@ class ActivitySidebar(BasePanel):
         """A device attached or detached anywhere — re-list the rail."""
         log.debug("_on_fleet_changed: event=%s", type(event).__name__)
         self.refresh_devices()
-
-    def apply_language(self, lang: str) -> None:
-        # Translation keys come back when tr() wiring lands; the sidebar
-        # is one of the smallest places to start localizing.
-        log.debug("apply_language: lang=%s", lang)
-        del lang

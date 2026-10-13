@@ -13,7 +13,6 @@ import pytest
 
 from trcc.core.errors import ThemeError
 from trcc.services import _dc as Dc
-from trcc.ui.presentation.overlay_serialization import dc_as_legacy_overlay_config
 
 
 def load_dc_as_theme_config(path):
@@ -303,113 +302,6 @@ def test_rotation_field_passes_through(tmp_path: Path) -> None:
     assert cfg["rotation"] == 180
 
 
-# =========================================================================
-# dc_as_legacy_overlay_config — legacy GUI shape (dict keyed by metric)
-# =========================================================================
-
-
-def test_legacy_overlay_returns_empty_when_no_dc(tmp_path: Path) -> None:
-    """A theme dir with no config1.dc yields an empty overlay config."""
-    assert dc_as_legacy_overlay_config(tmp_path) == {}
-
-
-def test_legacy_overlay_reads_trcc_json_elements(tmp_path: Path) -> None:
-    """A reference-manifest theme keeps its overlay layout in trcc.json's
-    ``elements`` (no config1.dc) — SaveTheme's new format.  The adapter
-    must surface it, else the GUI grid empties + overlay toggles off on
-    reload of a just-saved theme."""
-    import json
-    (tmp_path / "trcc.json").write_text(json.dumps({
-        "name": "t", "width": 320, "height": 320,
-        "elements": [
-            {"type": "clock", "source": "time", "x": 10, "y": 20,
-             "color": "#ffffff", "size": 24, "bold": False, "italic": False},
-            {"type": "text", "text": "HI", "x": 5, "y": 15,
-             "color": "#ff8800", "size": 18, "bold": True, "italic": False},
-        ],
-    }), encoding="utf-8")
-
-    cfg = dc_as_legacy_overlay_config(tmp_path)
-
-    assert set(cfg.keys()) == {"time", "custom_text"}
-    assert cfg["time"]["x"] == 10
-    assert cfg["time"]["metric"] == "time"
-    assert cfg["custom_text"]["text"] == "HI"
-
-
-def test_legacy_overlay_prefers_trcc_json_over_dc(tmp_path: Path) -> None:
-    """When both exist, trcc.json wins — matches FileContentStore._load_config."""
-    import json
-    (tmp_path / "trcc.json").write_text(json.dumps({
-        "elements": [{"type": "text", "text": "JSON", "x": 1, "y": 2,
-                      "color": "#fff", "size": 12,
-                      "bold": False, "italic": False}],
-    }), encoding="utf-8")
-    (tmp_path / "config1.dc").write_bytes(_build_dd_buffer([
-        _build_dd_element(mode=4, x=9, y=9, custom_text=b"DC"),
-    ]))
-
-    cfg = dc_as_legacy_overlay_config(tmp_path)
-
-    assert cfg["custom_text"]["text"] == "JSON"
-
-
-def test_legacy_overlay_skips_corrupt_dc(tmp_path: Path) -> None:
-    """A DC with bad magic doesn't raise — just empty overlay."""
-    (tmp_path / "config1.dc").write_bytes(b"\xff\x00\x00")
-    assert dc_as_legacy_overlay_config(tmp_path) == {}
-
-
-def test_legacy_overlay_dd_clocks_keyed_by_source(tmp_path: Path) -> None:
-    """0xDD time/weekday/date elements key on their source name with the
-    legacy font dict + position fields the overlay grid expects."""
-    (tmp_path / "config1.dc").write_bytes(_build_dd_buffer([
-        _build_dd_element(mode=1, x=10, y=20),
-        _build_dd_element(mode=2, x=30, y=40),
-        _build_dd_element(mode=3, x=50, y=60),
-    ]))
-
-    cfg = dc_as_legacy_overlay_config(tmp_path)
-
-    assert set(cfg.keys()) == {"time", "weekday", "date"}
-    assert cfg["time"]["x"] == 10
-    assert cfg["time"]["y"] == 20
-    assert cfg["time"]["metric"] == "time"
-    assert cfg["time"]["time_format"] == 0
-    assert cfg["date"]["date_format"] == 0
-    # Font dict is the legacy shape overlay_grid consumes.
-    assert "font" in cfg["time"]
-    assert {"name", "size", "style"} <= set(cfg["time"]["font"])
-
-
-def test_legacy_overlay_disambiguates_duplicates(tmp_path: Path) -> None:
-    """Two TIME elements get distinct keys ("time" then "time_1")."""
-    (tmp_path / "config1.dc").write_bytes(_build_dd_buffer([
-        _build_dd_element(mode=1, x=10, y=20),
-        _build_dd_element(mode=1, x=30, y=40),
-    ]))
-
-    cfg = dc_as_legacy_overlay_config(tmp_path)
-
-    assert set(cfg.keys()) == {"time", "time_1"}
-    assert cfg["time"]["x"] == 10
-    assert cfg["time_1"]["x"] == 30
-
-
-def test_legacy_overlay_custom_text(tmp_path: Path) -> None:
-    """A 0xDD CUSTOM element surfaces as a custom_text entry with the
-    raw string preserved."""
-    (tmp_path / "config1.dc").write_bytes(_build_dd_buffer([
-        _build_dd_element(mode=4, x=5, y=15, custom_text=b"GPU"),
-    ]))
-
-    cfg = dc_as_legacy_overlay_config(tmp_path)
-
-    assert list(cfg.keys()) == ["custom_text"]
-    assert cfg["custom_text"]["text"] == "GPU"
-    assert cfg["custom_text"]["x"] == 5
-
-
 def _build_dc_with_trailer(*, show_unit: bool) -> bytes:
     """A 0xDC buffer carrying the trailer, so ``num8`` is reachable.
 
@@ -426,6 +318,44 @@ def _build_dc_with_trailer(*, show_unit: bool) -> bytes:
     buf.append(1)                                  # myMbxs
     buf.extend(struct.pack("<2i", 0, 0))           # XvalMB YvalMB
     return bytes(buf)
+
+
+def _font_record() -> bytes:
+    """One DC font record: empty name, 24 pt, regular, opaque white."""
+    return bytes([0]) + struct.pack("<f", 24.0) + bytes([0, 0, 0, 255, 255, 255, 255])
+
+
+def _build_dc_with_clock(*, date_idx: int, time_idx: int) -> bytes:
+    """A 0xDC buffer through its clock block: date, time and weekday on."""
+    buf = bytearray(_build_dc_with_trailer(show_unit=True))
+    buf.extend(bytes([1, 1, 1]))                        # master, date, time
+    buf.extend(struct.pack("<2i", date_idx, time_idx))  # the two myModeSub
+    buf.extend(struct.pack("<4i", 5, 6, 7, 8))          # date x,y  time x,y
+    buf.extend(_font_record() + _font_record())         # date font, time font
+    buf.append(1)                                       # weekday on
+    buf.extend(struct.pack("<2i", 9, 10))
+    buf.extend(_font_record())
+    return bytes(buf)
+
+
+@pytest.mark.parametrize(("time_idx", "pattern"), [(0, "%H:%M"),
+                                                    (1, "%I:%M %p"),
+                                                    (2, "%H:%M")])
+def test_a_0xdc_time_keeps_the_themes_own_format(
+    tmp_path: Path, time_idx: int, pattern: str,
+) -> None:
+    """The C# draws each clock element in its own myModeSub; the reader read
+    the 0xDC time index and dropped it ("time stays global")."""
+    f = tmp_path / "Clock" / "config1.dc"
+    f.parent.mkdir()
+    f.write_bytes(_build_dc_with_clock(date_idx=3, time_idx=time_idx))
+
+    clocks = {e["source"]: e for e in Dc.File(f).read()["elements"]
+              if e["type"] == "clock"}
+
+    assert clocks["time"]["format"] == pattern
+    assert clocks["date"]["format"] == "%m/%d"
+    assert (clocks["time"]["x"], clocks["time"]["y"]) == (7, 8)
 
 
 def test_a_0xdc_mask_that_bakes_its_unit_is_drawn_bare(tmp_path: Path) -> None:
@@ -477,3 +407,18 @@ def test_a_0xdc_label_is_not_given_a_show_unit(tmp_path: Path) -> None:
     texts = [e for e in cfg["elements"] if e["type"] == "text"]
     assert texts, "no text elements parsed — this pin proves nothing"
     assert all("show_unit" not in e for e in texts)
+
+
+def test_an_icon_element_is_skipped_by_name(caplog: pytest.LogCaptureFixture) -> None:
+    """Mode 5 is the C#'s icon element (UCShortcut), not "unknown": a report
+    from a theme that has one must say what was dropped."""
+    import logging
+
+    caplog.set_level(logging.DEBUG, logger="trcc.services._dc")
+    element = Dc._build_dd_element(5, 0, 12, 34, 0, 0, {}, "")
+
+    assert element is None
+    assert [r.getMessage() for r in caplog.records if "0xDD" in r.getMessage()] == [
+        "0xDD: icon element (C# mode 5, UCShortcut) at (12, 34) is not "
+        "supported; skipping"]
+

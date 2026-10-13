@@ -6,11 +6,23 @@ source of truth.
 """
 from __future__ import annotations
 
+import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Literal
 
+from .logs import per_frame
 from .models import LedStyle
+
+log = logging.getLogger(__name__)
+frame_log = per_frame(__name__)
+
+#: LED ticks per unit of the carousel interval, counted as the C# counts
+#: them: ``ValCount >= 6 * textBoxTimer`` (FormLED.cs:3489), one ``ValCount``
+#: per 150 ms LED tick.  So the C#'s "seconds" are 0.9 s, and its default
+#: "2" is 12 ticks.  Settings store ticks; a UI shows this unit.
+ZONE_SYNC_TICKS_PER_UNIT = 6
 
 # =========================================================================
 # LEDMode — the six color-cycling effects
@@ -61,8 +73,10 @@ class LedDeviceSettings:
     place, then atomic-save.  Loaded back from JSON via
     ``_led_settings_from_dict``.
     """
-    # Global state (used by single-zone devices + as zone-sync defaults)
-    mode: LEDMode = LEDMode.STATIC
+    # Global state (used by single-zone devices + as zone-sync defaults).
+    # A new device starts in rainbow, as FormLED does (``myLedMode = 4``,
+    # FormLED.cs:27); a saved mode always wins.
+    mode: LEDMode = LEDMode.RAINBOW
     color: tuple[int, int, int] = (255, 0, 0)
     brightness: int = 65
     global_on: bool = True
@@ -70,22 +84,34 @@ class LedDeviceSettings:
     # Multi-zone state (only populated for zone_count > 1)
     zones: list[LedZoneSettings] = field(default_factory=list)
 
-    # Zone-sync carousel (rotate the lit zone every N ticks)
+    # The zone/page selection — FormLED's ``LunBo1..4``, the ONE fact.  With
+    # the carousel (``zone_sync``) off it holds the picked page; on, the pages
+    # it rotates.  On a select-all style (PA120/LF10) it is the zones an edit
+    # reaches, and ``zone_sync`` means "every zone".  Empty = the first, as
+    # FormLED starts (``LunBo1 = true``).
     zone_sync: bool = False
     zone_sync_zones: list[bool] = field(default_factory=list)
-    zone_sync_interval_ticks: int = 13     # ≈ 2 s at default ticker cadence
-    selected_zone: int = 0
+    zone_sync_interval_ticks: int = 2 * ZONE_SYNC_TICKS_PER_UNIT  # C# "2"
 
     # Test mode — cycle through 4 reference colors
     test_mode: bool = False
 
+    @property
+    def selected_zone(self) -> int:
+        """The picked zone or page: the first in the mask, as FormLED shows
+        the first ``LunBoN`` (FormLED.cs:3540); 0 when none.
+
+        Derived, not stored.  It was a second field beside the mask, each
+        Command wrote one of the two, and the panel showed one page while the
+        cooler showed another.
+        """
+        zone = next((i for i, on in enumerate(self.zone_sync_zones) if on), 0)
+        frame_log.debug("selected_zone: %s → %d", self.zone_sync_zones, zone)
+        return zone
+
     # Sensor linkage (TEMP_LINKED / LOAD_LINKED choose source per global / zone)
     temp_source: SensorLink = "cpu"
     load_source: SensorLink = "cpu"
-
-    # Per-segment on/off — driven by the segment display (gauges) when
-    # the device has one; empty list = always-on.
-    segment_on: list[bool] = field(default_factory=list)
 
     # LC2 clock display options (style 9)
     clock_24h: bool = True
@@ -158,6 +184,20 @@ class LedPayload:
     colors: list[tuple[int, int, int]]
     is_on: list[bool] | None = None
     global_on: bool = True
+
+    @property
+    def shown(self) -> list[tuple[int, int, int]]:
+        """What each LED shows: its colour where lit, black where off.
+
+        The one lit rule.  The wire sends it and the preview draws it, so the
+        two cannot disagree; the preview used to apply ``is_on`` but not
+        ``global_on``, and kept every LED lit after "off".
+        """
+        frame_log.debug("LedPayload.shown: %d LEDs, global_on=%s, mask=%s",
+                        len(self.colors), self.global_on, self.is_on is not None)
+        return [c if self.global_on and (self.is_on is None or self.is_on[i])
+                else (0, 0, 0)
+                for i, c in enumerate(self.colors)]
 
 
 # =========================================================================
@@ -245,6 +285,26 @@ _ZONE_BTN_N: tuple[tuple[str, str], ...] = (
     ("led_zone_btn_3", "led_zone_btn_3_active"),
     ("led_zone_btn_4", "led_zone_btn_4_active"),
 )
+
+
+def one_hot(index: int, size: int) -> list[bool]:
+    """The zone/page mask that selects *index* alone, *size* entries long."""
+    frame_log.debug("one_hot: %d of %d", index, size)
+    return [i == index for i in range(size)]
+
+
+def zone_sync_units(ticks: int) -> int:
+    """The carousel interval as a UI shows it (the C#'s textBoxTimer)."""
+    units = max(1, round(ticks / ZONE_SYNC_TICKS_PER_UNIT))
+    log.debug("zone_sync_units: %d ticks -> %d", ticks, units)
+    return units
+
+
+def zone_sync_ticks(units: int) -> int:
+    """The ticks to store for an interval a UI was given."""
+    ticks = max(1, units) * ZONE_SYNC_TICKS_PER_UNIT
+    log.debug("zone_sync_ticks: %d -> %d ticks", units, ticks)
+    return ticks
 
 
 LED_STYLES: dict[LedStyle, LedStyleSpec] = {
@@ -336,6 +396,17 @@ ZONE_STYLE_ASSETS: dict[LedStyle, tuple[tuple[str, str], ...]] = {
 # LF10 (style 7).
 LED_SELECT_ALL_STYLES: frozenset[int] = frozenset({2, 7})
 
+
+def is_select_all(style: LedStyle | None) -> bool:
+    """PA120/LF10: the zone selector edits zones and rotates nothing.
+
+    By the LEGACY id: ``LedStyle`` values are names ("pa120"), so the
+    ``style.value in LED_SELECT_ALL_STYLES`` the render used was never true.
+    """
+    answer = style is not None and LEGACY_STYLE_ID.get(style) in LED_SELECT_ALL_STYLES
+    frame_log.debug("is_select_all: %s → %s", style, answer)
+    return answer
+
 # Preset color buttons in the LED panel (legacy C# FormLED ucColor1
 # preset bar).  Eight fixed positions; the panel renders these as
 # square swatches users click to apply.
@@ -410,3 +481,16 @@ class _PmRegistryShim:
 
 
 PmRegistry = _PmRegistryShim()
+
+
+def stretch(colors: Sequence[tuple[int, int, int]],
+            count: int) -> list[tuple[int, int, int]]:
+    """*colors* over *count* LEDs: each takes the source colour at its place.
+
+    How every follower fits the colours it is sent to its own LEDs (the RAM
+    and OpenRGB drivers), and how the RGB page previews it -- one rule.
+    """
+    frame_log.debug("stretch: %d -> %d", len(colors), count)
+    if not colors or count <= 0:
+        return []
+    return [colors[i * len(colors) // count] for i in range(count)]

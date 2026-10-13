@@ -52,6 +52,10 @@ emit through; core imports no adapter to provide it.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import NamedTuple
 
 # ── TRACE — the fourth rung of the verbosity ladder ─────────────────────────
@@ -80,6 +84,71 @@ def trace(logger: logging.Logger, msg: str, *args: object) -> None:
     """Log at TRACE — deep internals, only ever seen under ``-vvv``."""
     if logger.isEnabledFor(TRACE):
         logger.log(TRACE, msg, *args)
+
+
+#: Leading bytes shown when a binary payload is rendered into a record.  Enough
+#: to recognise a magic number (``ff d8`` JPEG, ``da db dc dd`` a type-2 frame
+#: header) and no more; the whole point is that the size does not depend on the
+#: payload.
+BLOB_HEAD_BYTES = 16
+
+
+@dataclass(frozen=True, slots=True)
+class Blob:
+    """A binary payload rendered into a log record BOUNDED — size, then a head.
+
+    ``log.debug("...: %s", frame)`` on a display frame is not a log line, it is
+    a copy of the framebuffer.  ``%s`` on ``bytes`` is ``repr``, which escapes
+    every byte — measured at **2.87x** the payload on real frame data — so one
+    record costs:
+
+        320x240   rgb565      153,600 B  ->  0.45 MB   (measured in the wild)
+        1920x462  rgb565    1,774,080 B  ->  4.9  MB
+        1600x720  rgb565    2,304,000 B  ->  6.3  MB
+
+    The rotating file is 1 MB x 5.  On most panels **one frame record exceeds
+    the entire rotation budget**, so every frame rotates the log and nothing
+    one-shot survives in it.
+
+    That is not hypothetical.  Reporter #220 was asked for a scaling repro,
+    delivered two reports on 2026-09-21 — and **98% of every byte he uploaded
+    was eleven of these records**, spanning one second.  The
+    ``screen '...': devicePixelRatio=...`` line the whole request existed to
+    capture had rotated away before he ran ``trcc report``.  He also described
+    the symptom without knowing it: *"constantly writing to trcc.log through to
+    trcc.log.5, the whole time."*
+
+    The rule that every function gets a log line is worth keeping.  What it
+    cannot mean is that a function's ``bytes`` parameter goes into the record
+    whole: that discards the artifact the rule exists to protect.  Wrap it::
+
+        log.debug("_write_frame: frame=%s", Blob(frame))
+        # _write_frame: frame=153600 bytes, first 16: 18 04 ba 0c 17 14 d2 0a...
+
+    A payload that already fits the budget renders as itself, because for a
+    short one the bytes ARE the diagnosis and hex would be a downgrade — a HID
+    device path reads ``b'/dev/hidraw0'``, not ``12 bytes, first 12: 2f 64 65``.
+    So one wrapper serves every ``bytes`` argument, and no call site has to
+    judge whether its own payload is "big enough to bother"; that judgement is
+    what a reviewer gets wrong, and what a mechanical pass never makes at all.
+
+    Rendering is bounded and lazy — ``__str__`` runs only if a handler formats
+    the record, and it never touches more than :data:`BLOB_HEAD_BYTES`, so the
+    cost is O(1) in the payload rather than O(n).
+    """
+
+    data: bytes
+    head: int = BLOB_HEAD_BYTES
+
+    def __str__(self) -> str:
+        if len(self.data) <= self.head:
+            return repr(bytes(self.data))
+        return (f"{len(self.data)} bytes, first {self.head}: "
+                f"{bytes(self.data[:self.head]).hex(' ')}")
+
+    #: ``%r`` has to be bounded as well, or the wrapper leaks the payload it
+    #: exists to bound the moment a caller reaches for repr.
+    __repr__ = __str__
 
 
 class Verbosity(NamedTuple):
@@ -144,3 +213,101 @@ def per_frame(module_name: str) -> logging.Logger:
     name = f"{PER_FRAME_ROOT}.{module_name.removeprefix('trcc.')}"
     log.debug("per_frame: %s → %s", module_name, name)
     return logging.getLogger(name)
+
+
+def sink_for(level: int, log: logging.Logger,
+             frame: logging.Logger) -> logging.Logger:
+    """The logger a Command's lines belong to: *frame* for one that declares
+    itself per-tick (``LOG_LEVEL`` DEBUG or below), else *log*.
+
+    A Command already says how often it runs, so the sink follows that rather
+    than a second list that would drift from it.  ``App.dispatch`` and
+    ``AppProxy.dispatch`` -- the chokepoint in each process -- both ask here.
+    """
+    sink = frame if level <= logging.DEBUG else log
+    frame_log.debug("sink_for: level=%d -> %s", level, sink.name)
+    return sink
+
+
+# ── Dispatch origin — which UI asked ─────────────────────────────────────
+#
+# Every UI dispatches through the same bus, so the bus's one log line could
+# not say WHO asked: a CLI ``color``, an API poll and the session's own
+# restore all read "dispatch …".  The UI that dispatches names itself here
+# (``UserInterface.dispatch`` passes its registry key), and ``App.dispatch``
+# prints it.  A context variable, not a parameter: a Command's own child
+# dispatches inherit it, and a background thread (hotplug, the loops) starts
+# with the default — so what core does on its own reads ``[core]``.
+
+_ORIGIN: ContextVar[str] = ContextVar("trcc_dispatch_origin", default="core")
+#: Both run on EVERY dispatch, per-tick ones included — the per-frame family.
+frame_log = per_frame(__name__)
+
+
+@contextmanager
+def dispatch_origin(key: str) -> Iterator[None]:
+    """Name the UI dispatching inside this block (``"api"``, ``"cli"``, …)."""
+    frame_log.debug("dispatch_origin: %s", key)
+    token = _ORIGIN.set(key)
+    try:
+        yield
+    finally:
+        _ORIGIN.reset(token)
+
+
+def current_origin() -> str:
+    """The UI the current dispatch came from, or ``"core"``."""
+    origin = _ORIGIN.get()
+    frame_log.debug("current_origin: %s", origin)
+    return origin
+
+
+# ── A failure that repeats every poll ────────────────────────────────────
+#
+# A sensor read that fails once fails on every poll after it — a pynvml build
+# without ``nvmlDeviceGetFanSpeedRPM`` raises the same AttributeError at 1 Hz
+# per GPU.  Logging its traceback each time wrote ~6 lines per GPU per second
+# into the one file ``trcc report`` sends, rotating the diagnosis out of it
+# within hours (#312).  The traceback is logged ONCE; repeats go to the
+# per-frame family, silent unless ``-v``.
+
+_REPORTED: set[str] = set()
+_REPEATS: dict[str, logging.Logger] = {}
+
+
+def _repeat(log: logging.Logger, msg: str, *args: object) -> bool:
+    """True when *msg* was reported before -- and then it goes per-frame.
+
+    The formatted message is the key, so ``nvmlDeviceGetFanSpeedRPM(0) failed``
+    and ``…(1) failed`` are reported once each.
+    """
+    key = f"{log.name}:{msg % args if args else msg}"
+    if key in _REPORTED:
+        frame_log = _REPEATS.get(log.name) or _REPEATS.setdefault(
+            log.name, per_frame(log.name))
+        frame_log.debug(msg, *args)
+        return True
+    _REPORTED.add(key)
+    return False
+
+
+def recurring_failure(log: logging.Logger, msg: str, *args: object) -> None:
+    """Log a per-poll failure: its traceback once, then per-frame only.
+
+    Call from the ``except`` block.  One report per function per GPU, which is
+    what a report needs.
+    """
+    if not _repeat(log, msg, *args):
+        log.debug(msg + " — traceback logged once; repeats go to the per-frame log",
+                  *args, exc_info=True)
+
+
+def recurring_warning(log: logging.Logger, msg: str, *args: object) -> None:
+    """A WARNING that a per-tick loop would repeat: once, then per-frame only.
+
+    A screencast whose capture broke fails the same way seven times a second;
+    as a WARNING each time it rotates the diagnosis out of the file ``trcc
+    report`` sends.
+    """
+    if not _repeat(log, msg, *args):
+        log.warning(msg + " — repeats go to the per-frame log", *args)

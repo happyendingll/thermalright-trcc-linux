@@ -25,7 +25,6 @@ from PySide6.QtWidgets import QLabel, QLineEdit, QPushButton, QWidget
 if TYPE_CHECKING:
     from ...core.models import HardwareMetrics
 
-from ...app import App
 from ...core.commands import GetSensorDashboard, SetSensorDashboard
 from ...core.models import (
     CATEGORY_COLORS,
@@ -33,6 +32,7 @@ from ...core.models import (
     PanelConfig,
     SensorBinding,
 )
+from ...core.ports import CommandBus
 from ..presentation.sensor_display import format_sensor_value
 from .assets import Assets
 from .base import set_background_pixmap
@@ -279,7 +279,7 @@ class UCSystemInfo(QWidget):
 
     panel_clicked = Signal(object)  # SystemInfoPanel
 
-    def __init__(self, app: App, parent=None):
+    def __init__(self, app: CommandBus, parent=None):
         super().__init__(parent)
         _, _, w, h = Layout.SYSINFO_PANEL
         self.setFixedSize(w, h)
@@ -324,14 +324,22 @@ class UCSystemInfo(QWidget):
         # persisted when the user actually edits it.  So a dashboard
         # re-derives its unbound rows every launch instead of freezing at
         # whatever the very first run happened to see.
-        result = self._app.dispatch(GetSensorDashboard())
-        self._dashboard = result.panels
-        log.info(
-            "UCSystemInfo._setup_ui: %d panel(s), %d row(s) auto-mapped",
-            len(self._dashboard), result.auto_mapped,
-        )
+        self.show_dashboard(rebuild=True)    # the grid exists even when empty
 
-        self._rebuild_grid()
+    def show_dashboard(self, *, rebuild: bool = False) -> None:
+        """Show the layout the App holds -- at open, and when any UI saves one.
+
+        Rebuilt only when it differs from what is shown: every edit here is
+        saved at once, so this window's own save comes back identical.
+        """
+        result = self._app.dispatch(GetSensorDashboard())
+        changed = list(result.panels) != list(self._dashboard)
+        log.info("UCSystemInfo.show_dashboard: %d panel(s), %d row(s) "
+                 "auto-mapped, changed=%s", len(result.panels),
+                 result.auto_mapped, changed)
+        if rebuild or changed:
+            self._dashboard = result.panels
+            self._rebuild_grid()
 
     def _save(self) -> None:
         """Persist the edited layout through the bus."""
@@ -588,16 +596,9 @@ class UCSystemInfo(QWidget):
         """Add a new custom panel."""
         log.info("UCSystemInfo._on_add_clicked: existing=%d",
                  len(self._dashboard))
-        new_panel = PanelConfig(
-            category_id=0, name="Custom",
-            sensors=[
-                SensorBinding("Sensor 1", "", ""),
-                SensorBinding("Sensor 2", "", ""),
-                SensorBinding("Sensor 3", "", ""),
-                SensorBinding("Sensor 4", "", ""),
-            ],
-        )
-        self._dashboard.append(new_panel)
+        # What a new panel IS lives on the model, not here — qtgui and the
+        # CLI add panels too, and three literals would be three drifts.
+        self._dashboard.append(PanelConfig.custom())
         self._save()
 
         # Navigate to the page where the new panel is

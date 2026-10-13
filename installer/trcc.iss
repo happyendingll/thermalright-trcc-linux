@@ -28,6 +28,11 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 WizardStyle=modern
 PrivilegesRequired=admin
+; The [Registry] PATH entry is a machine-wide environment change.  Without this
+; Setup never broadcasts WM_SETTINGCHANGE, so Explorer -- and every terminal it
+; opens -- keeps the old PATH and 'trcc' is "not recognized" until the user
+; signs out (#218).  Applies to the uninstall's PATH removal as well.
+ChangesEnvironment=yes
 LicenseFile=..\LICENSE
 ; Upgrade: detect running TRCC and offer to close it
 CloseApplications=yes
@@ -72,9 +77,8 @@ Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environmen
     Check: NeedsAddPath('{app}')
 
 [UninstallDelete]
-; Clean up autostart entry and app directory
-Type: files; Name: "{userappdata}\Microsoft\Windows\Start Menu\Programs\Startup\trcc-linux.desktop"
-Type: files; Name: "{userstartup}\trcc-linux.desktop"
+; The app directory.  (Autostart is removed in CurUninstallStepChanged: the
+; sign-in task and the Run values.  Nothing ever wrote to the Startup folder.)
 Type: filesandordirs; Name: "{app}"
 ; Remove user config and data (~/.trcc)
 ; ~/.trcc-user is intentionally kept — contains user-created custom content
@@ -140,13 +144,24 @@ begin
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  ResultCode: Integer;
 begin
   if CurUninstallStep = usUninstall then
   begin
     { Remove TRCC from system PATH }
     RemoveFromPath(ExpandConstant('{app}'));
 
-    { Remove autostart registry key if TRCC set it }
+    { Remove every autostart TRCC may have set.  The names are identity and
+      must match src/trcc/adapters/system/_autostart.py -- gated by
+      tests/test_installer_uninstall.py.  The sign-in task (_TASK_NAME) is
+      what the installed app uses; left behind, it runs a deleted program at
+      every sign-in. }
+    Exec(ExpandConstant('{sys}\schtasks.exe'), '/delete /tn "TRCC Linux" /f',
+         '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    RegDeleteValue(HKEY_CURRENT_USER,
+      'Software\Microsoft\Windows\CurrentVersion\Run',
+      'TRCCNext');
     RegDeleteValue(HKEY_CURRENT_USER,
       'Software\Microsoft\Windows\CurrentVersion\Run',
       'TRCC Linux');

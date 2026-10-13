@@ -431,6 +431,73 @@ def test_the_granted_stream_size_is_logged(
     assert session._stream_size == (1895, 1008)
 
 
+
+# ── logical region → buffer pixels (HiDPI, monitor origin) ───────────
+
+
+@pytest.mark.parametrize(("region", "granted", "buffer", "expected"), [
+    # 200%: mutter's buffer is logical x 2 (meta-stream-source-monitor.c).
+    ((100, 50, 640, 360), ((0, 0), (1920, 1080)), (3840, 2160),
+     (200, 100, 1280, 720)),
+    # 125%, fractional: the whole logical screen is the whole buffer.
+    ((0, 0, 2048, 1152), ((0, 0), (2048, 1152)), (2560, 1440),
+     (0, 0, 2560, 1440)),
+    # A second monitor at x=1920: its own stream starts at its own corner.
+    ((2020, 10, 100, 100), ((1920, 0), (1280, 1024)), (1280, 1024),
+     (100, 10, 100, 100)),
+    # Nothing reported: used as given, the behaviour before.
+    ((5, 6, 7, 8), None, (1920, 1080), (5, 6, 7, 8)),
+], ids=["200pct", "125pct", "second-monitor", "unreported"])
+def test_a_logical_region_maps_onto_the_stream_buffer(
+    region: tuple[int, int, int, int],
+    granted: tuple[tuple[int, int], tuple[int, int]] | None,
+    buffer: tuple[int, int], expected: tuple[int, int, int, int],
+) -> None:
+    """The portal's position/size are logical; its buffer is device pixels.
+
+    MUTATION CHECK: return the region unmapped → the scaled and the
+    second-monitor cases fail.
+    """
+    from trcc.adapters.screencast.pipewire import map_region_to_buffer
+
+    assert map_region_to_buffer(*region, granted, buffer) == expected
+
+
+class _ScaledSession(_Session):
+    """A 2x2 logical screen streamed as a 4x4 buffer (200%)."""
+
+    granted = ((0, 0), (2, 2))
+
+
+def test_a_scaled_stream_crops_the_whole_picked_area(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """At 200% the old crop took a quarter of the picked area.
+
+    MUTATION CHECK: drop the ``map_region_to_buffer`` call in
+    ``grab_region`` → a 2x2 frame comes back and this fails.
+    """
+    monkeypatch.setattr(pw, "PIPEWIRE_AVAILABLE", True)
+    frame = (4, 4, bytes(range(48)))
+
+    got = _capture(_ScaledSession(running=True, frame=frame),
+                   _Fallback()).grab_region(0, 0, 2, 2)
+
+    assert (got.width, got.height, got.data) == (4, 4, bytes(range(48)))
+
+
+def test_the_granted_position_is_kept() -> None:
+    from trcc.adapters.screencast.pipewire import PipeWireScreenCast
+
+    session = PipeWireScreenCast()          # constructing it touches no portal
+    results = {"streams": [(77, {"size": (1280, 1024), "position": (1920, 0)})]}
+    try:
+        PipeWireScreenCast._on_start_response(session, 0, results)
+    except Exception:
+        pass                                # the pipeline half needs a portal
+
+    assert session.granted == ((1920, 0), (1280, 1024))
+
 # ── the restore token ─────────────────────────────────────────────────
 
 
@@ -774,6 +841,10 @@ def test_a_frozen_stream_is_reported_once(caplog, monkeypatch) -> None:
     time, so "no frame yet" cannot see this.  What is wrong is that it is the
     same frame, and the only symptom the user has is a frozen panel.
     """
+    # Availability is set, not inherited: it follows whether the HOST has the
+    # bindings, and on CI's clean venv (no dbus) this test read the fallback
+    # path and saw no stall at all.
+    monkeypatch.setattr(pw, "PIPEWIRE_AVAILABLE", True)
     frame = (4, 4, b"\x09" * 48)
     cap = _capture(_Session(running=True, frame=frame), _Fallback())
 
@@ -868,3 +939,72 @@ def test_a_missing_pipewiresrc_names_the_package_to_install(
     assert "gst-inspect-1.0 pipewiresrc" in message, (
         "the error must say how to confirm the fix worked"
     )
+
+
+def test_a_portal_cast_writes_nothing_per_frame(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The Wayland rung ran ~16 times a second with a plain-logger line.
+
+    MUTATION CHECK: log ``grab_region`` on the plain logger again and the 20
+    frames below write 20 records to the file.
+    """
+    import gc
+    import logging
+
+    monkeypatch.setattr(pw, "PIPEWIRE_AVAILABLE", True)
+    session = _Session(running=True, frame=(8, 4, bytes([0xAB]) * (8 * 4 * 3)))
+    capture = _capture(session, _Fallback())
+    # A capture left by an EARLIER test, finalized mid-window, logs its own
+    # ``__del__`` -> ``stop`` lines here (CI 3.12, fc69ddf4).  Collect first and
+    # hold the collector off, so the window holds only these 20 frames.
+    gc.collect()
+    gc.disable()
+    try:
+        with caplog.at_level(logging.DEBUG):
+            capture.grab_region(1, 1, 2, 2)
+            caplog.clear()
+            for _ in range(20):
+                capture.grab_region(1, 1, 2, 2)
+    finally:
+        gc.enable()
+
+    assert [r.getMessage() for r in caplog.records
+            if not r.name.startswith("trcc.frame")] == []
+
+
+def test_the_capture_pipeline_converts_no_more_than_the_cast_uses() -> None:
+    """A 60 Hz screen through the real pipeline: the cast-rate frames, no more.
+
+    Driven with GStreamer itself (a live 60 fps test source in place of
+    ``pipewiresrc``, which needs a portal).  Converting and copying every
+    frame at full size, to keep one in four, was ~70% of the pipeline.
+
+    MUTATION CHECK: drop ``videorate`` from ``capture_pipeline`` and ~120
+    frames arrive in these two seconds.
+    """
+    gi = pytest.importorskip("gi")
+    gi.require_version("Gst", "1.0")
+    from gi.repository import GLib, Gst
+
+    Gst.init(None)
+    if Gst.ElementFactory.find("videorate") is None:
+        pytest.skip("GStreamer has no videorate here")
+    pipe = Gst.parse_launch(pw.capture_pipeline(
+        "videotestsrc is-live=true pattern=solid-color ! "
+        "video/x-raw,format=BGRx,width=64,height=48,framerate=60/1"))
+    frames: list[int] = []
+
+    def on_sample(sink: Any) -> Any:
+        sink.emit("pull-sample")
+        frames.append(1)
+        return Gst.FlowReturn.OK
+
+    pipe.get_by_name("sink").connect("new-sample", on_sample)
+    pipe.set_state(Gst.State.PLAYING)
+    loop = GLib.MainLoop()
+    GLib.timeout_add(2000, loop.quit)
+    loop.run()
+    pipe.set_state(Gst.State.NULL)
+
+    assert 10 <= len(frames) <= 2 * pw.CAPTURE_MAX_FPS + 2, len(frames)

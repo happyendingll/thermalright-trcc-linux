@@ -15,12 +15,12 @@ A step-by-step guide for every major Linux distro. Each section is self-containe
 | Distribution | Package | PyPI / pip |
 |-------------|---------|------------|
 | Fedora / Nobara | [Native RPM](#fedora--nobara) | [pip](#fedora--nobara-pip) |
-| Debian 13+ / Mint 22+ / Pop!_OS / Zorin | [Native DEB](#ubuntu--debian--mint--pop_os--zorin) | [pip](#ubuntu--debian--mint--pop_os--zorin-pip) |
-| Ubuntu 24.04 / Ubuntu 22.04 / Mint 21.x / Debian 12 (older) | [Legacy DEB](#ubuntu-2204--mint-21x--debian-12-legacy-deb) | [pip](#ubuntu--debian--mint--pop_os--zorin-pip) |
+| Ubuntu 25.10+ / Debian 13+ | [Native DEB](#ubuntu--debian--mint--pop_os--zorin) | [pip](#ubuntu--debian--mint--pop_os--zorin-pip) |
+| Ubuntu 22.04 / 24.04, Mint 21–22, Pop!_OS, Zorin, Debian 12 | [Legacy DEB](#ubuntu-2204--2404--mint-21x--22x--debian-12-legacy-deb) | [pip](#ubuntu--debian--mint--pop_os--zorin-pip) |
 | Arch / CachyOS / Manjaro / EndeavourOS / Garuda | [Native pkg](#arch--cachyos--manjaro--endeavouros--garuda) | [pip](#arch--cachyos--manjaro--endeavouros--garuda-pip) |
-| openSUSE | [Native RPM](#opensuse) | [pip](#opensuse-pip) |
+| openSUSE | — | [pipx](#opensuse-pip) |
 | NixOS | [Flake](#nixos) | — |
-| Gentoo | [Ebuild](#gentoo) | — |
+| Gentoo | [pipx](#gentoo) | — |
 | Bazzite / Bluefin / Aurora / Fedora Atomic | [rpm-ostree](#bazzite--aurora--bluefin--fedora-atomic) | — |
 | SteamOS (Steam Deck) | — | [pip / Distrobox](#steamos-steam-deck) |
 | Vanilla OS | — | [apx subsystem](#vanilla-os) |
@@ -31,7 +31,7 @@ A step-by-step guide for every major Linux distro. Each section is self-containe
 | Clear Linux | — | [pip](#clear-linux) |
 | Windows 10/11 | [Installer](#windows-experimental) | — |
 | macOS 11+ (Apple Silicon) | [DMG](#macos-experimental) | — |
-| macOS 11+ (Intel) | — | [pipx](#macos-experimental) |
+| macOS 11+ (Intel) | [DMG](#macos-experimental) | [pipx](#macos-experimental) |
 | FreeBSD | — | [pip](#freebsd-experimental) |
 | Asahi Linux (Apple Silicon) | — | [pip](#asahi-linux-apple-silicon) |
 | Raspberry Pi / ARM SBCs | — | [pip](#raspberry-pi--arm-sbcs) |
@@ -77,7 +77,7 @@ Once the terminal is open, you can paste commands with `Ctrl+Shift+V` (not `Ctrl
 
 ### Fedora / Nobara
 
-Covers: Fedora 39+, Nobara 39+
+Covers: Fedora 43+, and Nobara built on it. Older Fedora: use [pip](#fedora--nobara-pip) — the RPM is built for Fedora's current Python.
 
 **One-liner** (download + install in one command):
 ```bash
@@ -105,9 +105,9 @@ That's it! If your device isn't detected, restart your computer and try again �
 
 ### Ubuntu / Debian / Mint / Pop!_OS / Zorin
 
-Covers: Ubuntu 24.04+ (including **26.04 / Python 3.14**), Debian 13+, Linux Mint 22+, Pop!_OS 24.04+, Zorin OS 17+, KDE neon, Kubuntu, Xubuntu, Lubuntu
+Covers: Ubuntu 25.10+ (including **26.04 / Python 3.14**) and its flavours (Kubuntu, Xubuntu, Lubuntu), Debian 13+
 
-> **Older versions** (Ubuntu 22.04, Mint 21.x, Debian 11/12, Pop!_OS 22.04, elementary OS 7) — use the [Legacy DEB](#ubuntu-2204--mint-21x--debian-12-legacy-deb) instead, which bundles its own Python environment.
+> **Ubuntu 24.04 and everything built on it** (Linux Mint 22, Pop!_OS 24.04, Zorin OS 18, KDE neon, elementary OS 8), **and older releases** (Ubuntu 22.04, Mint 21.x, Debian 11/12, Pop!_OS 22.04, Zorin OS 17, elementary OS 7) — use the [Legacy DEB](#ubuntu-2204--2404--mint-21x--22x--debian-12-legacy-deb) instead, which bundles its own Python environment. Ubuntu 24.04 does not ship PySide6 at all, so this package cannot install there (#316).
 
 > **On Ubuntu 26.04 (Python 3.14):** use **v9.7.5 or newer** — earlier `.deb`s installed to a Python-version-specific path and failed with `ModuleNotFoundError: No module named 'trcc'`.
 
@@ -134,18 +134,13 @@ trcc gui
 
 That's it! If your device isn't detected, restart your computer and try again — that's usually all it takes. Still nothing? See the [Device Testing Guide](GUIDE_DEVICE_TESTING.md) or run `trcc report` and [open an issue](https://github.com/Lexonight1/thermalright-trcc-linux/issues/new) with the output.
 
-> **`python3-pyside6` not found?** On Ubuntu 24.04 it may be in the `universe` repository — enable it, then install again:
-> ```bash
-> sudo add-apt-repository universe
-> sudo apt update
-> sudo apt install ./trcc-linux-latest_all.deb
-> ```
+> **`python3-pyside6.qtcore … is not installable`?** Your release does not ship PySide6 (Ubuntu 24.04 and the distros built on it) — enabling `universe` does not help. Use the [Legacy DEB](#ubuntu-2204--2404--mint-21x--22x--debian-12-legacy-deb).
 
 ---
 
-### Ubuntu 22.04 / Mint 21.x / Debian 12 (Legacy DEB)
+### Ubuntu 22.04 / 24.04 / Mint 21.x / 22.x / Debian 12 (Legacy DEB)
 
-Covers: Ubuntu 22.04 LTS, Linux Mint 21.x, Linux Mint 22.x, Debian 12 (Bookworm), Pop!_OS 22.04, elementary OS 7
+Covers: Ubuntu 22.04 LTS, Ubuntu 24.04 LTS, Linux Mint 21.x, Linux Mint 22.x, Debian 12 (Bookworm), Pop!_OS 22.04 / 24.04, Zorin OS 17 / 18, KDE neon, elementary OS 7 / 8
 
 The standard `.deb` requires `python3-pyside6` and other packages that aren't in Ubuntu 22.04's repos. This legacy package installs Python dependencies into `/opt/trcc-linux` via pip — no system Python conflicts, no `--break-system-packages`.
 
@@ -190,6 +185,8 @@ cd ~/Downloads
 sudo pacman -U trcc-linux-*-any.pkg.tar.zst
 ```
 
+> **Optional HID backend:** Arch ships two Python HID bindings that conflict, so the package depends on neither. Install `python-hidapi`, or keep `python-hid` if it is already there (SteamOS ships it) — one, never both.
+
 **Step 3 — Launch:**
 
 ```bash
@@ -202,22 +199,10 @@ That's it! If your device isn't detected, restart your computer and try again �
 
 ### openSUSE
 
-Covers: openSUSE Tumbleweed, openSUSE Leap 15.5+
-
-**Step 1 — Download** the `.rpm` file from the [latest release](https://github.com/Lexonight1/thermalright-trcc-linux/releases/latest).
-
-**Step 2 — Open a terminal** and run:
-
-```bash
-cd ~/Downloads
-sudo zypper install ./trcc-linux-*.noarch.rpm
-```
-
-**Step 3 — Launch:**
-
-```bash
-trcc gui
-```
+There is no native openSUSE package: the `.rpm` on the releases page is built
+for Fedora, and on openSUSE `zypper` refuses it (`nothing provides 'libusb1'`),
+and its files target a different Python. Use **[pipx](#opensuse-pip)** —
+measured working on Tumbleweed.
 
 ---
 
@@ -279,24 +264,23 @@ trcc gui
 
 Covers: Gentoo Linux, Funtoo, Calculate Linux
 
-An ebuild is provided in the repo:
+Install with pipx -- there is no maintained ebuild:
 
 ```bash
-# Copy the ebuild to your local overlay
-sudo mkdir -p /var/db/repos/local/app-misc/trcc-linux
-sudo cp packaging/gentoo/trcc-linux-*.ebuild /var/db/repos/local/app-misc/trcc-linux/
-cd /var/db/repos/local/app-misc/trcc-linux
-sudo ebuild trcc-linux-*.ebuild manifest
+# Step 1: Install system dependencies
+sudo emerge --ask dev-python/pipx sys-apps/sg3_utils media-video/ffmpeg media-libs/portaudio
 
-# Install
-sudo emerge --ask app-misc/trcc-linux
-```
+# Step 2: Install TRCC
+pipx install trcc-linux
 
-Then:
+# Step 3: Run the setup wizard (device permissions, desktop shortcut)
+trcc system setup
 
-```bash
+# Step 4: Launch
 trcc gui
 ```
+
+> To upgrade later: `pipx upgrade trcc-linux`
 
 ---
 
@@ -375,10 +359,10 @@ Arch-based distros enforce PEP 668 — use `pipx` instead of `pip`:
 
 ```bash
 # Step 1: Install system dependencies
-sudo pacman -S python-pipx sg3_utils python-pyside6 portaudio ffmpeg
+sudo pacman -S python-pipx sg3_utils pyside6 portaudio ffmpeg
 
 # Step 2: Install optional extras (hardware sensors, Wayland screen capture)
-sudo pacman -S lm_sensors grim python-gobject python-dbus python-gst
+sudo pacman -S lm_sensors grim python-gobject python-dbus gst-python
 
 # Step 3: Install TRCC via pipx
 pipx install trcc-linux
@@ -398,10 +382,10 @@ trcc gui
 
 ```bash
 # Step 1: Install system dependencies
-sudo zypper install python3-pipx sg3_utils python3-pyside6 portaudio ffmpeg
+sudo zypper install python3-pipx sg3_utils libgthread-2_0-0 portaudio ffmpeg 7zip
 
 # Step 2: Install optional extras (hardware sensors, Wayland screen capture)
-sudo zypper install sensors grim python3-gobject python3-dbus-python python3-gstreamer
+sudo zypper install sensors grim python3-gobject python3-dbus-python python3-gst
 
 # Step 3: Install TRCC
 pipx install trcc-linux
@@ -547,7 +531,7 @@ sudo ./install.sh
 
 The script auto-detects your distro, installs system packages, Python deps, udev rules, and a desktop shortcut. After it finishes: restart your computer, then run `trcc gui`.
 
-To uninstall: `trcc uninstall` (or `sudo ./install.sh --uninstall`).
+To uninstall: `sudo ./install.sh --uninstall`.
 
 ---
 
@@ -665,8 +649,12 @@ sudo steamos-readonly disable
 # Set a password if you haven't already
 passwd
 
+# Set up pacman's keyring (fixes "keyring is not writable" / "required key missing")
+sudo pacman-key --init
+sudo pacman-key --populate archlinux holo
+
 # Install dependencies
-sudo pacman -S --needed sg3_utils python-pip python-pyside6 portaudio ffmpeg
+sudo pacman -S --needed sg3_utils python-pip pyside6 portaudio ffmpeg
 
 # Install TRCC
 pip install --break-system-packages trcc-linux
@@ -689,14 +677,22 @@ trcc gui
 distrobox create --name trcc --image archlinux:latest
 distrobox enter trcc
 
-# Inside the container
-sudo pacman -S python-pip sg3_utils python-pyside6 portaudio ffmpeg
-pip install trcc-linux
+# Inside the container (it is disposable, so a system-wide pip install is fine here)
+sudo pacman -Syu --needed python-pip sg3_utils pyside6 portaudio ffmpeg
+sudo pip install --break-system-packages trcc-linux
 exit
 
-# Set up udev on the HOST (requires temporary unlock)
+# Set up device access on the HOST (requires temporary unlock).
+# The app is installed inside the container, so the host can't run `trcc system setup`;
+# it installs the same files the Arch package does, straight from the repo.
 sudo steamos-readonly disable
-sudo trcc system setup
+base=https://raw.githubusercontent.com/Lexonight1/thermalright-trcc-linux/main/packaging
+sudo curl -fsSLo /etc/udev/rules.d/99-trcc-lcd.rules "$base/udev/99-trcc-lcd.rules"
+sudo curl -fsSLo /etc/modprobe.d/trcc-lcd.conf "$base/modprobe/trcc-lcd.conf"
+sudo curl -fsSLo /etc/modules-load.d/trcc-sg.conf "$base/modprobe/trcc-sg.conf"
+sudo curl -fsSLo /etc/modules-load.d/trcc-rapl.conf "$base/modprobe/trcc-rapl.conf"
+sudo udevadm control --reload-rules && sudo udevadm trigger
+sudo modprobe sg; sudo modprobe intel_rapl_msr
 sudo steamos-readonly enable
 
 # Run
@@ -766,7 +762,7 @@ Download [`trcc-latest-setup.exe`](https://github.com/Lexonight1/thermalright-tr
 **Requirements:**
 - Windows 10 or 11
 - For NVIDIA GPU sensors: install [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) — trcc reads its sensors automatically
-- For bulk USB devices (GrandVision, Mjolnir Vision, Stream Vision, Wonder Vision): install [Zadig](https://zadig.akeo.ie/) and switch the driver to WinUSB. Run `trcc system setup-winusb` for guidance. SCSI devices (most models) work with the default Windows driver.
+- For bulk USB devices (GrandVision, Mjolnir Vision, Stream Vision, Wonder Vision): install [Zadig](https://zadig.akeo.ie/) and switch the driver to WinUSB. Run `trcc system setup` for guidance. SCSI devices (most models) work with the default Windows driver.
 - Run as Administrator for full hardware access
 
 **Verify:**
@@ -781,9 +777,11 @@ trcc doctor
 
 Download [`trcc-latest-macos.dmg`](https://github.com/Lexonight1/thermalright-trcc-linux/releases/latest/download/trcc-latest-macos.dmg) from the [latest release](https://github.com/Lexonight1/thermalright-trcc-linux/releases/latest), open the DMG, and drag **TRCC** to Applications.
 
-> **Intel Macs:** the DMG is built for Apple Silicon (arm64) only — it won't run
-> on an Intel Mac. Install via [`pipx`](https://pipx.pypa.io) instead (confirmed
-> working on Intel Macs and Hackintosh):
+> **Intel Macs:** download
+> [`trcc-latest-macos-intel.dmg`](https://github.com/Lexonight1/thermalright-trcc-linux/releases/latest/download/trcc-latest-macos-intel.dmg)
+> instead — the plain DMG is Apple Silicon (arm64) only.  The Intel DMG lasts
+> as long as GitHub offers an Intel build machine (until August 2027); `pipx`
+> works on Intel Macs and Hackintosh either way:
 >
 > ```bash
 > brew install pipx libusb p7zip ffmpeg
@@ -1009,10 +1007,18 @@ not been restored. Remove the pieces directly:
 
 ```bash
 trcc system autostart disable                 # drop the autostart entry
+trcc system ram-lighting disable              # BEFORE uninstalling: take back the RAM-bus grant, if you enabled it
 pip uninstall trcc-linux                      # or your package manager
 sudo rm -f /etc/udev/rules.d/99-trcc-lcd.rules    # udev rule
+sudo rm -f /etc/modules-load.d/trcc-sg.conf /etc/modules-load.d/trcc-rapl.conf
+sudo rm -f /usr/bin/trcc-ram-access /usr/bin/trcc-ram-access-off \
+           /usr/share/polkit-1/actions/com.github.lexonight1.trcc.policy   # setup's polkit files (pip/source only)
 rm -rf ~/.trcc ~/.trcc-user                   # config, data, your themes
 ```
+
+The distro packages (rpm, deb, Arch) remove the RAM-lighting grant themselves
+when uninstalled; a pip or source install cannot, so run `ram-lighting
+disable` first.
 
 `~/.trcc-user/` holds themes and backgrounds **you** authored — back it up
 first if you want to keep them.
@@ -1023,6 +1029,8 @@ first if you want to keep them.
 pip uninstall trcc-linux
 sudo rm /etc/udev/rules.d/99-trcc-lcd.rules
 sudo rm /etc/modprobe.d/trcc-lcd.conf
+sudo rm -f /etc/modules-load.d/trcc-sg.conf /etc/modules-load.d/trcc-rapl.conf
+sudo rm -f /etc/udev/rules.d/70-trcc-ram-lighting.rules /etc/modules-load.d/trcc-i2c.conf   # RAM-lighting grant
 sudo udevadm control --reload-rules
 rm -rf ~/.config/trcc ~/.trcc
 rm -f ~/.config/autostart/trcc*.desktop
@@ -1037,4 +1045,4 @@ rm -f ~/.local/share/applications/trcc*.desktop
 - See the [Device Testing Guide](GUIDE_DEVICE_TESTING.md) for verifying your setup
 - Run `trcc report` and [open an issue](https://github.com/Lexonight1/thermalright-trcc-linux/issues/new) with the output — this gives us everything we need to help you
 - Check the [Troubleshooting Guide](GUIDE_TROUBLESHOOTING.md) for common issues and fixes
-- For verbose output: `trcc gui -v` (or `trcc gui -vv` for debug)
+- For verbose output: `trcc -v gui` (or `trcc -vv gui` for debug)

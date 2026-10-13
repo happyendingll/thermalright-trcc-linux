@@ -4,7 +4,7 @@
 
 A REST interface to the same command bus every other UI uses. Each endpoint builds a Command, dispatches it, and returns the Result as JSON — so anything here is also reachable from the CLI, the GUI, or your own client. The Commands themselves are documented in [`REFERENCE_COMMANDS.md`](REFERENCE_COMMANDS.md).
 
-**137 endpoints.**
+**140 endpoints.**
 
 ## Running it
 
@@ -32,6 +32,7 @@ Interactive docs are served at `/docs` while the API is running.
 | `POST /devices/{key}/connect` | `ConnectView` | Connect *key*.  Returns the full handshake — including the raw device response as hex, the field issue triage always asks for. |
 | `POST /devices/{key}/disconnect` | `DisconnectResult` | — |
 | `POST /devices/{key}/reset` | `DisconnectResult` | Power-cycle the device: disconnect, reconnect, restore its display. |
+| `GET /devices/{key}/state` | `DeviceStateResult` | What an attached device IS: the cooler its handshake identified (``product``, ``resolution``) beside the catalog's guess for its USB id (``catalog_product``, ``catalog_resolution``), plus the handshake bytes. |
 
 ## Display, themes and frames
 
@@ -45,6 +46,7 @@ Interactive docs are served at `/docs` while the API is running.
 | `POST /devices/{key}/display/create-theme` | `CreateThemeResponse` | Create + apply a custom theme from uploaded multipart files. |
 | `POST /devices/{key}/display/export-video` | `VideoExportResult` | Encode a clip into a loose ``Theme.zt`` sized for the device's panel. |
 | `POST /devices/{key}/display/fit-mode` | `FitModeResult` | — |
+| `POST /devices/{key}/display/game` | `GameModeResult` | Switch game mode and/or set its CPU threshold. |
 | `POST /devices/{key}/display/keepalive` | `KeepaliveResult` | Run a keepalive burst (resend the last frame N times). |
 | `POST /devices/{key}/display/load-video` | `ThemeResult` | Stage a video as a one-file theme and apply it to the device. |
 | `POST /devices/{key}/display/loop-video` | `LoopVideoResult` | Toggle whether playback wraps or sticks at the last frame. |
@@ -55,27 +57,26 @@ Interactive docs are served at `/docs` while the API is running.
 | `POST /devices/{key}/display/orientation` | `OrientationResult` | — |
 | `POST /devices/{key}/display/overlay` | `OverlayResult` | — |
 | `POST /devices/{key}/display/overlay-background` | `OverlayBackgroundResult` | Set the solid background color used when background-mode=color. |
+| `GET /devices/{key}/display/overlay-elements` | `OverlayLayoutResult` | What is currently drawn on the device -- the read half of overlay. |
 | `POST /devices/{key}/display/overlay-elements` | `OverlayElementResult` | Add a user-edited overlay element. |
 | `PUT /devices/{key}/display/overlay-elements` | `OverlayConfigResult` | Bulk replace the user-overlay element list. |
 | `DELETE /devices/{key}/display/overlay-elements/{element_id}` | `OverlayElementDeleteResult` | Remove an overlay element by id. |
 | `PATCH /devices/{key}/display/overlay-elements/{element_id}` | `OverlayElementResult` | Mutate fields on an existing user-edited overlay element. |
-| `POST /devices/{key}/display/overlay-elements/{element_id}/flash` | `OverlayElementResult` | Briefly highlight an overlay element in the GUI. |
 | `POST /devices/{key}/display/pause-video` | `PauseVideoResult` | Pause / resume video playback. |
 | `POST /devices/{key}/display/play-video` | `VideoResult` | Start a video playback override on the device. |
 | `GET /devices/{key}/display/preview` | — | Return the device's current rendered frame as a PNG image. |
 | `WS /devices/{key}/display/preview/stream` | — | Stream JPEG-encoded preview frames over a WebSocket at ~5 fps. |
-| `POST /devices/{key}/display/push-image` | `SendResult` | Push a server-side image to the panel ONCE — nothing staged or persisted. |
-| `POST /devices/{key}/display/render-dc` | `RenderDcResult` | Render a legacy DC config to an image with no device and no theme load. |
+| `POST /devices/{key}/display/render-dc` | — | Render a legacy DC config to a PNG with no device and no theme load. |
 | `POST /devices/{key}/display/reset` | `SendResult` | Reset the display — stop any active video, then send a solid red frame. |
 | `POST /devices/{key}/display/restore-theme` | `ThemeResponse` | Restore the device's display state (persisted theme + background). |
+| `POST /devices/{key}/display/screencast/region` | `ScreencastResult` | Set *key*'s screen-cast region; a running cast follows it. |
 | `POST /devices/{key}/display/screencast/start` | `ScreencastResult` | Begin a screen-capture session for *key*. |
 | `POST /devices/{key}/display/screencast/stop` | `ScreencastResult` | End the screen-capture session for *key*. |
 | `POST /devices/{key}/display/seek-video` | `SeekVideoResult` | Jump to a specific frame. |
-| `POST /devices/{key}/display/send-image` | `ThemeResponse` | One-shot image-to-LCD via multipart upload. |
+| `POST /devices/{key}/display/send-image` | `ThemeResponse` | Show an uploaded image on the LCD until the next theme load. |
 | `POST /devices/{key}/display/sleep` | `SendResult` | Blank the panel so it goes dark — the shutdown / turn-off action. |
 | `POST /devices/{key}/display/slideshow` | `SlideshowResult` | Turn the device's slideshow on / off. |
 | `PUT /devices/{key}/display/slideshow` | `SlideshowResult` | Set the theme list + interval for a device's slideshow. |
-| `POST /devices/{key}/display/slideshow/drive` | `SlideshowResult` | Start or stop actually ROTATING the configured slideshow. |
 | `GET /devices/{key}/display/snapshot` | `LcdSnapshotResult` | Return the persisted LCD state for one device. |
 | `POST /devices/{key}/display/split-mode` | `SplitModeResult` | — |
 | `POST /devices/{key}/display/stop-video` | `VideoResult` | Clear the video playback override on the device. |
@@ -94,18 +95,15 @@ Interactive docs are served at `/docs` while the API is running.
 | `GET /theme/cloud` | `CloudThemesListResult` | List Thermalright cloud catalog (offline — catalog is static). |
 | `POST /theme/cloud/download` | `CloudThemeLoadResult` | Cache a cloud theme locally WITHOUT applying it to a device. |
 | `POST /theme/cloud/{key}` | `CloudThemeLoadResult` | Download a cloud theme + apply it to *key*. |
-| `POST /theme/config/import-upload` | `ImportConfigResponse` | Restore a device's settings from an uploaded JSON snapshot. |
-| `POST /theme/export` | `ThemeExportResult` | — |
-| `POST /theme/export-overlay` | `ThemeExportResult` | Copy a theme's overlay config file out to *output_path*. |
-| `POST /theme/import` | `ThemeImportResult` | Import a theme archive from a server-side path. |
+| `POST /theme/export-overlay` | — | Download a theme's overlay config — ``config1.dc`` or ``trcc.json``. |
 | `POST /theme/import-upload` | `ThemeImportResult` | Import a theme archive uploaded via multipart form-data. |
 | `POST /theme/init` | `EnsureDataDownloadResult` | Prefetch theme/web/mask archives for a resolution (idempotent). |
 | `GET /theme/list` | `ThemesListResult` | List themes for a device resolution. |
 | `POST /theme/save` | `ThemeResponse` | Save the device's active theme, refusing a name collision at 409. |
 | `GET /theme/web` | `list` | Cloud-theme preview gallery for a resolution (e.g. ``320x320``). |
-| `GET /theme/{key}/config-download` | — | Stream a device's settings snapshot as a JSON download. |
+| `GET /theme/{key}/download` | — | Stream what the panel shows, saved or not, as a Windows ``.tr``. |
 | `GET /theme/{key}/{theme_name}/download` | — | Stream a theme archive as a multipart download. |
-| `POST /theme/{name}/export-dc` | `ThemeDcExportResult` | Write a theme out as legacy ``config1.dc``. |
+| `POST /theme/{name}/export-dc` | — | Download a theme as legacy ``config1.dc``. |
 
 ## LED
 
@@ -119,12 +117,11 @@ Interactive docs are served at `/docs` while the API is running.
 | `POST /devices/{key}/led/memory-ratio` | `MemoryRatioResult` | Set the DDR memory multiplier (1, 2, or 4). |
 | `POST /devices/{key}/led/mode` | `LedColorsResult` | — |
 | `POST /devices/{key}/led/render` | `LedColorsResult` | One tick — engine reads Settings, advances counters, sends a frame. |
-| `POST /devices/{key}/led/select-zone` | `LedColorsResult` | Pick the currently-active zone. |
+| `POST /devices/{key}/led/select-zone` | `LedColorsResult` | Select exactly this zone: the page a page-style cooler shows, or the one zone a PA120/LF10 edit reaches. |
 | `GET /devices/{key}/led/snapshot` | `LedSnapshotResult` | Return the persisted LED state for one device. |
 | `POST /devices/{key}/led/temp-source` | `LedColorsResult` | — |
 | `POST /devices/{key}/led/test-mode` | `LedColorsResult` | — |
 | `POST /devices/{key}/led/toggle` | `LedColorsResult` | Turn the LED device (or one zone) on/off. |
-| `POST /devices/{key}/led/toggle-segment` | `LedColorsResult` | Flip one segment on/off. |
 | `POST /devices/{key}/led/week-start` | `WeekStartResult` | Pick the week-start day (Sunday-first vs Monday-first). |
 | `POST /devices/{key}/led/zone-brightness` | `LedColorsResult` | Set one zone's persistent brightness (0-100). |
 | `POST /devices/{key}/led/zone-color` | `LedColorsResult` | Set one zone's persistent color. |
@@ -144,7 +141,7 @@ Interactive docs are served at `/docs` while the API is running.
 | `GET /system/check-update` | `UpdateCheckResult` | Ask GitHub whether a newer version of trcc-linux is published. |
 | `GET /system/dashboard` | `SensorDashboardResult` | The sensor-dashboard layout — the grid the GUI's System Info screen edits. |
 | `POST /system/dashboard` | `SensorDashboardResult` | Replace the sensor-dashboard layout wholesale. |
-| `POST /system/debug-report` | `DebugReportPayload` | Generate a debug report bundle. |
+| `POST /system/debug-report` | `DebugReportPayload` | Generate a debug report; the rendered text comes back in the body. |
 | `GET /system/disk-sensors` | `DiskSensorsResult` | Drive thermal sensors — the list ``disk_temp`` comes from. |
 | `POST /system/disk-sensors/active` | `DiskDeviceResult` | Pin which drive supplies ``disk_temp``.  Empty key = hottest. |
 | `GET /system/disks` | `DisksListResult` | List mounted partitions — NOT the drive list `disk_temp` comes from. |
@@ -162,13 +159,20 @@ Interactive docs are served at `/docs` while the API is running.
 | `GET /system/memory-slots` | `MemorySlotsResult` | DRAM slots — identity everywhere, timings on Linux (empty = not probed). |
 | `GET /system/metrics` | `dict` | Raw flat metric map: ``sensor_id`` → current (personalized) value. |
 | `POST /system/quickstart` | `QuickstartResult` | Walk the new-user happy path — doctor, then scan — as one sequence. |
+| `POST /system/ram-effect` | `RgbLightsResult` | Save one of the memory's own effects on the sticks. |
+| `GET /system/ram-lighting` | `RamLightingResult` | Whether TRCC may reach RGB memory -- read from files, no bus traffic. |
+| `POST /system/ram-lighting` | `RamLightingResult` | Switch RAM lighting on or off: a password prompt at the desktop, answered when it is typed or closed. |
+| `GET /system/rgb` | `RgbLightsResult` | The RGB lights from the last scan -- no bus traffic. |
+| `GET /system/rgb-follow` | `RgbFollowResult` | What follows the cooler's colours, and what it is doing (#160). |
+| `POST /system/rgb-follow` | `RgbFollowResult` | Pick what follows the cooler's colours: off, openrgb or ram (#160). |
+| `POST /system/rgb/scan` | `RgbLightsResult` | Look for the lights: RGB memory, and OpenRGB's devices. |
 | `GET /system/sensors` | `SensorsResult` | — |
 | `GET /system/sensors/catalog` | `SensorsListResult` | Every sensor this machine can measure — identities, no values. |
 | `GET /system/sensors/{category}` | `SensorsResult` | Filter the live sensor list by category prefix. |
 | `POST /system/setup` | `SetupResult` | — |
 | `GET /system/snapshot` | `ControlCenterSnapshotResult` | Return the AppSettings snapshot. |
 | `GET /system/status` | `AppStatusResponse` | Unified snapshot: app-level prefs + per-device attach list. |
-| `POST /system/upgrade` | `UpgradeResult` | Upgrade trcc-linux via the detected package manager. |
+| `POST /system/upgrade` | `UpgradeResult` | The command that upgrades this TRCC install — returned, never run. |
 
 ## Preferences
 
@@ -185,7 +189,6 @@ Interactive docs are served at `/docs` while the API is running.
 
 | Endpoint | Returns | Description |
 |---|---|---|
-| `POST /trcc/ensure` | `DaemonKillResponse` | Start the TRCC daemon if it is not already running. |
 | `POST /trcc/kill` | `DaemonKillResponse` | Stop the running TRCC daemon. |
 | `GET /trcc/status` | `DaemonStatusResponse` | Snapshot of the running daemon: pid, uptime, device counts. |
 

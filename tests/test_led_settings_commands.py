@@ -26,7 +26,6 @@ from trcc.core.commands import (
     SetMemoryRatio,
     SetWeekStart,
     ToggleLed,
-    ToggleSegment,
 )
 from trcc.core.led_models import LEDMode
 from trcc.services.settings import Settings
@@ -39,6 +38,41 @@ _KEY = "0416:8001"
 def _app(tmp_path: Path) -> App:
     return App(platform=FakePlatform(tmp_path))
 
+
+
+def test_the_led_clock_draws_in_the_coolers_own_format(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FormLED keeps its own isTimer24 (FormLED.cs:945, drawn at :3938).
+
+    The render read the LCD overlay's ``time_format`` instead: the cooler's
+    own 12/24h button stored ``clock_24h`` and changed nothing, while the
+    LCD's ``SetTimeFormat`` changed the LED clock.  Both halves are pinned.
+    """
+    import trcc.services.led_segment as segment
+    from tests.mock_platform import MockPlatform
+    from trcc.adapters.render.qt import QtRenderer
+    from trcc.core.commands import ConnectDevice, RenderLed, SetTimeFormat
+
+    drawn: list[bool] = []
+    real = segment.compute_mask
+
+    def _spy(*args, **kwargs):
+        drawn.append(kwargs["is_24h"])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(segment, "compute_mask", _spy)
+    app = App(MockPlatform([{"type": "led", "vid": "0416", "pid": "8001",
+                             "pm": 1}], tmp_path), renderer=QtRenderer())
+    assert app.dispatch(ConnectDevice(key=_KEY)).ok
+
+    assert app.dispatch(SetClockFormat(key=_KEY, is_24h=False)).ok
+    assert app.dispatch(SetTimeFormat(fmt="24h")).ok        # the LCD's, not this
+    drawn.clear()
+    assert app.dispatch(RenderLed(key=_KEY)).ok
+
+    assert drawn and drawn[-1] is False, (
+        f"the LED clock drew {drawn} after its own button chose 12h")
 
 # ── Mode ─────────────────────────────────────────────────────────────
 
@@ -195,7 +229,6 @@ _GATED: list = [
     (SetLedZoneSyncInterval, {"ticks": 9}),
     (SetLedZoneSyncZones, {"zones": (True, False)}),
     (SelectZone, {"zone": 0}),
-    (ToggleSegment, {"index": 0, "on": True}),
     (SetClockFormat, {"is_24h": False}),
     (SetWeekStart, {"sunday_first": True}),
     (SetMemoryRatio, {"ratio": 2}),
@@ -294,6 +327,48 @@ def _new_runtime_with_test(*, timer: int, color: int):
     return LedRuntimeState(test_timer=timer, test_color=color)
 
 
+# ── LedSnapshot's segment count is the panel's, not a settings list's ─────
+
+
+def _first_pm_per_style() -> list[int]:
+    from trcc.core.led_protocol import _PM_REGISTRY
+
+    first: dict[object, int] = {}
+    for pm, entry in sorted(_PM_REGISTRY.items()):
+        first.setdefault(entry.style, pm)
+    return list(first.values())
+
+
+@pytest.mark.parametrize("pm", _first_pm_per_style())
+def test_a_fresh_leds_snapshot_counts_its_panels_segments(
+    fake_platform: FakePlatform, pm: int,
+) -> None:
+    """``segment_count`` was the length of a clicked-segment list (since
+    deleted) that nothing filled, so `trcc led snapshot` and `led-debug` said
+    "segments 0" for every fresh device.  It is the style's display now --
+    the source ListLedStyles already used."""
+    from trcc.core.commands import LedSnapshot
+    from trcc.services.led_segment import get_display
+
+    from .conftest import _CliRenderer
+    from .test_render_led import _LED_KEY, _attach_and_connect
+
+    app = App(fake_platform, renderer=_CliRenderer())  # type: ignore[arg-type]
+    _attach_and_connect(app, fake_platform, pm=pm)
+    style = app.get(_LED_KEY).led_handshake.style  # type: ignore[attr-defined]
+    display = get_display(style)
+
+    snap = app.dispatch(LedSnapshot(key=_LED_KEY))
+
+    assert snap.segment_count == (display.mask_size if display else 0)
+
+
+def test_an_unattached_leds_snapshot_counts_no_segments(tmp_path: Path) -> None:
+    from trcc.core.commands import LedSnapshot
+
+    assert _app(tmp_path).dispatch(LedSnapshot(key="0416:8001")).segment_count == 0
+
+
 # ── LedSnapshot carries per-zone state, not just a zone COUNT ─────────────
 #
 # ``zone_count`` said how many zones exist with no way to ask what any of
@@ -337,3 +412,50 @@ def test_led_snapshot_reports_the_carousel_mask(tmp_path: Path) -> None:
 
     assert snap.zone_sync_zones == (True, False, True)
     assert isinstance(snap.zone_sync_zones, tuple), "a frozen Result holds tuples"
+
+
+def test_a_saved_segment_mask_from_an_older_version_is_dropped() -> None:
+    """``segment_on`` was a setting until 2026-10-07 (it reached neither the
+    render nor the wire).  An older trcc.json still carries it; loading must
+    not choke on it, and the next save leaves it out."""
+    import dataclasses
+
+    from trcc.services.settings import _led_settings_from_dict
+
+    loaded = _led_settings_from_dict({"segment_on": [True, False], "mode": 2})
+
+    assert "segment_on" not in dataclasses.asdict(loaded)
+
+
+def test_the_carousel_interval_counts_like_the_csharp() -> None:
+    """``ValCount >= 6 * textBoxTimer`` per 150 ms tick (FormLED.cs:3489).
+
+    The gui converted at 1000/150 = 6.67 ticks per unit and the default was
+    13 where the C#'s "2" is 12.  A stored 13 still reads back as 2.
+    MUTATION CHECK: set ``ZONE_SYNC_TICKS_PER_UNIT`` to 1000/150 → fails.
+    """
+    from trcc.core.led_models import (
+        LedDeviceSettings,
+        zone_sync_ticks,
+        zone_sync_units,
+    )
+
+    assert (zone_sync_ticks(2), zone_sync_ticks(10)) == (12, 60)
+    assert LedDeviceSettings().zone_sync_interval_ticks == 12
+    assert (zone_sync_units(12), zone_sync_units(13), zone_sync_units(1)) == (2, 2, 1)
+
+
+def test_the_gui_sends_the_carousel_interval_in_csharp_ticks() -> None:
+    """The gui's box shows the C# unit; 2 in it is 12 ticks, not 13.
+
+    MUTATION CHECK: put back ``int(secs * 1000 / 150)`` → this fails.
+    """
+    from types import SimpleNamespace
+
+    from trcc.ui.gui.led_handler import LEDHandler
+
+    sent: list = []
+    fake = SimpleNamespace(_device_key="0416:8001", _dispatch=sent.append)
+    LEDHandler._on_carousel_interval_changed(fake, 2)  # type: ignore[arg-type]
+
+    assert sent == [SetLedZoneSyncInterval(key="0416:8001", ticks=12)]

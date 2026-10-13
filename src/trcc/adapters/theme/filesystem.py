@@ -30,10 +30,12 @@ Rendering (turning a Theme into frame bytes) is DisplayService's job.
 from __future__ import annotations
 
 import builtins
+import filecmp
 import hashlib
 import json
 import logging
 import shutil
+import tempfile
 import zipfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -43,10 +45,18 @@ from typing import TYPE_CHECKING
 
 from ...core._safe import is_safe_zip_member
 from ...core.errors import ThemeError
-from ...core.logs import per_frame
-from ...core.models import DiscoveredMask, Theme, ThemeDir, WebPreviewInfo
+from ...core.logs import Blob, per_frame
+from ...core.models import (
+    MEDIA,
+    DiscoveredMask,
+    MediaKind,
+    Theme,
+    ThemeDir,
+    WebPreviewInfo,
+)
 from ...core.ports import ContentStore, SingleFileTheme
 from ...services import _dc as Dc
+from ...services import _tr as Tr
 
 if TYPE_CHECKING:
     from ...core.ports import Paths
@@ -68,17 +78,20 @@ _PRE_CUTOVER_CONFIG_FILE = "trcc-next.json"
 # the legacy overlay_config dict under a ``dc`` key, plus explicit
 # ``background`` and ``mask`` path fields.  Read-only — we translate to
 # next/'s shape on load but don't write this shape back.
-# Video-background filenames TRCC actually ships.  ``td.bg`` (00.png)
-# is the static fallback rendered when no video is present; videos
-# live alongside it as ``Theme.{mp4,mov,webm}`` or ``Theme.zt`` (the
-# JPEG-sequence archive UCVideoCut writes).  No ``background.*`` —
-# that name never existed in legacy or Windows TRCC.
-_VIDEO_CANDIDATES = (
-    "Theme.mp4", "Theme.mov", "Theme.webm", ThemeDir.ZT,
-)
-# Video container extensions we ship (derived from _VIDEO_CANDIDATES so the
-# two never drift); the background allowlist is those plus the static PNG.
-_VIDEO_EXTS = frozenset(Path(c).suffix.lower() for c in _VIDEO_CANDIDATES)
+# Animated-background filenames.  ``td.bg`` (00.png) is the static
+# fallback rendered when no animation is present; an animation lives
+# alongside it as ``Theme{ext}`` -- ``Theme.zt`` being the JPEG-sequence
+# archive UCVideoCut writes, the one name the C# uses.  No ``background.*``
+# -- that name never existed in legacy or Windows TRCC.
+#
+# DERIVED from ``MEDIA``, the one authority for what a background is.  This
+# was a hand list (mp4, mov, webm, zt) while MEDIA declared seven animated
+# formats, so a .gif, .mkv or .avi background played and then failed to save
+# ("unsupported background extension"), and a .zip export wrote the raw
+# container under 00.png (#261, 2026-10-07).
+_VIDEO_EXTS = MEDIA.exts(MediaKind.ANIMATED)
+_VIDEO_CANDIDATES = tuple(ThemeDir.video(ext) for ext in sorted(_VIDEO_EXTS))
+# The background allowlist: every animated format plus the static PNG.
 _BG_EXTS = _VIDEO_EXTS | {".png"}
 
 
@@ -93,11 +106,14 @@ class FileSingleFileTheme(SingleFileTheme):
     def install(self, source: Path, filename: str) -> Path:
         """Copy *source* in as *filename*, skipping an unchanged re-run.
 
-        The size guard is what makes re-loading the same file cheap; both
-        callers had their own copy of it.
+        The guard is what makes re-loading the same file cheap; both callers
+        had their own copy of it.  It compared SIZES only, so a different
+        image or clip of the same byte count kept the old one — ``filecmp``
+        checks size first and reads the bytes only when the sizes match.
         """
         dest = self.path / filename
-        if dest.is_file() and dest.stat().st_size == source.stat().st_size:
+        self._drop_other_videos(dest)
+        if dest.is_file() and filecmp.cmp(source, dest, shallow=False):
             log.info("SingleFileTheme.install: %s unchanged — skipped", dest)
             return dest
         shutil.copy2(source, dest)
@@ -108,11 +124,26 @@ class FileSingleFileTheme(SingleFileTheme):
         """Move an already-produced file (a transcoder output) in as
         *filename*, and clear the temp directory it came from."""
         dest = self.path / filename
+        self._drop_other_videos(dest)
         shutil.move(str(produced), str(dest))
         shutil.rmtree(produced.parent, ignore_errors=True)
         log.info("SingleFileTheme.adopt: %s → %s (temp dir cleared)",
                  produced, dest)
         return dest
+
+    def _drop_other_videos(self, dest: Path) -> None:
+        """Remove an earlier payload in another container.
+
+        The directory is named by the source's stem and reused, so loading
+        ``clip.zt`` after ``clip.mp4`` would leave both -- and ``video_path``
+        picks the first candidate, which is the OLD clip.  One file in, one
+        file there.
+        """
+        for name in _VIDEO_CANDIDATES:
+            if name != dest.name and (stale := self.path / name).is_file():
+                stale.unlink()
+                log.info("SingleFileTheme: dropped %s, replaced by %s",
+                         stale.name, dest.name)
 
 
 class FileContentStore(ContentStore):
@@ -179,7 +210,7 @@ class FileContentStore(ContentStore):
         id keeps on-disk paths readable.  Identical bytes always hash to
         the same id — that is what gives the writers their auto-dedup.
         """
-        log.debug("_content_id: data=%s", data)
+        log.debug("_content_id: data=%s", Blob(data))
         return hashlib.sha256(data).hexdigest()[:16]
 
     @contextmanager
@@ -550,6 +581,7 @@ class FileContentStore(ContentStore):
     def export_dc(
         self, theme_dir: Path, output_path: Path,
         *, elements: list[dict] | None = None,
+        flags: dict | None = None,
     ) -> Path:
         """Write *theme_dir*'s config out as legacy ``config1.dc`` to
         *output_path* — for sharing themes with Windows TRCC users.
@@ -566,9 +598,10 @@ class FileContentStore(ContentStore):
         log.info("export_dc: theme_dir=%s output_path=%s elements=%s",
                  theme_dir, output_path,
                  None if elements is None else len(elements))
-        config = self._load_config(theme_dir)
+        config = {**self._load_config(theme_dir), **(flags or {})}
         if elements is not None:
             config = {**config, "elements": elements}
+        log.debug("export_dc: flags=%s", flags)
         Dc.File(output_path).write(config)
         return output_path
 
@@ -806,8 +839,15 @@ class FileContentStore(ContentStore):
         _scan(user_masks_dir, is_custom=True)
         return masks
 
-    def export(self, theme_path: Path, archive_path: Path) -> None:
-        """Archive a theme as a self-contained, shareable zip.
+    def export(self, theme_path: Path, archive_path: Path, *,
+               background: Path | None = None) -> None:
+        """Archive a theme as a self-contained, shareable file.
+
+        ``.tr`` writes the Windows app's own format, so a Windows user can
+        import it (#272); it holds a still background or a Theme.zt, never an
+        mp4, exactly like a Windows export.  A video reaches it as a Theme.zt
+        the caller baked and passed as *background*.  Anything else is our
+        zip, which keeps every file.
 
         A saved theme references its background/mask in the user library
         (Phase D), so a raw dir-zip would omit them.  Export DEREFERENCES:
@@ -822,7 +862,11 @@ class FileContentStore(ContentStore):
         if not theme_path.is_dir():
             raise ThemeError(f"Theme path is not a directory: {theme_path}")
 
-        members = self._export_members(self.load(theme_path), theme_path)
+        members = self._export_members(self.load(theme_path), theme_path,
+                                       background)
+        if archive_path.suffix.lower() == ".tr":
+            self._export_tr(theme_path, members, archive_path)
+            return
         try:
             with zipfile.ZipFile(archive_path, "w",
                                  compression=zipfile.ZIP_DEFLATED) as zf:
@@ -838,21 +882,82 @@ class FileContentStore(ContentStore):
         log.info("Exported %s → %s (%d member(s): %s)",
                  theme_path, archive_path, len(members), sorted(members))
 
+    def export_unsaved(
+        self, manifest: dict, archive_path: Path, *,
+        background: Path | bytes | None,
+        mask: Path | None,
+        preview: bytes | None,
+    ) -> None:
+        """Assemble live state as a throwaway theme dir, then :meth:`export` it.
+
+        The dir follows the self-contained convention :meth:`export` already
+        reads -- ``00.png`` or ``Theme.<ext>``, ``01.png``, ``Theme.png`` and
+        the manifest -- so the archive is built by the one writer every export
+        uses, and the temp dir is gone on return, success or not.
+        """
+        log.info("export_unsaved: %s (bg=%s mask=%s preview=%s)",
+                 archive_path,
+                 "png" if isinstance(background, bytes) else background,
+                 mask, preview is not None)
+        with tempfile.TemporaryDirectory(prefix="trcc-export-") as tmp:
+            theme_dir = Path(tmp) / "theme"
+            theme_dir.mkdir()
+            if isinstance(background, bytes):
+                (theme_dir / ThemeDir.BG).write_bytes(background)
+            elif background is not None:
+                # The member names ``_export_members`` gives a referenced
+                # background, so the two exporters cannot disagree.
+                ext = background.suffix.lower()
+                name = ThemeDir.video(ext) if ext in _VIDEO_EXTS else ThemeDir.BG
+                shutil.copyfile(background, theme_dir / name)
+            if mask is not None:
+                shutil.copyfile(mask, theme_dir / ThemeDir.MASK)
+            if preview is not None:
+                (theme_dir / ThemeDir.PREVIEW).write_bytes(preview)
+            self.write_manifest(theme_dir, manifest)
+            self.export(theme_dir, archive_path)
+
+    def _export_tr(self, theme_path: Path, members: dict[str, Path | bytes],
+                   archive_path: Path) -> None:
+        """Write *members* as a Windows ``.tr``: a still ``00.png`` or a
+        ``Theme.zt``, as ``FormCZTV.buttonDaoChu_Click`` writes one.  Any
+        other video has no slot and is refused by :func:`Tr.write`."""
+        def read(name: str) -> bytes | None:
+            log.debug("_export_tr.read: %s", name)
+            source = members.get(name)
+            return source.read_bytes() if isinstance(source, Path) else source
+
+        data = Tr.write(Tr.TrTheme(
+            config_dc=Dc.Writer().serialize(self._load_config(theme_path)),
+            mask_png=read(ThemeDir.MASK),
+            background_png=read(ThemeDir.BG),
+            theme_zt=read(ThemeDir.ZT),
+        ))
+        try:
+            archive_path.write_bytes(data)
+        except OSError as e:
+            raise ThemeError(f"Failed to write {archive_path}: {e}") from e
+        log.info("Exported %s → %s (Windows .tr, %d bytes)",
+                 theme_path, archive_path, len(data))
+
     def _export_members(
-        self, theme: Theme, theme_path: Path,
+        self, theme: Theme, theme_path: Path, background: Path | None = None,
     ) -> dict[str, Path | bytes]:
         """Resolve a theme into its self-contained archive members.
 
         Maps each archive entry name to a source ``Path`` (copied
         verbatim) or ``bytes`` (the rebuilt manifest).  Dereferences the
         background/mask refs to library files via Phase-B resolution, so
-        the archive carries the bytes, not the refs.
+        the archive carries the bytes, not the refs.  *background*, when
+        given, stands in for the theme's own.
         """
         members: dict[str, Path | bytes] = {}
 
-        bg = self.background_path(theme)
+        bg = background or self.background_path(theme)
+        if background is not None:
+            log.info("export: background overridden by %s", background)
         if bg is not None and bg.suffix.lower() in _VIDEO_EXTS:
-            members[f"Theme{bg.suffix.lower()}"] = bg
+            members[ThemeDir.video(bg.suffix)] = bg
             log.info("export: bundling video bg %s", bg.name)
         elif bg is not None:
             members[ThemeDir.BG] = bg
@@ -899,24 +1004,21 @@ class FileContentStore(ContentStore):
                 "(refusing to overwrite — choose a different name)",
             )
 
+        with archive_path.open("rb") as f:
+            windows = Tr.is_tr(f.read(4))
         into_dir.mkdir(parents=True)
         try:
-            with zipfile.ZipFile(archive_path, "r") as zf:
-                skipped: list[str] = []
-                for info in zf.infolist():
-                    if not is_safe_zip_member(info.filename):
-                        skipped.append(info.filename)
-                        continue
-                    zf.extract(info, into_dir)
-                if skipped:
-                    log.warning(
-                        "FileContentStore.import_: skipped %d unsafe member(s) in %s: %s",
-                        len(skipped), archive_path, skipped,
-                    )
+            if windows:
+                self._import_tr(archive_path, into_dir)
+            else:
+                self._extract_zip(archive_path, into_dir)
+        except ThemeError:
+            shutil.rmtree(into_dir, ignore_errors=True)
+            raise
         except zipfile.BadZipFile as e:
             shutil.rmtree(into_dir, ignore_errors=True)
             raise ThemeError(
-                f"Not a valid zip archive: {archive_path}: {e}",
+                f"Not a Windows .tr theme or a zip archive: {archive_path}: {e}",
             ) from e
         except OSError as e:
             shutil.rmtree(into_dir, ignore_errors=True)
@@ -928,6 +1030,33 @@ class FileContentStore(ContentStore):
             # Archive extracted but isn't a valid theme — clean up + re-raise.
             shutil.rmtree(into_dir, ignore_errors=True)
             raise
+
+    def _import_tr(self, archive_path: Path, into_dir: Path) -> None:
+        """Unpack a Windows ``.tr`` into the theme files it carries (#272)."""
+        theme = Tr.read(archive_path.read_bytes())
+        files = {ThemeDir.DC: theme.config_dc, ThemeDir.MASK: theme.mask_png,
+                 ThemeDir.BG: theme.background_png, ThemeDir.ZT: theme.theme_zt}
+        for name, data in files.items():
+            if data is not None:
+                (into_dir / name).write_bytes(data)
+        log.info("_import_tr: %s → %s (%s)", archive_path, into_dir,
+                 sorted(n for n, d in files.items() if d is not None))
+
+    def _extract_zip(self, archive_path: Path, into_dir: Path) -> None:
+        """Extract our own zip export, refusing zip-slip members."""
+        log.info("_extract_zip: %s → %s", archive_path, into_dir)
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            skipped: list[str] = []
+            for info in zf.infolist():
+                if not is_safe_zip_member(info.filename):
+                    skipped.append(info.filename)
+                    continue
+                zf.extract(info, into_dir)
+            if skipped:
+                log.warning(
+                    "FileContentStore.import_: skipped %d unsafe member(s) in %s: %s",
+                    len(skipped), archive_path, skipped,
+                )
 
     # ── internals ─────────────────────────────────────────────────────
 

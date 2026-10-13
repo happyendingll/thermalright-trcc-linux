@@ -20,33 +20,40 @@ from __future__ import annotations
 
 import logging
 import subprocess
+from functools import partial
+from pathlib import Path
 
-from PySide6.QtCore import QRect, Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
+    QIcon,
     QImage,
     QPainter,
     QPalette,
     QPen,
     QPixmap,
-    QTransform,
 )
 from PySide6.QtWidgets import QLabel, QProgressBar, QWidget
 
-from ...core.geometry import fit_rect_for_mode
-from ...core.models import SUBPROCESS_NO_WINDOW as _NO_WINDOW
+from ...core import toolchain
+from ...core.logs import per_frame
 from ...core.models import (
-    ZT_FRAME_INTERVAL_MS as FRAME_INTERVAL_MS,
+    CUTTER_DEFAULT_FPS,
+    FitMode,
+    VideoExportRequest,
+    panel_asset_dims,
 )
+from ...core.models import SUBPROCESS_NO_WINDOW as _NO_WINDOW
 from ...core.models import (
     ZT_MAX_DURATION_MS as MAX_DURATION_MS,
 )
-from ...core.models import FitMode, panel_asset_dims
+from ..presentation.clip_preview import ClipPreview
 from .assets import Assets
 from .base import make_icon_button
 
 log = logging.getLogger(__name__)
+frame_log = per_frame(__name__)
 
 # ============================================================================
 # Constants
@@ -66,6 +73,13 @@ BTN_HEIGHT_FIT = (169, 656, 34, 26)
 BTN_WIDTH_FIT = (233, 656, 34, 26)
 BTN_ROTATE = (297, 656, 34, 26)
 BTN_EXPORT = (446, 656, 34, 26)
+
+# How often a pending still is checked for -- the C#'s 15 ms Form1 timer.
+STILL_POLL_MS = 15
+
+# Frame-rate choice: the C#'s button1 / button2 (UCVideoCut.cs:2936-2962),
+# either side of the low-to-high wedge the background draws beside "FPS".
+BTN_FPS = {15: (40, 661, 14, 14), 24: (110, 661, 14, 14)}
 
 # Preview / Close buttons
 BTN_PREVIEW = (233, 513, 34, 20)
@@ -101,8 +115,8 @@ class UCVideoCut(QWidget):
     fit mode buttons, rotation, and Theme.zt export.
 
     Signals:
-        export_requested(int, int, int, object): (start_ms, end_ms,
-            rotation, fit_mode) — the window turns this into
+        export_requested(int, int, int, object, int): (start_ms, end_ms,
+            rotation, fit_mode, fps) — the window turns this into
             ``ExportVideoClip`` for the active device.  The panel does not
             know the device key or the canvas size, and does not need to:
             the Command resolves both.  ``fit_mode`` is a
@@ -112,7 +126,7 @@ class UCVideoCut(QWidget):
         video_cut_done(str): Emitted with Theme.zt path on export, or '' on cancel.
     """
 
-    export_requested = Signal(int, int, int, object)
+    export_requested = Signal(int, int, int, object, int)
     video_cut_done = Signal(str)
 
     def __init__(self, parent=None):
@@ -133,6 +147,8 @@ class UCVideoCut(QWidget):
         # export to forced-width.  None is the auto arm — fit inside, never
         # crop — which is what an untouched export has always done (#291).
         self._fit_mode: FitMode | None = None
+        # The clip's frame rate, 15 or 24 -- the C#'s originalImageHz.
+        self._clip_fps = CUTTER_DEFAULT_FPS
 
         # Timeline handles (pixel x positions)
         self._start_x = TIMELINE_X
@@ -141,12 +157,13 @@ class UCVideoCut(QWidget):
         self._end_ms = 0
         self._dragging = None  # 'start' or 'end'
 
-        # Preview state
+        # Preview state.  ClipPreview owns the ffmpeg; the timer only picks
+        # up what it has written -- frames while playing, else one still.
         self._preview_pixmap = None
+        self._clip = ClipPreview()
         self._preview_timer = QTimer(self)
         self._preview_timer.timeout.connect(self._preview_tick)
         self._previewing = False
-        self._preview_pos_ms = 0
 
         # Export state.  No worker: the encode belongs to the app, and
         # this panel only reflects its progress.
@@ -206,6 +223,14 @@ class UCVideoCut(QWidget):
             self, BTN_ROTATE, 'display_mode_rotate.png', "R", self._on_rotate)
         self._btn_export = make_icon_button(
             self, BTN_EXPORT, 'display_mode_crop.png', "OK", self._on_export)
+
+        # Frame-rate choice (15 / 24), one checked at a time
+        self._fps_btns = {
+            fps: make_icon_button(self, rect, 'shared_checkbox_off.png',
+                                  str(fps), partial(self._on_fps, fps))
+            for fps, rect in BTN_FPS.items()
+        }
+        self._show_fps()
 
         # Preview button
         self._btn_preview = make_icon_button(
@@ -343,7 +368,7 @@ class UCVideoCut(QWidget):
         # Get metadata with ffprobe
         try:
             result = subprocess.run([
-                'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                toolchain.executable('ffprobe'), '-v', 'error', '-select_streams', 'v:0',
                 '-show_entries', 'stream=r_frame_rate,nb_frames',
                 '-show_entries', 'format=duration',
                 '-of', 'csv=p=0',
@@ -393,6 +418,8 @@ class UCVideoCut(QWidget):
             self._lbl_info.setVisible(True)
             return
 
+        self._clip.load(Path(self._video_path))
+
         # Reset handles
         self._start_x = TIMELINE_X
         self._end_x = TIMELINE_X + TIMELINE_W
@@ -425,81 +452,60 @@ class UCVideoCut(QWidget):
             palette.setBrush(QPalette.ColorRole.Window, QBrush(bg_pix))
             self.setPalette(palette)
 
+    def _request(self, start_ms, end_ms):
+        """The clip as Export would encode it -- what the preview shows."""
+        frame_log.debug("_request: %s-%s ms", start_ms, end_ms)
+        return VideoExportRequest(
+            source=Path(self._video_path or ""), start_ms=int(start_ms),
+            end_ms=int(end_ms), target_w=self._target_w,
+            target_h=self._target_h, rotation=self._rotation,
+            fit_mode=self._fit_mode, fps=self._clip_fps)
+
     def _seek_and_show(self, ms):
-        """Seek to time and display frame using FFmpeg pipe."""
+        """Show the frame at *ms*, composed exactly as Export will encode it.
+
+        Grabbed in the background by :class:`ClipPreview`, which keeps only
+        the newest request while one is in flight.  This used to run ffmpeg
+        here, on the GUI thread, for every mouse-move and every 41 ms tick.
+        """
         if not self._video_path:
             return
-
-        ss = ms / 1000.0
-        try:
-            result = subprocess.run([
-                'ffmpeg', '-ss', str(ss), '-i', self._video_path,
-                '-vframes', '1', '-f', 'image2pipe', '-vcodec', 'bmp',
-                '-v', 'error', '-y', '-',
-            ], capture_output=True, timeout=5, creationflags=_NO_WINDOW)
-            if result.returncode != 0 or not result.stdout:
-                return
-
-            img = QImage.fromData(result.stdout)
-            if img.isNull():
-                return
-        except (OSError, subprocess.SubprocessError) as e:
-            log.debug("uc_video_cut: frame extract via ffmpeg failed: %s", e)
-            return
-
-        # Rotate, then compose exactly as the export will, so a forced axis
-        # crops here too and W/H finally look different BEFORE Apply.
-        if self._rotation:
-            img = img.transformed(QTransform().rotate(self._rotation))
-        img = self._compose_for_panel(img)
-        w, h = img.width(), img.height()
-        scale = min(PREVIEW_W / w, PREVIEW_H / h)
-        new_w, new_h = int(w * scale), int(h * scale)
-        if new_w > 0 and new_h > 0:
-            img = img.scaled(new_w, new_h,
-                             Qt.AspectRatioMode.IgnoreAspectRatio,
-                             Qt.TransformationMode.SmoothTransformation)
-
-        self._preview_pixmap = QPixmap.fromImage(img)
+        log.debug("_seek_and_show: ms=%s", ms)
+        if self._previewing:
+            self._stop_preview()
         self._lbl_current.setText(_format_time(ms))
+        self._clip.still(self._request(ms, ms + 1), (PREVIEW_W, PREVIEW_H))
+        if not self._preview_timer.isActive():
+            self._preview_timer.start(STILL_POLL_MS)
+
+    def _show_jpeg(self, data):
+        """Put one preview frame (already box-sized by ffmpeg) on screen."""
+        img = QImage.fromData(data)
+        if img.isNull():
+            log.debug("_show_jpeg: %d bytes did not decode", len(data))
+            return
+        self._preview_pixmap = QPixmap.fromImage(img)
         self.update()
 
-    def _compose_for_panel(self, img):
-        """The frame as the PANEL will show it — the export's own geometry.
-
-        The preview always contain-fitted regardless of the fit buttons, so W
-        and H looked identical on screen even once the encoder honoured them.
-        Composing through the SAME :func:`fit_rect_for_mode` the exporter uses
-        is what makes the choice visible before Apply, and is why the two
-        cannot disagree (#291).
-
-        The canvas clips, which is exactly how a forced axis crops: the C#
-        composites onto ``new Bitmap(wValSub, hValSub)`` at a possibly
-        negative offset and lets the bitmap do the cropping.
-
-        Without a known panel size there is nothing to compose onto, so the
-        raw frame comes back and the caller's contain-fit still applies.
-        """
-        if self._target_w <= 0 or self._target_h <= 0:
-            log.debug("_compose_for_panel: no panel size yet — raw frame")
-            return img
-        rect = fit_rect_for_mode((img.width(), img.height()),
-                                 (self._target_w, self._target_h),
-                                 self._fit_mode)
-        canvas = QImage(self._target_w, self._target_h,
-                        QImage.Format.Format_RGB32)
-        canvas.fill(Qt.GlobalColor.black)
-        painter = QPainter(canvas)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        painter.drawImage(QRect(rect.x, rect.y, rect.width, rect.height), img)
-        painter.end()
-        log.debug("_compose_for_panel: %s mode=%s -> %dx%d canvas", rect,
-                  self._fit_mode, self._target_w, self._target_h)
-        return canvas
-
     # =========================================================================
-    # Fit mode and rotation
+    # Frame rate, fit mode and rotation
     # =========================================================================
+
+    def _on_fps(self, fps, _checked=False):
+        """A frame-rate button: the C#'s button1_Click / button2_Click."""
+        log.info("_on_fps: %s -> %s", self._clip_fps, fps)
+        self._clip_fps = fps
+        self._show_fps()
+
+    def _show_fps(self):
+        """Check the chosen frame rate's box, clear the other."""
+        log.debug("_show_fps: %s", self._clip_fps)
+        for fps, btn in self._fps_btns.items():
+            name = ('shared_checkbox_on.png' if fps == self._clip_fps
+                    else 'shared_checkbox_off.png')
+            pix = Assets.load_pixmap(name, *BTN_FPS[fps][2:])
+            if not pix.isNull():
+                btn.setIcon(QIcon(pix))
 
     def _on_width_fit(self):
         log.info("_on_width_fit: fit_mode %s -> WIDTH", self._fit_mode)
@@ -528,19 +534,38 @@ class UCVideoCut(QWidget):
             self._start_preview()
 
     def _start_preview(self):
+        """Decode the trimmed range once, in the background, and play it.
+
+        The C#'s buttonYulan_Click: one ffmpeg at the chosen rate; the timer
+        shows what it has written so far, then loops.
+        """
+        if not self._video_path:
+            return
+        log.info("_start_preview: %s-%s ms at %d fps", self._start_ms,
+                 self._end_ms, self._clip_fps)
         self._previewing = True
-        self._preview_pos_ms = self._start_ms
-        self._preview_timer.start(int(FRAME_INTERVAL_MS))
+        self._clip.play(self._request(self._start_ms, self._end_ms),
+                        (PREVIEW_W, PREVIEW_H))
+        self._preview_timer.start(int(1000 / self._clip_fps))
 
     def _stop_preview(self):
+        log.debug("_stop_preview: previewing=%s", self._previewing)
         self._previewing = False
         self._preview_timer.stop()
+        self._clip.stop()
 
     def _preview_tick(self):
-        if self._preview_pos_ms >= self._end_ms:
-            self._preview_pos_ms = self._start_ms
-        self._seek_and_show(self._preview_pos_ms)
-        self._preview_pos_ms += FRAME_INTERVAL_MS
+        """Show what ClipPreview has ready: a playing frame or a still."""
+        data = self._clip.poll()
+        frame_log.debug("_preview_tick: got=%s previewing=%s",
+                        data is not None, self._previewing)
+        if data is not None:
+            self._show_jpeg(data)
+            if self._previewing:
+                self._lbl_current.setText(_format_time(
+                    self._start_ms + self._clip.shown * 1000 / self._clip_fps))
+        if not self._previewing and not self._clip.active:
+            self._preview_timer.stop()
 
     # =========================================================================
     # Export
@@ -548,9 +573,9 @@ class UCVideoCut(QWidget):
 
     def _on_export(self):
         """Ask the window to encode the current clip.  Does not encode."""
-        log.info("_on_export: video_path=%s start=%s end=%s rotation=%s",
-                 self._video_path, self._start_ms, self._end_ms,
-                 self._rotation)
+        log.info("_on_export: video_path=%s start=%s end=%s rotation=%s "
+                 "fps=%s", self._video_path, self._start_ms, self._end_ms,
+                 self._rotation, self._clip_fps)
         if self._is_processing or not self._video_path:
             log.debug("_on_export: busy=%s path=%s — ignored",
                       self._is_processing, self._video_path)
@@ -564,7 +589,8 @@ class UCVideoCut(QWidget):
         self._lbl_info.setText("Starting export...")
         self._lbl_info.setVisible(True)
         self.export_requested.emit(
-            self._start_ms, self._end_ms, self._rotation, self._fit_mode)
+            self._start_ms, self._end_ms, self._rotation, self._fit_mode,
+            self._clip_fps)
 
     def export_refused(self, message):
         """The window's dispatch was refused before anything was queued."""
@@ -612,6 +638,9 @@ class UCVideoCut(QWidget):
     # =========================================================================
 
     def _cleanup_video(self):
+        log.debug("_cleanup_video: path=%s", self._video_path)
+        self._preview_timer.stop()
+        self._clip.stop()
         self._video_path = None
 
     def closeEvent(self, event):

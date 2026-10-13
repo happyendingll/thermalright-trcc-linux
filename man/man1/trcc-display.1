@@ -1,4 +1,4 @@
-.TH "TRCC\-DISPLAY" "1" "" "trcc\-linux 9.10.2" "TRCC Manual"
+.TH "TRCC\-DISPLAY" "1" "" "trcc\-linux 9.10.8" "TRCC Manual"
 .SH NAME
 trcc\-display \- Configure device display (theme / orientation / brightness)
 .SH SYNOPSIS
@@ -148,7 +148,7 @@ Show this command's help and exit.
 .PP
 \fBtrcc display export\-video\fR \fIKEY\fR \fIPATH\fR [\fIOPTIONS\fR]
 .PP
-Encode a clip into a loose Theme.zt sized for the device's panel. Distinct from load\-video, which stages a whole theme directory and applies it. This gives you the .zt file itself  \-  to set as a background, to keep, or to hand to set\-background. The encode runs in the background and reports on the event bus, so \-\-wait follows it and \-\-no\-wait returns immediately with the token. Under TRCC_DAEMON=1 the work happens in the daemon and this terminal is simply watching it, which is why the progress can be followed from a process that is not doing the encoding.
+Encode a clip into a loose Theme.zt sized for the device's panel. Distinct from load\-video, which stages a whole theme directory and applies it. This gives you the .zt file itself  \-  to set as a background, to keep, or to hand to set\-background. The encode runs in the background and reports on the event bus, so \-\-wait follows it and \-\-no\-wait returns immediately with the token. The work happens in the shared App and this terminal only watches it, which is why the progress can be followed from a process that is not doing the encoding.
 .PP
 Arguments:
 .RS 4
@@ -175,8 +175,36 @@ Rotation in degrees: 0 / 90 / 180 / 270.
 \fB\-\-fit, \-f \fIFIT\fR\fR
 Fit the clip to the panel: 'width' / 'height' pin that axis and crop the overflow, 'stretch' fills both. Omit for the auto fit \-\- scale inside the panel, never crop. A .zt is encoded AT canvas size, so this is baked in.
 .TP
+\fB\-\-fps \fIFPS\fR\fR
+Frames per second: 15 (default, as the Windows app) or 24.
+.TP
 \fB\-\-wait\fR
 Follow progress until the encode finishes (default), or print the token and return.
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS game
+.PP
+\fBtrcc display game\fR \fIKEY\fR [\fISTATE\fR] [\fIOPTIONS\fR]
+.PP
+Game mode: while CPU usage stays above the threshold for 11 seconds, the panel shows only its overlay, on black, until it falls back.
+.PP
+Arguments:
+.RS 4
+.TP
+\fBKEY\fR
+Device key, e.g. 0402:3922
+.TP
+\fBSTATE\fR
+\&'on' / 'off'; omit to change only the threshold
+.RE
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-threshold \fITHRESHOLD\fR\fR
+CPU usage % above which game mode takes the panel (0\-99)
 .TP
 \fB\-\-help\fR
 Show this command's help and exit.
@@ -279,7 +307,7 @@ Show this command's help and exit.
 .PP
 \fBtrcc display load\-video\fR \fIKEY\fR \fIPATH\fR [\fIOPTIONS\fR]
 .PP
-Play a video on the LCD as a single\-video theme. Transcodes the source to a Theme.zt matching the device's native resolution (.zt inputs are copied as\-is), stages a one\-file theme, then dispatches LoadTheme. Device must be attached so we know the target resolution.
+Play a video on the LCD as a single\-video theme. The file plays as it is, with the device's fit (display set\-fit\-mode) applied live. Any of \-\-start / \-\-end / \-\-rotation cuts it instead: that clip is baked into a Theme.zt at the panel's size and the current fit, as the Windows trimmer does (.zt inputs always go in as they are). Device must be attached so we know the panel's size.
 .PP
 Arguments:
 .RS 4
@@ -295,10 +323,10 @@ Options:
 .RS 4
 .TP
 \fB\-\-start, \-s \fISTART_MS\fR\fR
-Clip start in milliseconds (default: 0).
+Cut from here, in milliseconds (default: 0).
 .TP
 \fB\-\-end, \-e \fIEND_MS\fR\fR
-Clip end in milliseconds (default: probe duration, fallback 10s).
+Cut to here, in milliseconds (default: the file's end).
 .TP
 \fB\-\-rotation, \-r \fIROTATION\fR\fR
 Rotation in degrees: 0 / 90 / 180 / 270.
@@ -379,7 +407,7 @@ Show this command's help and exit.
 .PP
 \fBtrcc display media\-player\fR \fIKEY\fR [\fIURI\fR]
 .PP
-Set the media\-player source  \-  a local file or a web URL/stream. Wraps SetMediaPlayer: a local file plays through the video pipeline; a web URL is referenced (persisted so theme save captures it). An empty URI clears the source.
+Set the media\-player source  \-  a local file or a web URL/stream. Wraps SetMediaPlayer: a local file plays through the video pipeline; a web URL (http, https, rtsp) plays as a live stream. An empty URI clears the source.
 .PP
 Arguments:
 .RS 4
@@ -524,27 +552,21 @@ Options:
 \fB\-\-help\fR
 Show this command's help and exit.
 .RE
-.SS overlay\-flash
+.SS overlay\-list
 .PP
-\fBtrcc display overlay\-flash\fR \fIKEY\fR \fIELEMENT_ID\fR [\fIOPTIONS\fR]
+\fBtrcc display overlay\-list\fR \fIKEY\fR
 .PP
-Briefly highlight an overlay element in the GUI.
+Show what is currently drawn on the device's screen. The read half of overlay. overlay\-update / overlay\-delete / overlay\-flash all take an element id, and until this existed the only source of one was the line overlay\-add printed when you created it  \-  so the ids were unrecoverable the moment the terminal scrolled.
 .PP
 Arguments:
 .RS 4
 .TP
 \fBKEY\fR
-(no description)
-.TP
-\fBELEMENT_ID\fR
-(no description)
+Device key, e.g. 0402:3922
 .RE
 .PP
 Options:
 .RS 4
-.TP
-\fB\-\-duration, \-d \fIDURATION_MS\fR\fR
-Flash duration in milliseconds
 .TP
 \fB\-\-help\fR
 Show this command's help and exit.
@@ -708,7 +730,7 @@ Show this command's help and exit.
 .PP
 \fBtrcc display restore\-theme\fR \fIKEY\fR
 .PP
-Reload the device's persisted theme  \-  convenience after restart.
+Restore the device's saved display (theme + background; Theme1 if none).
 .PP
 Arguments:
 .RS 4
@@ -740,9 +762,9 @@ Show this command's help and exit.
 .RE
 .SS screencast
 .PP
-\fBtrcc display screencast\fR \fIKEY\fR \fIX\fR \fIY\fR \fIW\fR \fIH\fR [\fIOPTIONS\fR]
+\fBtrcc display screencast\fR \fIKEY\fR [\fIX\fR] [\fIY\fR] [\fIW\fR] [\fIH\fR] [\fIOPTIONS\fR]
 .PP
-Stream a screen region to the LCD until interrupted. Wraps StartScreencast  \-  the GUI ScreencastHandler subscriber drives the per\-frame Qt capture timer. Ctrl\-C calls StopScreencast for clean teardown.
+Stream a screen region to the LCD until interrupted. Wraps StartScreencast, which starts capturing. Ctrl\-C calls StopScreencast for clean teardown. Without a region it casts the device's stored one (screencast\-region, or the loaded theme's); a given region is stored as the device's.
 .PP
 Arguments:
 .RS 4
@@ -751,13 +773,13 @@ Arguments:
 Device key, e.g. 0402:3922
 .TP
 \fBX\fR
-Top\-left X coordinate of capture region (px)
+Top\-left X of the capture region (px)
 .TP
 \fBY\fR
-Top\-left Y coordinate of capture region (px)
+Top\-left Y of the capture region (px)
 .TP
 \fBW\fR
-Capture region width (px)
+Capture region width (px); 0 0 0 0 casts the stored region
 .TP
 \fBH\fR
 Capture region height (px)
@@ -768,6 +790,40 @@ Options:
 .TP
 \fB\-\-audio\fR
 Pipe system audio alongside the video feed (Linux: PipeWire)
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS screencast\-region
+.PP
+\fBtrcc display screencast\-region\fR \fIKEY\fR \fIX\fR \fIY\fR \fIW\fR \fIH\fR [\fIOPTIONS\fR]
+.PP
+Set the device's screen\-cast region; a running cast follows it.
+.PP
+Arguments:
+.RS 4
+.TP
+\fBKEY\fR
+Device key, e.g. 0402:3922
+.TP
+\fBX\fR
+Top\-left X on screen (px)
+.TP
+\fBY\fR
+Top\-left Y on screen (px)
+.TP
+\fBW\fR
+Region width (px)
+.TP
+\fBH\fR
+Region height (px)
+.RE
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-hide\-border\fR
+Hide the on\-screen border around the region (default: unchanged)
 .TP
 \fB\-\-help\fR
 Show this command's help and exit.
@@ -919,53 +975,6 @@ Device key, e.g. 0402:3922
 .PP
 Options:
 .RS 4
-.TP
-\fB\-\-help\fR
-Show this command's help and exit.
-.RE
-.SS slideshow\-drive
-.PP
-\fBtrcc display slideshow\-drive\fR \fIKEY\fR [\fIOPTIONS\fR]
-.PP
-Actually rotate the configured slideshow, until stopped. slideshow on and configure\-slideshow only PERSIST the slideshow. Nothing advanced it outside the gui  \-  the gui runs its own timer, so a slideshow set up here was saved, reported back correctly, and never switched a theme. This registers the driver that rotates it. Unlike slideshow\-run (a foreground demo loop over a directory), this uses the persisted config and returns immediately; the rotation continues in the background for as long as the app or daemon is alive.
-.PP
-Arguments:
-.RS 4
-.TP
-\fBKEY\fR
-Device key, e.g. 0402:3922
-.RE
-.PP
-Options:
-.RS 4
-.TP
-\fB\-\-stop\fR
-Stop driving instead of starting
-.TP
-\fB\-\-help\fR
-Show this command's help and exit.
-.RE
-.SS slideshow\-run
-.PP
-\fBtrcc display slideshow\-run\fR \fIKEY\fR \fITHEMES_DIR\fR [\fIOPTIONS\fR]
-.PP
-Foreground slideshow over a directory of themes. Different from slideshow / configure\-slideshow (which persist state). This is a one\-shot loop: blocks until Ctrl\-C, swaps to the next theme each tick. Useful for demos + smoke tests; the persisted flow is what production users want.
-.PP
-Arguments:
-.RS 4
-.TP
-\fBKEY\fR
-Device key, e.g. 0402:3922
-.TP
-\fBTHEMES_DIR\fR
-Directory containing theme subdirectories
-.RE
-.PP
-Options:
-.RS 4
-.TP
-\fB\-\-interval, \-i \fIINTERVAL\fR\fR
-Seconds between theme switches (default: 30.0)
 .TP
 \fB\-\-help\fR
 Show this command's help and exit.

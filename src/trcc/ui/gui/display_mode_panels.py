@@ -19,7 +19,6 @@ from PySide6.QtWidgets import (
 )
 
 from ...core.geometry import lock_region_to_panel
-from ...core.i18n import tr
 from ...core.models import ACTION_ICON_IMAGES, DATE_FORMAT_IMAGES, OverlayMode
 from .assets import Assets
 from .base import set_background_pixmap
@@ -224,6 +223,7 @@ class DisplayModePanel(QFrame):
         "Load": "Load mask overlay",
         "Clear": "Clear mask",
         "VideoLoad": "Load video for playback",
+        "VideoUrl": "Play a web video or live stream (http, https, rtsp)",
         "GIF": "Load animated GIF",
         "Network": "Network stream",
         "Settings": "Settings",
@@ -480,12 +480,17 @@ class MaskPanel(DisplayModePanel):
         if self._updating:
             return
         log.debug("_on_position_changed: x=%s y=%s", self.entry_x.text(), self.entry_y.text())
+        if (position := self._entered_position()) is not None:
+            self.mask_position_changed.emit(*position)
+
+    def _entered_position(self) -> tuple[int, int] | None:
+        """The X/Y the fields say, an empty field reading as 0; None mid-edit."""
         try:
-            x = int(self.entry_x.text() or '0')
-            y = int(self.entry_y.text() or '0')
-            self.mask_position_changed.emit(x, y)
+            return int(self.entry_x.text() or '0'), int(self.entry_y.text() or '0')
         except ValueError:
-            pass
+            log.debug("_entered_position: not a number yet (%r, %r)",
+                      self.entry_x.text(), self.entry_y.text())
+            return None
 
     def _on_eye_toggle(self):
         log.debug("_on_eye_toggle: mask_visible=%s→%s", self._mask_visible, not self._mask_visible)
@@ -509,20 +514,27 @@ class MaskPanel(DisplayModePanel):
             )
 
     def set_position(self, x: int, y: int):
-        """Set X/Y values without triggering events."""
+        """Set X/Y values without triggering events.
+
+        Left alone when the fields already mean it: the App echoes back every
+        position typed here, and rewriting a field the user is typing in turns
+        an emptied field into "0" under the cursor.
+        """
+        log.debug("set_position: (%d,%d) entered=%s", x, y, self._entered_position())
+        if self._entered_position() == (x, y):
+            return
         self._updating = True
         self.entry_x.setText(str(x))
         self.entry_y.setText(str(y))
         self._updating = False
 
     def set_mask_visible(self, visible: bool):
-        """Set eye toggle state."""
+        """Show ``mask_visible`` -- on the eye AND the switch, one fact both
+        dispatch (``SetMaskVisible``), as the C#'s one ``myMbxs``."""
+        log.debug("set_mask_visible: %s", visible)
         self._mask_visible = visible
         self._update_eye_icon()
-
-    def apply_language(self, lang: str) -> None:
-        """Update title label for current language."""
-        self._title_lbl.setText(tr('Layer Mask', lang))
+        self.set_enabled(visible)
 
 
 class ScreenCastPanel(DisplayModePanel):
@@ -531,10 +543,16 @@ class ScreenCastPanel(DisplayModePanel):
     Extends DisplayModePanel with coordinate entry fields, +/- buttons,
     border toggle, and aspect ratio locking.
 
-    Matches Windows UCTouPingXianShi layout within 351x100.
+    Matches Windows UCTouPingXianShi layout within 351x100.  The region and
+    the border flag are the App's (``LcdSnapshot.screencast_rect``); the panel
+    shows them and says when the user changed one.
     """
 
-    screencast_params_changed = Signal(int, int, int, int)  # x, y, w, h
+    #: A finished edit -- Enter, focus leaving a field, or a +/- click -- of
+    #: the region on screen, ``(x, y, w, h)``.  Not per keystroke: a half-typed
+    #: "3" of "320" is not a region anyone asked for.
+    region_edited = Signal(int, int, int, int)
+    #: The border button: True hides the on-screen frame (the C#'s ``myYcbk``).
     border_toggled = Signal(bool)
     audio_toggled = Signal(bool)
 
@@ -556,13 +574,13 @@ class ScreenCastPanel(DisplayModePanel):
     _BTN_BORDER = (309, 16, 24, 16)
     _BTN_AUDIO = (280, 16, 24, 16)
 
-    capture_requested = Signal()  # launch screen capture
 
     def __init__(self, parent=None):
         super().__init__("screencast", [], parent)
         self._updating = False
-        self._show_border = True
+        self._hide_border = True
         self._aspect_lock = True
+        self._shown: tuple[int, int, int, int] = (0, 0, 0, 0)
         # None, not (0, 0) — ``DeviceStateResult.resolution`` keeps "we have
         # not asked the hardware yet" distinct from "a 0x0 panel", and a
         # presentation that collapses them cannot tell a user with no device
@@ -582,6 +600,7 @@ class ScreenCastPanel(DisplayModePanel):
                             ("w", self.entry_w), ("h", self.entry_h)):
             field.setProperty(_AXIS_PROPERTY, axis)
             field.textChanged.connect(self._on_coord_edited)
+            field.editingFinished.connect(self._commit)
 
         # +/- buttons
         self._make_pm_btn(*self._BTN_ADD_X, +1, self.entry_x)
@@ -628,81 +647,71 @@ class ScreenCastPanel(DisplayModePanel):
         except ValueError:
             return
 
-        if self._aspect_lock and which in ('w', 'h') and (
-                ratio := self._get_aspect_ratio()):
-            # ratio is height/width, so height = width * ratio and
-            # width = height / ratio.  These were the wrong way round, which
-            # made every non-square panel move the locked edge the WRONG WAY:
-            # on an 854x480 panel a width of 201 produced a height of 357
-            # where 113 is correct.  Square panels were skipped outright by a
-            # ``ratio != 1.0`` guard, so they never locked at all.
+        if self._aspect_lock and which in ('w', 'h'):
+            # ONE derivation, shared with qtgui -- core.geometry, in either
+            # direction.  The typed edge leads; only the other field is
+            # rewritten, so the cursor in the one being typed stays put.  No
+            # device yet (None) or a 0x0 answer leaves the region alone.
+            _, _, w, h = lock_region_to_panel(
+                self._resolution, *self.values(),
+                keep="width" if which == 'w' else "height")
+            follower, value = ((self.entry_h, h) if which == 'w'
+                               else (self.entry_w, w))
             self._updating = True
-            if which == 'w':
-                # ONE derivation, shared with qtgui — core.geometry.
-                *_, locked = lock_region_to_panel(self._resolution, 0, 0, val, 0)
-                self.entry_h.setText(str(locked))
-            else:
-                self.entry_w.setText(str(round(val / ratio)))
-            log.debug("_on_coord_changed: aspect lock %s=%d ratio=%.4f -> %sx%s",
-                      which, val, ratio,
-                      self.entry_w.text(), self.entry_h.text())
+            follower.setText(str(value))
             self._updating = False
+            log.debug("_on_coord_changed: aspect lock %s=%d on %s -> %sx%s",
+                      which, val, self._resolution, w, h)
 
-        self._emit_params()
+    def values(self) -> tuple[int, int, int, int]:
+        """The region the fields show, ``(x, y, w, h)`` -- what Start sends.
 
-    def _emit_params(self):
-        """Emit all four coordinate values."""
-        try:
-            x = int(self.entry_x.text() or '0')
-            y = int(self.entry_y.text() or '0')
-            w = int(self.entry_w.text() or '0')
-            h = int(self.entry_h.text() or '0')
-            self.screencast_params_changed.emit(x, y, w, h)
-        except ValueError:
-            pass
-
-    def _get_aspect_ratio(self) -> float | None:
-        """The panel's height/width, or ``None`` before a device is known.
-
-        Derived, not tabulated.  A hardcoded resolution->ratio table used to
-        live here; every one of its 11 entries was exactly ``height / width``,
-        so it was a second copy of geometry this panel is already handed by
-        :meth:`set_resolution` — and it had drifted, missing 640x172 entirely
-        and falling back to a 0.75 default that is 2.8x wrong for that panel.
-
-        ``None`` carries the same meaning it does on
-        ``DeviceStateResult.resolution``, which is where this geometry comes
-        from: nobody has told us yet.  A UI that answered 0.75 anyway would be
-        constraining the user's region to a panel it has not met.
+        The entries' ``QIntValidator(0, 9999)`` admits digits only, so an
+        empty field is the one non-number and reads as 0.
         """
-        if self._resolution is None:
-            log.debug("_get_aspect_ratio: no device yet — no aspect lock")
-            return None
-        width, height = self._resolution
-        if width <= 0 or height <= 0:
-            log.warning("_get_aspect_ratio: device reported %dx%d — no aspect lock",
-                        width, height)
-            return None
-        return height / width
+        x, y, w, h = (int(e.text() or '0') for e in
+                      (self.entry_x, self.entry_y, self.entry_w, self.entry_h))
+        log.debug("values: x=%d y=%d w=%d h=%d", x, y, w, h)
+        return x, y, w, h
+
+    def _increment(self, entry, delta):
+        """A +/- click is a finished edit, as in the C# (one delegate per click)."""
+        log.debug("_increment: %s %+d", entry.property(_AXIS_PROPERTY), delta)
+        super()._increment(entry, delta)
+        self._commit()
+
+    def _commit(self) -> None:
+        """Emit ``region_edited`` when the fields differ from what was shown.
+
+        ``editingFinished`` also fires when focus merely leaves a field, so an
+        unchanged region sends nothing.
+        """
+        region = self.values()
+        log.debug("_commit: %s (shown %s)", region, self._shown)
+        if region != self._shown:
+            self._shown = region
+            self.region_edited.emit(*region)
 
     def _on_border_toggle(self):
-        log.debug("_on_border_toggle: show_border=%s→%s", self._show_border, not self._show_border)
-        self._show_border = not self._show_border
+        log.info("_on_border_toggle: hide_border=%s→%s",
+                 self._hide_border, not self._hide_border)
+        self._hide_border = not self._hide_border
         self._update_border_icon()
-        self.border_toggled.emit(self._show_border)
+        self.border_toggled.emit(self._hide_border)
 
     def _update_border_icon(self):
-        img = 'display_mode_border_active.png' if self._show_border else 'display_mode_border.png'
+        # The C#'s ``P显示边框A`` is the image for ``myYcbk`` True -- hidden.
+        img = 'display_mode_border_active.png' if self._hide_border else 'display_mode_border.png'
         pix = Assets.load_pixmap(img, 24, 16)
         if not pix.isNull():
             self.border_btn.setIcon(QIcon(pix))
             self.border_btn.setIconSize(self.border_btn.size())
             self.border_btn.setStyleSheet(Styles.FLAT_BUTTON)
         else:
-            self.border_btn.setText("B" if self._show_border else "b")
+            self.border_btn.setText("B" if self._hide_border else "b")
             self.border_btn.setStyleSheet(
                 "QPushButton { background: #00CED1; color: white; border: none; font-size: 8px; }"
-                if self._show_border else
+                if self._hide_border else
                 "QPushButton { background: #555; color: white; border: none; font-size: 8px; }"
             )
 
@@ -718,17 +727,34 @@ class ScreenCastPanel(DisplayModePanel):
         if h is not None:
             self.entry_h.setText(str(h))
         self._updating = False
+        self._shown = self.values()
 
     def set_resolution(self, width: int, height: int) -> None:
-        """Set LCD resolution for aspect ratio calculations."""
+        """The canvas a cast fills (``LcdSnapshot.screencast_canvas``) -- the
+        aspect the region locks to."""
+        log.debug("set_resolution: %s -> %dx%d", self._resolution, width, height)
         self._resolution = (width, height)
 
     def set_aspect_lock(self, enabled):
         self._aspect_lock = enabled
 
-    def set_border_visible(self, visible):
-        self._show_border = visible
+    def set_hide_border(self, hide: bool) -> None:
+        """Show the App's border flag without emitting ``border_toggled``."""
+        log.debug("set_hide_border: %s -> %s", self._hide_border, hide)
+        self._hide_border = hide
         self._update_border_icon()
+
+    @property
+    def audio_on(self) -> bool:
+        """The mic button's state -- what Start sends as ``audio``."""
+        log.debug("audio_on: %s", self._audio_on)
+        return self._audio_on
+
+    def set_audio(self, on: bool) -> None:
+        """Show a cast's microphone state without emitting ``audio_toggled``."""
+        log.info("set_audio: %s -> %s", self._audio_on, on)
+        self._audio_on = on
+        self._update_audio_icon()
 
     def _on_audio_toggle(self):
         log.info("_on_audio_toggle")

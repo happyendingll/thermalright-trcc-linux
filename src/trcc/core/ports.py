@@ -9,18 +9,26 @@ from __future__ import annotations
 import builtins
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
+from ._frames import pad_rows
 from ._safe import is_under
 from .errors import DeviceDisconnectedError, UnsupportedOperationError
 from .logs import per_frame
 from .models import (
     DEFAULT_REFRESH_INTERVAL_S,
+    FAN_SLOT_KEYWORDS,
     MIN_REFRESH_INTERVAL_S,
+    RamAccessState,
+    RamAccessStatus,
+    RamEffectSettings,
+    RgbMirrorDevice,
+    TlsFiles,
     VideoExportRequest,
+    format_device_key,
 )
 
 log = logging.getLogger(__name__)
@@ -32,6 +40,7 @@ frame_log = per_frame(__name__)
 WriteBuffer = bytes | bytearray | memoryview
 
 if TYPE_CHECKING:
+    from .commands._base import Command
     from .diagnostics import DoctorResult, GpuReaderState, HealthReport
     from .events import EventBus
     from .models import (
@@ -54,6 +63,7 @@ if TYPE_CHECKING:
         Wire,
     )
     from .protocol import DeviceProfile
+    from .results import Result
 
 
 # =========================================================================
@@ -141,7 +151,11 @@ class ScsiTransport(ABC):
     @abstractmethod
     def send_cdb(self, cdb: bytes, data: bytes,
                  timeout_ms: int = 5000) -> bool:
-        """Send a 16-byte CDB with a data-out payload.  True on CSW status 0."""
+        """Send a 16-byte CDB with a data-out payload.  True on CSW status 0.
+
+        A failed command returns False (soft: the next frame retries).  A
+        device that is GONE raises a disconnect-class error instead, so the
+        recovery threshold can mark it lost."""
 
     @abstractmethod
     def read_cdb(self, cdb: bytes, length: int,
@@ -270,20 +284,58 @@ class Device(ABC, Generic[T]):
 
     @property
     def is_connected(self) -> bool:
-        connected = self._handshake is not None
+        """Handshaken AND still holding an open transport — "can I send now".
+
+        Not the handshake alone.  Only :meth:`disconnect` clears it, while the
+        device closes its OWN transport in two places that do not call it: the
+        recovery threshold and a ``_reconnect`` whose re-open failed.  Read off
+        the handshake, such a device stayed "connected" with nothing to write
+        to, so every producer kept sending into it — two records and an
+        ``ErrorOccurred`` per frame, for three hours on 2026-10-06 — and a
+        replug's ``connect_unit`` saw "already connected" and left it there.
+        """
+        connected = self._handshake is not None and self._transport.is_open
         frame_log.debug("Device.is_connected: %s (%s)", connected, self.info.key)
         return connected
 
     @property
     def is_led(self) -> bool:
         """True for LED-control devices; False for LCD-frame devices."""
-        log.debug("is_led")
+        frame_log.debug("Device.is_led: False (%s)", self.info.key)
         return False
+
+    #: Which PHYSICAL unit this is, when more than one of the model is
+    #: plugged in.  Empty is the normal case — see :meth:`set_unit`.
+    _unit: str = ""
+
+    def set_unit(self, unit: str) -> None:
+        """Name WHICH of several identical units this object drives (#287).
+
+        Two of the same cooler share a VID/PID and ship no serial, so the
+        catalog's ``ProductInfo.key`` cannot tell them apart and both devices
+        landed in ``App.devices`` under one key — the second overwrote the
+        first.  ``Platform.scan_devices`` resolves the USB port and
+        ``disambiguate`` hands it out; the composition root passes it here,
+        the same way it passes quirks and the state dir.
+
+        Empty for every single-device user, which keeps :attr:`key` at the
+        plain ``vid:pid`` their config and commands already use.
+        """
+        self._unit = unit
+        log.info("Device %s: unit=%r", self.info.key, unit)
 
     @property
     def key(self) -> str:
-        frame_log.debug("Device.key: %s", self.info.key)
-        return self.info.key
+        """This DEVICE's identity — ``vid:pid``, or ``vid:pid@port`` (#287).
+
+        Mirrors :attr:`DeviceInfo.key` exactly, because the two are compared:
+        the scan produces the ``DeviceInfo`` and the composition root builds
+        the ``Device`` from it, and a user's settings are looked up under
+        whichever string reaches them.
+        """
+        key = format_device_key(self.info.vid, self.info.pid, self._unit)
+        frame_log.debug("Device.key: %s", key)
+        return key
 
     @property
     def needs_keepalive(self) -> bool:
@@ -357,7 +409,8 @@ class Device(ABC, Generic[T]):
         the call site, so this base raise is defensive — no ``isinstance``
         needed.  Returns the number of frames uploaded.
         """
-        log.debug("send_boot_animation: frames=%s delays_ds=%s", frames, delays_ds)
+        log.debug("send_boot_animation: %d frame(s) delays_ds=%s",
+                  len(frames), delays_ds)
         raise UnsupportedOperationError(
             f"{self.key} does not support boot animation (SCSI-only)"
         )
@@ -383,7 +436,9 @@ class Device(ABC, Generic[T]):
         log.info("%s: reconnecting transport (close → open → handshake)", self.key)
         try:
             self._transport.close()
-            self._transport.open()
+            # ``connect()`` opens the transport itself.  Opening here as well
+            # made every reconnect open TWICE: a second USB handle claiming the
+            # interface while the first still held it.
             self.connect()
         except Exception as e:
             log.warning("%s: reconnect failed: %s", self.key, e)
@@ -409,14 +464,14 @@ class Device(ABC, Generic[T]):
             try:
                 ok = write()
             except Exception as e:
-                if attempt == 0 and not self._quirks.keepalive_stream:
+                if attempt == 0 and not self._quirks.single_session:
                     log.warning(
                         "%s: send attempt 1 failed (%s) — reconnecting and retrying",
                         self.key, e,
                     )
                     self._reconnect()
                     continue
-                if self._quirks.keepalive_stream:
+                if self._quirks.single_session:
                     # Single-session firmware: a close→reopen wedges the panel
                     # until a physical replug (#228), so NEVER reconnect — soft-
                     # fail and let the next keepalive tick resend the frame.
@@ -461,7 +516,8 @@ class Device(ABC, Generic[T]):
 #     cpu:temp  cpu:usage  cpu:freq  cpu:power
 #     gpu:primary:temp  gpu:0:temp  gpu:nvidia:0:temp
 #     memory:used  memory:percent
-#     fan:cpu:rpm  fan:gpu:percent
+#     fan:<key>:rpm  fan:<key>:percent
+#     fan:cpu  fan:gpu  fan:ssd  fan:sys2    (the four slots a theme shows)
 
 
 # A quantity method below that carries a BODY instead of ``@abstractmethod`` is
@@ -497,7 +553,7 @@ class QuantitySource:
     ``ABC``.
 
     The three ports below declare quantities a backend may simply not have —
-    :class:`CpuSource` 4, :class:`GpuSource` 7, :class:`FanSource` 1 — and
+    :class:`CpuSource` 4, :class:`GpuSource` 10, :class:`FanSource` 1 — and
     answer ``None`` by default so a backend that cannot read one does not have
     to say so in code.  That default is what makes this ABC possible: "the
     subclass never overrode it" IS "this backend has no such sensor", and
@@ -702,8 +758,35 @@ class GpuSource(IdentifiedSource, QuantitySource):
         sensor.  A backend that can read it overrides this.
         """
 
+    def hotspot(self) -> float | None:
+        """Hottest point on the die in °C -- amdgpu's ``junction``, LHM's
+        "GPU Hot Spot".  Not :meth:`temp`, which is the edge sensor (#301).
+
+        ``None`` is the default and means this backend has no such
+        sensor.  A backend that can read it overrides this.
+        """
+
+    def mem_temp(self) -> float | None:
+        """VRAM temperature in °C -- amdgpu's ``mem``, xe's ``vram``.
+
+        ``None`` is the default and means this backend has no such
+        sensor.  A backend that can read it overrides this.
+        """
+
     def fan(self) -> float | None:
-        """Fan speed 0-100.
+        """Fan duty 0-100 %.
+
+        ``None`` is the default and means this backend has no such
+        sensor.  A backend that can read it overrides this.
+        """
+
+    def fan_rpm(self) -> float | None:
+        """Fan speed in RPM -- what the Windows app shows as GPUFAN (#145).
+
+        A separate quantity from :meth:`fan`, not a unit flag on it: a driver
+        may expose either or both (NVML has RPM only from recent drivers,
+        amdgpu a PWM duty only on some boards), and a percent drawn beside
+        "RPM" is the bug this split exists to prevent.
 
         ``None`` is the default and means this backend has no such
         sensor.  A backend that can read it overrides this.
@@ -737,6 +820,18 @@ class FanSource(IdentifiedSource, QuantitySource):
         ``None`` is the default and means this backend has no such
         sensor.  A backend that can read it overrides this.
         """
+
+    @property
+    def on_gpu(self) -> bool:
+        """True for a graphics card's own fan, which a GpuSource already reads.
+
+        Declared, not guessed from the key: the pool used to skip keys
+        containing "gpu", which caught ``hwmon:amdgpu:fan1`` and missed
+        ``hwmon:nouveau:fan1`` and ``hwmon:xe:fan1`` -- so those cards' fans
+        filled the CPUFAN slot.  False unless a backend knows better.
+        """
+        frame_log.debug("FanSource.on_gpu: %s -> False", self.key)
+        return False
 
 
 class DiskSource(IdentifiedSource):
@@ -780,6 +875,21 @@ class BoardTempSource(IdentifiedSource):
     @abstractmethod
     def temp(self) -> float | None:
         """Current temperature in Celsius, or ``None``."""
+
+
+class VoltageSource(IdentifiedSource):
+    """One motherboard / super-I/O voltage input (#259).
+
+    Nothing read ``inN_input`` before.  The kernel reports millivolts,
+    generally UNSCALED: board-specific resistor dividers are applied in
+    userspace (``sensors.d``), so on an unlabelled chip "+12V" can read about
+    1 V.  The reading is the chip's; naming and scaling a row is the user's,
+    on the dashboard.
+    """
+
+    @abstractmethod
+    def volts(self) -> float | None:
+        """Current input voltage in V, as the chip reports it, or ``None``."""
 
 
 class DramSource(IdentifiedSource):
@@ -870,6 +980,8 @@ class SensorEnumerator(ABC):
     # boot by the composition root from ``settings.active_disk``.
     _preferred_disk_key: str | None = None
     _warned_missing_disk_key: str | None = None
+    _fan_slot_pins: dict[str, str] | None = None
+    _warned_missing_fan_pins: frozenset[str] = frozenset()
 
     # Poll cadence, in seconds.  Lives here rather than on the concrete
     # enumerator for the same reason the preference keys do: it is pure state
@@ -926,7 +1038,7 @@ class SensorEnumerator(ABC):
         """
         clamped = max(MIN_REFRESH_INTERVAL_S, seconds)
         if clamped == self._interval_s:
-            log.debug("set_interval: already %.2fs — no change", clamped)
+            frame_log.debug("set_interval: already %.2fs — no change", clamped)
             return
         log.info("set_interval: %.2fs -> %.2fs", self._interval_s, clamped)
         self._interval_s = clamped
@@ -1046,32 +1158,14 @@ class SensorEnumerator(ABC):
             temp=value(f"gpu:{i}:temp", 0.0), usage=value(f"gpu:{i}:usage", 0.0),
             clock=value(f"gpu:{i}:clock", 0.0), power=value(f"gpu:{i}:power", 0.0),
         ) for i, g in enumerate(self.gpus())]
-        # Fan slots the DC can show (CPUFAN / GPUFAN / SSDFAN / FAN2).
-        # snapshot() populated every other field but never called self.fans(),
-        # so all four defaulted to 0.0 — every theme showed 0 RPM on every
-        # board (#145/#207).
-        #
-        # The GPU fan is the one slot we can identify with certainty: it belongs
-        # to the GPU the user already picked, so it FOLLOWS the GPU picker —
-        # ``primary_gpu().fan()`` (a duty-cycle percent, all the driver exposes;
-        # not RPM).  Linux has no ``fanN_label`` for the motherboard headers, so
-        # CPU/SSD/SYS2 fill from the device's still-spinning fans in discovery
-        # order (a 0-RPM header is an empty header, skipped).  The GPU's own
-        # hwmon fan (e.g. ``amdgpu``) is excluded from that pool so it is never
-        # double-counted as a case fan.
-        fan_gpu = value("gpu:primary:fan", 0.0)
-        # Same pool, same order, same "an empty header is 0 RPM" skip -- but
-        # read from the sample.  ``_store`` keeps a 0.0 (it omits only None),
-        # so the truthiness test still has to be applied here or a stopped
-        # header would take a fan slot.
-        pool = iter(
-            rpm for f in self.fans()
-            if "gpu" not in f.key.lower()
-            and (rpm := readings.get(f"fan:{f.key}:rpm"))
-        )
-        fan_cpu = next(pool, 0)
-        fan_ssd = next(pool, 0)
-        fan_sys2 = next(pool, 0)
+        # The four fan slots come from ``read_all`` like everything else --
+        # ``fan_slots`` computes them once, for the overlay AND this DTO.  A GPU
+        # fan with only a duty percent lands under ``fan:gpu:percent``, so here
+        # it is 0 RPM rather than a percent passed off as RPM (#145).
+        fan_cpu = value("fan:cpu", 0.0)
+        fan_gpu = value("fan:gpu", 0.0)
+        fan_ssd = value("fan:ssd", 0.0)
+        fan_sys2 = value("fan:sys2", 0.0)
         metrics = HardwareMetrics(
             cpu_temp=max((c.temp for c in cpus), default=0.0),
             cpu_percent=(sum(c.usage for c in cpus) / len(cpus)) if cpus else 0.0,
@@ -1107,6 +1201,61 @@ class SensorEnumerator(ABC):
             (fan_cpu, fan_gpu, fan_ssd, fan_sys2),
         )
         return metrics
+
+    def fan_slots(self, readings: dict[str, float]) -> dict[str, float]:
+        """The four fan slots a theme shows -- CPUFAN, GPUFAN, SSDFAN, FAN2.
+
+        ONE computation for both views.  It used to live inside
+        :meth:`snapshot` alone, so the GUI sidebar had values while every fan
+        element on the LCD asked ``read_all`` for ``fan:gpu`` and found no such
+        key: blank on every host, every tick (#145).
+
+        GPUFAN follows the GPU picker and, like the Windows app, is RPM.  A
+        driver that exposes only a duty cycle (old NVIDIA, some amdgpu boards)
+        fills ``fan:gpu:percent`` instead, which a renderer draws with "%" --
+        never a percent under an "RPM" label.  Linux has no ``fanN_label`` for
+        motherboard headers, so CPU/SSD/SYS2 fill from the still-spinning fans
+        in discovery order; a 0-RPM header is an empty header, and the GPU's
+        own hwmon fan is excluded so it is not counted twice.
+        """
+        slots: dict[str, float] = {}
+        pins = self._fan_slot_pins or {}
+        for slot, key in pins.items():
+            if (value := readings.get(key)) is not None:
+                slots[slot] = value
+            elif slot not in self._warned_missing_fan_pins:
+                log.warning("fan_slots: %s is pinned to %s, which has no "
+                            "reading -- the default fills it", slot, key)
+                self._warned_missing_fan_pins |= {slot}
+        if "fan:gpu" not in slots:
+            if (rpm := readings.get("gpu:primary:fan_rpm")) is not None:
+                slots["fan:gpu"] = rpm
+            elif (duty := readings.get("gpu:primary:fan")) is not None:
+                slots["fan:gpu:percent"] = duty
+        # Spinning motherboard fans no pin has taken: a name keyword claims a
+        # slot first, then the rest fill in order.
+        pool = [(f.name.lower(), rpm) for f in self.fans()
+                if not f.on_gpu and f"fan:{f.key}:rpm" not in pins.values()
+                and (rpm := readings.get(f"fan:{f.key}:rpm"))]
+        open_slots = [s for s in FAN_SLOT_KEYWORDS if s not in slots]
+        for slot in list(open_slots):
+            hit = next((i for i, (name, _) in enumerate(pool)
+                        if any(kw in name for kw in FAN_SLOT_KEYWORDS[slot])), None)
+            if hit is not None:
+                slots[slot] = pool.pop(hit)[1]
+                open_slots.remove(slot)
+        for slot in open_slots:
+            slots[slot] = pool.pop(0)[1] if pool else 0.0
+        frame_log.debug("fan_slots: %s", slots)
+        return slots
+
+    def set_fan_slot_pins(self, pins: Mapping[str, str]) -> None:
+        """Pin which reading fills each fan slot (``fan:cpu`` ->
+        ``fan:hwmon:nct6798:fan6:rpm``).  The App seeds this from the
+        dashboard's FAN rows, the one place a user picks (#145)."""
+        log.info("set_fan_slot_pins: %s -> %s", self._fan_slot_pins, dict(pins))
+        self._fan_slot_pins = dict(pins)
+        self._warned_missing_fan_pins = frozenset()
 
     # ── Flat dict view (for overlay lookups) ────────────────────────
     @abstractmethod
@@ -1232,14 +1381,23 @@ class Paths(ABC):
         asset both resolve outside the theme dir -- so the same file rendered
         or went black depending on which theme happened to be selected.
 
-        Rooted at :meth:`user_content_dir`, not :meth:`user_data_dir`, so
-        staged one-off content (``single-image/``, ``uploads/``) counts too.
-        Concrete on the ABC for the same reason :meth:`user_data_dir` is:
-        every OS roots user content the same way, only the root differs.
+        **Defined by what it is NOT: program content, under** :meth:`data_dir`.
+        That tree is the only one pre-scaled to the panel — stock themes, cloud
+        backgrounds and masks, all downloaded by the app.  Everything else is
+        the user's, including a file picked from ``~/Downloads`` that was never
+        copied into :meth:`user_content_dir`.  It used to be the other way
+        round ("user = under user_content_dir"), which filed such a file as
+        program content: a picked video decoded at canvas size, stretched, with
+        W/H doing nothing, and a picked photo wider than the panel went black
+        (#291).  Measured before the flip: every program root the port hands
+        out (``theme_dir``, ``cloud_theme_dir``, ``cloud_mask_dir`` and their
+        per-SKU siblings) derives from :meth:`data_dir`.
+        Concrete on the ABC: every OS roots program data the same way, only
+        the root differs.
         """
-        under = is_under(path, self.user_content_dir())
-        frame_log.debug("is_user_content: %s → %s", path, under)
-        return under
+        user = not is_under(path, self.data_dir())
+        frame_log.debug("is_user_content: %s → %s", path, user)
+        return user
 
     def theme_dir(self, width: int, height: int, variant: str = "") -> Path:
         """Themes shipped with the app or downloaded from GitHub releases.
@@ -1552,12 +1710,36 @@ class ContentStore(ABC):
     # ── Whole units in and out ────────────────────────────────────────
 
     @abstractmethod
-    def export(self, theme_path: Path, archive_path: Path) -> None:
+    def export(self, theme_path: Path, archive_path: Path, *,
+               background: Path | None = None) -> None:
         """Archive a theme as a self-contained, shareable zip.
 
         DEREFERENCES: a saved theme references its assets in the user
         library, so the resolved bytes are bundled and the ref keys stripped
         — the recipient needs nothing from the sender's library.
+
+        *background* replaces the theme's own background in the archive only
+        — a video baked to a ``Theme.zt`` for a ``.tr``, which has no slot for
+        an mp4.  The theme on disk is untouched.
+        """
+
+    @abstractmethod
+    def export_unsaved(
+        self, manifest: dict, archive_path: Path, *,
+        background: Path | bytes | None,
+        mask: Path | None,
+        preview: bytes | None,
+    ) -> None:
+        """Archive a theme that exists only as a device's live state.
+
+        The Windows app's export writes what is ON the panel, saved or not
+        (``FormCZTV.buttonDaoChu_Click``), so there is no theme folder to hand
+        :meth:`export`.  The caller decides the content -- the manifest, the
+        background (PNG bytes, or a video file), the mask image, the grid
+        tile -- and this assembles it as a self-contained theme somewhere the
+        user never sees, archives it like :meth:`export`, and discards it.
+        Nothing lands in the user library, so an export never adds a mask or
+        a background to a grid.
         """
 
     @abstractmethod
@@ -1572,12 +1754,14 @@ class ContentStore(ABC):
     def export_dc(
         self, theme_dir: Path, output_path: Path,
         *, elements: list[dict] | None = None,
+        flags: dict | None = None,
     ) -> Path:
         """Write *theme_dir*'s config out in the legacy binary layout — for
         sharing with Windows TRCC users.
 
         *elements* REPLACES the theme's own layout when given: the caller
-        passes what the device is actually showing.
+        passes what the device is actually showing.  *flags* override the
+        theme's DC fields the same way (the device's screencast region).
         """
 
     @abstractmethod
@@ -1648,17 +1832,6 @@ class Renderer(ABC):
 
     @abstractmethod
     def rotate(self, surface: Any, degrees: int) -> Any: ...
-
-    @abstractmethod
-    def flip_horizontal(self, surface: Any) -> Any:
-        """Return a horizontally-mirrored copy of *surface*.
-
-        Used by the split-mode (Dynamic Island) overlay path:
-        authored assets cover the left side of the canvas, so the
-        renderer flips them when the device's PanelCutout sits on
-        the right.
-        """
-        ...
 
     # ── Adjustments ───────────────────────────────────────────────────
     @abstractmethod
@@ -1771,6 +1944,18 @@ class Renderer(ABC):
         del surface
         raise NotImplementedError("encode_png not implemented on this Renderer")
 
+    def raw_argb32(self, surface: Any) -> tuple[bytes, int, int, int]:
+        """The surface's pixels as ARGB32 (``bytes, width, height, stride``).
+
+        No encode: the frame a window on the same machine shows is these
+        bytes, copied through shared memory (``trcc.frame_share``).
+        Non-abstract, like :meth:`get_pixels_rgb` -- a renderer without it
+        leaves windows on the JPEG path.
+        """
+        log.debug("raw_argb32: surface=%s", surface)
+        del surface
+        raise NotImplementedError("raw_argb32 not implemented on this Renderer")
+
     def get_pixels_rgb(
         self, surface: Any, cols: int, rows: int,
     ) -> list[list[tuple[int, int, int]]]:
@@ -1863,7 +2048,8 @@ class Renderer(ABC):
 
         Mirrors ``DisplayService._encode_for_wire``: a fixed hardware-mount
         baseline (``encode_baseline`` — FW360 PM=6 → 180°) pre-rotates the wire
-        frame, then JPEG or RGB565 per the profile.
+        frame, then JPEG or RGB565 per the profile — RGB565 rows centred in
+        the panel's wider framebuffer row when it has one (``wire_row_px``).
         """
         if profile.encode_baseline:
             frame_log.debug("encode_payload: hardware-mount baseline %d° "
@@ -1878,9 +2064,11 @@ class Renderer(ABC):
             # (uncapped) with only LY setting it, which left every other JPEG
             # panel able to ship a frame the firmware silently discards (#251).
             return self.encode_jpeg(surface, max_size=profile.max_frame_bytes)
-        frame_log.debug("encode_payload: RGB565, byte order %s",
-                        profile.byte_order)
-        return self.encode_rgb565(surface, profile.byte_order)
+        frame_log.debug("encode_payload: RGB565, byte order %s, row %d px",
+                        profile.byte_order, profile.wire_row_px)
+        width, _ = self.surface_size(surface)
+        return pad_rows(self.encode_rgb565(surface, profile.byte_order),
+                        width * 2, profile.wire_row_px * 2)
 
     # ── Fonts ─────────────────────────────────────────────────────────
     def list_fonts(self) -> list[str]:
@@ -1898,17 +2086,6 @@ class Renderer(ABC):
     # ── Legacy boundary (video frames) ────────────────────────────────
     @abstractmethod
     def from_raw_rgb24(self, frame: RawFrame) -> Any: ...
-
-    @abstractmethod
-    def to_raw_rgb24(self, surface: Any) -> RawFrame:
-        """A surface back to packed RGB24 — the inverse of the above.
-
-        Exists because only half the pair did.  A surface is opaque to core,
-        so a caller holding one and needing to hand it to something that
-        speaks ``RawFrame`` had nowhere to convert — and the gui screencast
-        simply passed the surface, where the attribute access on ``.data`` /
-        ``.width`` blew up every frame.
-        """
 
     @abstractmethod
     def surface_nbytes(self, surface: Any) -> int:
@@ -1968,8 +2145,15 @@ class Diagnostics(ABC):
         ...
 
     @abstractmethod
-    def debug_report(self, log_tail_lines: int) -> str:
-        """Build the debug bundle and return its rendered, paste-ready text."""
+    def debug_report(self, log_tail_lines: int, *,
+                     held: Mapping[str, Mapping[str, str]] | None = None,
+                     probe: bool = True) -> str:
+        """Build the debug bundle and return its rendered, paste-ready text.
+
+        *held*: device key -> the handshake the running App reported; those
+        devices are not probed (a probe is a second handle on a driven panel).
+        *probe* False: probe nothing, for an App that is running but silent.
+        """
         ...
 
     @abstractmethod
@@ -1993,6 +2177,26 @@ class Diagnostics(ABC):
 # =========================================================================
 
 
+
+class TlsIdentity(ABC):
+    """Port for the LAN API's TLS files.  Concrete: ``CryptographyTls``
+    (``adapters/infra/tls.py``).
+
+    A self-signed certificate cannot be verified by name, so clients PIN its
+    fingerprint — which is why ``self_signed`` makes it ONCE and reuses it until
+    it expires.  Behind a port so the CLI dispatches ``ProvideApiTls`` instead
+    of importing the adapter, and never does network I/O of its own.
+    """
+
+    @abstractmethod
+    def self_signed(self, directory: Path, bind_host: str) -> TlsFiles:
+        """The pair in *directory*, made for every address this host answers on."""
+
+    @abstractmethod
+    def supplied(self, cert: Path, key: Path) -> TlsFiles:
+        """The user's own certificate and key, with the certificate's fingerprint."""
+
+
 class DataInstaller(ABC):
     """Port for installing on-demand data archives (themes / web / masks).
 
@@ -2007,6 +2211,145 @@ class DataInstaller(ABC):
     ) -> bool:
         """Fetch *archive_name* and extract into *target_dir*; True if populated."""
         ...
+
+
+# =========================================================================
+# SmBus — the chipset bus RGB memory's lighting controller answers on
+# =========================================================================
+
+#: The longest SMBus block: 32 bytes after its length byte.
+SMBUS_BLOCK_MAX = 32
+
+
+class SmBus(ABC):
+    """One SMBus: byte reads and writes, and block writes, to one address.
+
+    Concrete: ``LinuxSmBus`` (``adapters/rgb/smbus.py``, ``/dev/i2c-N``),
+    opened by ``Platform.smbuses``.  Every failure is an ``OSError``.
+    """
+
+    def __init__(self, number: int) -> None:
+        log.debug("SmBus.__init__: i2c-%d", number)
+        #: The OS's number for this bus -- ``i2c-3`` is 3.
+        self.number = number
+
+    @abstractmethod
+    def read_byte_data(self, address: int, register: int) -> int:
+        """One byte from *register* of the chip at *address*."""
+
+    @abstractmethod
+    def write_byte_data(self, address: int, register: int, value: int) -> None:
+        """One byte to *register* of the chip at *address*."""
+
+    @abstractmethod
+    def write_block_data(self, address: int, register: int,
+                         data: bytes) -> None:
+        """Up to ``SMBUS_BLOCK_MAX`` bytes to *register*, as one block write."""
+
+    @abstractmethod
+    def close(self) -> None:
+        """Release the bus."""
+
+
+# =========================================================================
+# RgbMirror — another RGB system that shows what the cooler shows (#160)
+# =========================================================================
+
+
+class RgbMirror(ABC):
+    """Another RGB system whose devices follow the cooler's colours.
+
+    TRCC leads: the colours a cooler shows are sent to the other system's
+    devices, so the whole PC matches.  Concrete: ``OpenRgbMirror``
+    (``adapters/rgb/openrgb.py``), a client of OpenRGB's SDK server, and
+    ``CorsairDramMirror`` (``adapters/rgb/corsair_dram.py``), Corsair RGB
+    memory over the SMBus.
+    Every method may raise ``OSError`` when the other system is unreachable;
+    the caller decides when to try again.
+    """
+
+    @abstractmethod
+    def devices(self) -> tuple[RgbMirrorDevice, ...]:
+        """The other system's devices, connecting first if needed."""
+        ...
+
+    @abstractmethod
+    def show(self, device: RgbMirrorDevice,
+             colors: Sequence[tuple[int, int, int]]) -> None:
+        """Show *colors* on *device*, stretched to its LED count."""
+        ...
+
+    @abstractmethod
+    def close(self) -> None:
+        """Drop the connection; the next call connects again."""
+        ...
+
+
+class RamAccess(ABC):
+    """The opt-in grant that lets this user reach RGB memory's bus.
+
+    Concrete: ``LinuxRamAccess`` (``adapters/system/_ram_access.py``).  The
+    bus also carries the memory's own settings chips, so access is never
+    given by default: ``enable`` asks for a password.  ``status`` reads files
+    only -- it never touches the bus.
+    """
+
+    @abstractmethod
+    def status(self) -> RamAccessStatus:
+        """Where this user stands, from the filesystem alone."""
+
+    @abstractmethod
+    def enable(self) -> RamAccessStatus:
+        """Install the grant -- a password prompt -- and say what changed."""
+
+    @abstractmethod
+    def disable(self) -> RamAccessStatus:
+        """Remove the grant and take the access back."""
+
+
+class _NoRamAccess(RamAccess):
+    """An OS TRCC cannot open the memory's bus on yet: every answer says so."""
+
+    def __init__(self, os_name: str) -> None:
+        log.debug("_NoRamAccess: %s", os_name)
+        self._status = RamAccessStatus(
+            RamAccessState.UNSUPPORTED,
+            f"RAM lighting is not available on {os_name} yet")
+
+    def status(self) -> RamAccessStatus:
+        log.debug("_NoRamAccess.status")
+        return self._status
+
+    def enable(self) -> RamAccessStatus:
+        log.info("_NoRamAccess.enable: %s", self._status.message)
+        return self._status
+
+    def disable(self) -> RamAccessStatus:
+        log.info("_NoRamAccess.disable: %s", self._status.message)
+        return self._status
+
+
+class RamLights(RgbMirror):
+    """RGB memory TRCC drives itself: it follows, and it keeps effects.
+
+    Concrete: ``CorsairDramMirror`` (``adapters/rgb/corsair_dram.py``).  The
+    follow half is ``RgbMirror``'s; this adds what only memory TRCC drives
+    directly can do.
+    """
+
+    @abstractmethod
+    def found(self) -> tuple[RgbMirrorDevice, ...] | None:
+        """The sticks of the last scan, None before any.  Never touches the
+        bus -- what a page shows without asking the hardware anything."""
+
+    @abstractmethod
+    def apply_effect(self, device: RgbMirrorDevice,
+                     settings: RamEffectSettings) -> None:
+        """Save *settings* on *device* as its own effect.
+
+        ``ValueError`` for settings the effect cannot take, before anything
+        is written; ``OSError`` when the stick does not take it.
+        """
 
 
 # =========================================================================
@@ -2038,9 +2381,10 @@ class CloudCatalog(ABC):
         ...
 
     @abstractmethod
-    def download_preview(self, theme_id: str, resolution: str | None = None) -> Path:
-        """Fetch ``<theme_id>.png`` (cached); return its local path."""
+    def downloaded(self, resolution: str) -> tuple[str, ...]:
+        """Ids of the videos already cached for *resolution* (``"WxH"``)."""
         ...
+
 
 
 # =========================================================================
@@ -2108,8 +2452,14 @@ class HttpFetcher(ABC):
     """
 
     @abstractmethod
-    def fetch(self, url: str, timeout_s: float = 30.0) -> bytes:
-        """Fetch a URL's body.  Raise on non-200 status or transport error."""
+    def fetch(
+        self, url: str, timeout_s: float = 30.0, max_bytes: int | None = None,
+    ) -> bytes:
+        """Fetch a URL's body.  Raise on non-200 status or transport error.
+
+        ``max_bytes`` refuses a body longer than that WITHOUT reading the rest
+        of it: a capped caller must never hold more than the cap in memory.
+        """
         ...
 
 
@@ -2285,8 +2635,25 @@ class Platform(ABC):
     # ── Transport factory — ONE method, wire-agnostic ─────────────────
     @abstractmethod
     def open_transport(self, wire: Wire, vid: int, pid: int,
-                       serial: str | None = None) -> Transport:
+                       serial: str | None = None,
+                       unit: str = "", *,
+                       hid_reports: bool = False,
+                       report_id: int = 0x00) -> Transport:
         """Return an unopened transport for *wire*.
+
+        *unit* names WHICH physical device to open when several of the same
+        model are plugged in — the USB port, as ``Platform.scan_devices``
+        resolved it (#287).  Empty means "the only one of this model", which
+        is what every caller meant before the keyword existed.
+
+        *hid_reports* asks for a firmware's override instead of the wire's
+        ordinary transport: HID output reports through hidapi (#228).  Which
+        firmware needs it is the App's quirk knowledge; opening it is still the
+        Platform's job, so a stand-in platform scripts this transport like
+        every other and a mock run can never reach a real device through it.
+        *report_id* is the HID report that transport writes: 0x00, the
+        default report, for the coolers; a lighting controller such as ASUS
+        Aura (0xEC) numbers its reports.
 
         **The port must not name a wire.**  It used to: separate
         ``open_bulk`` / ``open_scsi`` abstract methods meant every OS
@@ -2365,6 +2732,20 @@ class Platform(ABC):
         ``app.platform`` is what a Command has.
         """
 
+    # ── Network ───────────────────────────────────────────────────────
+    @abstractmethod
+    def http_fetcher(self) -> HttpFetcher:
+        """Where the App's downloads go: the cloud theme catalog, the update
+        check and the data archives.
+
+        On the platform rather than built inside ``App`` because a platform
+        is the one seam every harness owns: the App used to make its own
+        fetcher, so a mock platform could not stop a mock run from going
+        online -- an update check at startup and hourly, and every data
+        archive on each auto-connect.  ``BaseOS`` answers with the real one;
+        stand-ins answer offline.
+        """
+
     # ── Package manager (diagnostics; read-only) ──────────────────────
     @abstractmethod
     def packages(self) -> PackageManager:
@@ -2439,8 +2820,12 @@ class Platform(ABC):
     # macOS/BSD, so the interface is the entire substitute.
 
     @abstractmethod
-    def usb_power_state(self, vid: int, pid: int) -> UsbPowerState | None:
+    def usb_power_state(self, vid: int, pid: int,
+                        unit: str = "") -> UsbPowerState | None:
         """The device's USB runtime-power state, or ``None`` if unknowable.
+
+        ``unit`` names WHICH of two identical coolers (#287) — empty means the
+        only one of this model.  Unit-less, a twin read its sibling's state.
 
         Read-only.  TRCC never sets power policy — that is the udev rules'
         job (``adapters/system/_udev.py``); this only reports what the kernel
@@ -2462,8 +2847,12 @@ class Platform(ABC):
         """The system package manager, or "" when this OS has none of ours."""
 
     @abstractmethod
-    def upgrade_command(self) -> tuple[str, ...]:
-        """Argv that upgrades trcc on this OS, or empty when there is none."""
+    def upgrade_hint(self) -> str:
+        """The command that upgrades this install, for the user to run.
+
+        Never run by TRCC: no distro repo carries trcc-linux, so a package
+        manager "upgrade" upgraded everything else and reported success.
+        """
 
     @classmethod
     def resolve(cls) -> type[Platform]:
@@ -2508,13 +2897,6 @@ class Platform(ABC):
         """
 
     # ── GUI / hardware-probe convenience ──────────────────────────────
-
-    @abstractmethod
-    def minimize_on_close(self) -> bool:
-        """True if the GUI should minimize-to-tray on close instead of hiding.
-
-        Windows expects minimize; Linux/macOS/BSD hide-to-tray.
-        """
 
     @abstractmethod
     def configure_stdout(self) -> None:
@@ -2576,6 +2958,23 @@ class Platform(ABC):
         than importing a probe into ``core``.
         """
 
+    def smbuses(self) -> tuple[SmBus, ...]:
+        """The chipset SMBus controllers, opened -- where RGB memory sits.
+
+        Its own Platform method for the reason ``open_transport`` is: a
+        stand-in platform scripts the bus, so no test or mock run can ever
+        write to the memory of the machine it runs on.  An OS with no SMBus
+        access refuses here, in the base, with an ``OSError`` the RGB
+        follower already reports and retries.
+        """
+        log.info("smbuses: %s has no SMBus access", type(self).__name__)
+        raise OSError(f"no SMBus access on {type(self).__name__}")
+
+    def ram_access(self) -> RamAccess:
+        """The opt-in grant to reach RGB memory -- on an OS that has one."""
+        log.debug("ram_access: %s has none", type(self).__name__)
+        return _NoRamAccess(type(self).__name__)
+
 
 # =========================================================================
 # Callable type aliases (infrastructure DI)
@@ -2630,6 +3029,16 @@ class SendTask(ABC):
 
         Returns the maximum seconds to wait before the next ``run_once``.
         """
+
+    def runs_on_caller(self) -> None:
+        """No scheduler thread drives this task: a producer that WAITS for its
+        work must run it itself.  ``SyncSendScheduler`` says so on ``add``.
+
+        Default: nothing here waits, so nothing changes.  Without it a waiting
+        send under the synchronous test scheduler sat out its whole timeout --
+        5 s per connected device on every ``App.close`` in the suite.
+        """
+        log.debug("%s.runs_on_caller: nothing waits", type(self).__name__)
 
 
 class SendScheduler(ABC):
@@ -2731,3 +3140,42 @@ class VideoExportRunner(ABC):
     @abstractmethod
     def shutdown(self) -> None:
         """Stop the worker and drop anything still queued (app teardown)."""
+
+
+_R = TypeVar("_R", bound="Result")
+
+
+class CommandBus(ABC):
+    """What every UI talks to: send a Command, observe the bus.
+
+    ``App`` (in-process), ``AppProxy`` (a daemon's, over the socket) and every
+    ``UserInterface`` (which names itself on the way through, so the log says
+    which UI asked) are all one.  UI code holds a ``CommandBus``, never an
+    ``App``: dispatching and observing is all a UI may do, and the type checker
+    now says so instead of a convention.
+    """
+
+    @abstractmethod
+    def dispatch(self, cmd: Command[_R]) -> _R:
+        """Run *cmd* and return its typed Result."""
+
+    @property
+    @abstractmethod
+    def events(self) -> EventBus:
+        """The event bus to observe."""
+
+    @property
+    @abstractmethod
+    def remote(self) -> bool:
+        """True when a daemon runs the Commands, not this process."""
+
+    def on_app_gone(self, stopped: Callable[[], None],
+                    lost: Callable[[], None]) -> None:
+        """Call *stopped* if the App stops on purpose, *lost* if it dies.
+
+        At most one of them, once, on a background thread.  An App in this
+        process lives and dies with it, so by default there is nothing to
+        watch; ``AppProxy`` overrides this.
+        """
+        log.debug("on_app_gone: %s runs in this process — nothing to watch",
+                  type(self).__name__)

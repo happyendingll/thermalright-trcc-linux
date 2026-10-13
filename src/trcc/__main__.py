@@ -49,8 +49,11 @@ if sys.platform == 'win32':
             except (AttributeError, OSError, ValueError):
                 pass
 
+    # No log line in here, ever: this IS ``emit`` for every handler, the file
+    # handlers included.  One (e078aadd) re-entered the handler holding the
+    # msvcrt lock — ~9 s per record on Windows, v9.10.0 through v9.10.4.
+    # ``tests/test_logging_coverage.py::test_nothing_on_the_record_path_logs``.
     def _safe_stream_emit(self: logging.StreamHandler, record: logging.LogRecord) -> None:
-        log.debug("_safe_stream_emit: record=%s", record)
         try:
             msg = self.format(record)
             stream = self.stream
@@ -81,12 +84,17 @@ if sys.platform == 'win32':
         pass  # add_dll_directory requires Python 3.8+ and a valid dir
 
 try:
-    # Auto-launch GUI when invoked as trcc-gui.exe (windowed PyInstaller build)
-    if Path(sys.executable).name.lower().startswith('trcc-gui'):
-        from trcc.ui.cli.main import gui
-        sys.exit(gui() or 0)
-    # Everything else goes through the shared entry so python -m trcc and
-    # the `trcc` console script dispatch the same way.
+    # trcc-gui.exe is the WINDOWED twin of trcc.exe: same CLI, ``gui`` when no
+    # subcommand is given.  It used to call ``gui()`` directly, which dropped
+    # every argument — so the sign-in task's ``--resume`` could never reach it
+    # — and skipped the shared entry's bundled-tools PATH step.
+    if Path(sys.executable).name.lower().startswith('trcc-gui') and (
+            len(sys.argv) < 2 or sys.argv[1].startswith('-')):
+        sys.argv.insert(1, 'gui')
+        log.info("trcc-gui: no subcommand — defaulting to gui (argv=%s)",
+                 sys.argv[1:])
+    # Everything goes through the shared entry so python -m trcc, the `trcc`
+    # console script and both frozen exes dispatch the same way.
     from trcc._entry import main
     sys.exit(main() or 0)
 except Exception:

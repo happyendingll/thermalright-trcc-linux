@@ -13,23 +13,24 @@ Lifecycle::
     4. Install SIGTERM / SIGINT handlers that flip the server's stop flag.
     5. Block in ``serve_forever`` until the loop exits.
 
-Opt-in today (``TRCC_DAEMON=1``).  No Qt event loop — next/'s App
-is framework-blind, so the daemon is a plain Python process.
+The default: every UI finds this process or starts it (``TRCC_DAEMON=0``
+opts out).  No Qt event loop — the App is framework-blind, so the daemon is a
+plain Python process.
 """
 from __future__ import annotations
 
 import logging
 import os
-import signal
 import subprocess
 import sys
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from . import ipc
 
 if TYPE_CHECKING:
     from .core.ports import Platform, Renderer
+    from .core.results import DaemonResult, DeviceStateResult
 
 log = logging.getLogger(__name__)
 
@@ -60,7 +61,7 @@ def run_daemon(
     (``DaemonUI.preflight``, exit 1), building a LOCAL App with ``TRCC_DAEMON``
     stripped so the daemon can never proxy to itself (#162), the session
     bring-up, and the single ``App.close()``.  What stays daemon-specific is
-    ``DaemonUI.run`` -- the IPC server and its signal handlers.
+    ``DaemonUI.run`` and ``stop`` -- the IPC server, and ending it.
 
     ``App.close()`` used to be called here AND by the caller; the template now
     owns it exactly once, which is the double-teardown the GUI window had
@@ -119,26 +120,59 @@ def uptime_s() -> int:
     return seconds
 
 
-def ensure_daemon(*, timeout: float = 10.0) -> bool:
-    """Make sure a daemon is reachable, spawning one if not.
+#: How long an older App gets to shut down when it is replaced: its close
+#: blanks and releases every panel (~5 s for a 10-panel fleet, measured).
+_REPLACE_TIMEOUT_S = 15.0
 
-    Returns True when the socket becomes reachable, False if the spawn
-    didn't come up within *timeout* seconds.  Idempotent — if a daemon
-    is already up this is a fast no-op.
+
+def ensure_daemon(*, timeout: float = 10.0) -> bool:
+    """Make sure a current daemon is reachable, spawning one if not.
+
+    A running daemon OLDER than this install -- or too old to say -- is
+    replaced: stopped, and this install's started, whose session restores what
+    the panels showed.  A NEWER one is kept (never downgrade) and warned
+    about.  Returns True when a daemon is reachable, False if the spawn didn't
+    come up within *timeout* seconds.
     """
     if ipc.daemon_running():
-        return True
+        from .__version__ import __version__
+        if is_this_process_the_daemon():
+            # Reached from inside the daemon: asking our own socket would
+            # block on the request we are serving.
+            log.debug("ensure_daemon: this process is the daemon")
+            return True
+        theirs = _running_version()
+        if not _older(theirs, __version__):
+            if theirs != __version__:
+                log.warning("ensure_daemon: the running App is %s, newer than "
+                            "this %s — using it", theirs, __version__)
+            return True
+        log.info("ensure_daemon: the running App is %s, older than this %s — "
+                 "replacing it", theirs or "too old to say", __version__)
+        if not kill_daemon(timeout=_REPLACE_TIMEOUT_S):
+            log.warning("ensure_daemon: the old App did not stop within %.0fs "
+                        "— using it", _REPLACE_TIMEOUT_S)
+            return ipc.daemon_running()
 
+    if ipc.AppLock.held():
+        # An App is STARTING: it holds the lock and has not bound yet.  A
+        # second one beside it would own the same panels (#314).
+        log.info("ensure_daemon: an App is starting — waiting for it")
+        return ipc.wait_for_daemon(timeout=timeout)
     cmd = _daemon_spawn_cmd()
-    log.info("Spawning next/ daemon: %s", " ".join(cmd))
+    log.info("Spawning the shared App: %s", " ".join(cmd))
     # Strip the daemon-mode flag from the child's env so the spawned daemon
     # can't inherit it and try to proxy to itself — it builds the App
     # in-process via run_daemon → _build_local_app regardless (#162).
     from ._boot import _ENV_FLAG
     child_env = {k: v for k, v in os.environ.items() if k != _ENV_FLAG}
+    # cwd="/", as daemons do: otherwise the App inherits whatever directory the
+    # FIRST UI was started from — holding it open (an unmountable USB stick)
+    # and resolving anything relative against it for its whole life.
     subprocess.Popen(
         cmd,
         env=child_env,
+        cwd="/",
         start_new_session=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -177,26 +211,85 @@ def kill_daemon(*, timeout: float = 5.0) -> bool:
 # =========================================================================
 
 
-def _install_signal_handlers(server: ipc.IPCServer) -> None:
-    """SIGTERM / SIGINT flip the server's stop flag + wake the accept loop."""
-    log.debug("_install_signal_handlers: called")
-    def _shutdown(signo: int, _frame: Any) -> None:
-        name = signal.Signals(signo).name
-        log.info("trcc daemon: received %s — shutting down", name)
-        server.shutdown()
+def running_status() -> DaemonResult | None:
+    """The running App's OWN ``DaemonStatus`` -- executed there, over its socket.
 
-    signal.signal(signal.SIGTERM, _shutdown)
-    signal.signal(signal.SIGINT, _shutdown)
+    Its pid, uptime and version are facts only that process knows.  None when
+    it does not answer.  Straight through ``AppProxy``, never a UI's
+    ``dispatch``: ``DaemonStatus`` runs in the caller, and this is how the
+    caller gets the App's side.
+    """
+    from .core.commands import DaemonStatus
+    from .proxy import AppProxy
+    proxy = AppProxy(timeout=5.0)
+    try:
+        status = proxy.dispatch(DaemonStatus(here=True))
+    except Exception as e:
+        log.warning("running_status: the running App did not answer (%s: %s)",
+                    type(e).__name__, e)
+        status = None
+    finally:
+        proxy.close()
+    log.info("running_status: %s", status)
+    return status
+
+
+def held_devices() -> list[DeviceStateResult] | None:
+    """The devices the running App reports, each with its live state.
+
+    Over its socket, like :func:`running_status`: ``trcc report`` runs in the
+    caller, and a panel the App holds must be described by the App rather
+    than probed a second time.  None when the App does not answer.
+    """
+    from .core.commands import DeviceState, ListDevices
+    from .proxy import AppProxy
+    proxy = AppProxy(timeout=5.0)
+    try:
+        listing = proxy.dispatch(ListDevices())
+        states: list[DeviceStateResult] | None = [
+            proxy.dispatch(DeviceState(key=entry.key))
+            for entry in listing.devices]
+    except Exception as e:
+        log.warning("held_devices: the running App did not answer (%s: %s)",
+                    type(e).__name__, e)
+        states = None
+    finally:
+        proxy.close()
+    log.info("held_devices: %s",
+             None if states is None else [s.key for s in states])
+    return states
+
+
+def _running_version() -> str:
+    """The running daemon's version; ``""`` when it cannot say -- a daemon
+    older than ``DaemonResult.version`` sends no such field."""
+    status = running_status()
+    version = status.version if status is not None else ""
+    log.info("_running_version: %s", version or "unknown")
+    return version
+
+
+def _older(theirs: str, ours: str) -> bool:
+    """Whether version *theirs* is older than *ours* ("" is oldest)."""
+    import re
+    older = ([int(n) for n in re.findall(r"\d+", theirs)]
+             < [int(n) for n in re.findall(r"\d+", ours)])
+    log.debug("_older: %r < %r -> %s", theirs, ours, older)
+    return older
 
 
 def _daemon_spawn_cmd() -> list[str]:
-    """Argv that re-invokes this Python as the daemon entry point.
+    """Argv that starts a daemon running THIS install's code.
 
-    Prefer the installed ``trcc`` console script when on PATH so the
-    daemon picks up the user's installed entry point; otherwise fall back
-    to ``python -m trcc daemon``.
+    The running interpreter, not the first ``trcc`` on PATH: with two installs
+    (pipx + a distro package), a UI could start a daemon of the other one --
+    and with a version check, replace it forever.  A frozen build (Windows,
+    macOS) has no ``-m``; it keeps the console-script lookup until the daemon
+    is verified there.
     """
-    log.debug("_daemon_spawn_cmd: called")
+    log.debug("_daemon_spawn_cmd: frozen=%s", getattr(sys, "frozen", False))
+    if not getattr(sys, "frozen", False):
+        return [sys.executable, "-m", "trcc", "daemon"]
     from shutil import which
     if (trcc_bin := which("trcc")) is not None:
         return [trcc_bin, "daemon"]

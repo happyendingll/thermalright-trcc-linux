@@ -19,18 +19,19 @@ import dataclasses
 import logging
 import struct
 import time
+from pathlib import Path
 
 from ...core.errors import (
     HandshakeError,
     TransportError,
     UnsupportedOperationError,
 )
-from ...core.logs import per_frame
+from ...core.logs import Blob, per_frame
 from ...core.models import HandshakeResult, ProductInfo, Wire
 from ...core.ports import BulkTransport
 from ...core.protocol import DeviceProfile, get_profile, pm_to_fbl
 from . import _f5
-from ._base import HANDSHAKE_TIMEOUT_MS, BaseBulkDevice
+from ._base import HANDSHAKE_TIMEOUT_MS, BaseBulkDevice, read_state, write_state
 
 log = logging.getLogger(__name__)
 frame_log = per_frame(__name__)
@@ -58,19 +59,59 @@ _DELAY_FRAME_TYPE2_S = 0.001
 # A streaming firmware reboots on the init packet, so we skip it and let the
 # panel finish its own boot before the first frame (#228 Frozen Warframe SE).
 _QUIRK_BOOT_SETTLE_S = 3.0
+# Units whose streaming probe got silence and whose ordinary handshake then
+# answered: not the firmware the quirk describes.  Remembered so later connects
+# skip the 3 s settle + 5 s read that silence costs (#267).
+_STREAMING_PROBE_FILE = "hid_streaming_probe.json"
 
 _DEFAULT_FRAME_TIMEOUT_MS = 100
 
 
+class _ProbeMemory:
+    """Whether a unit's streaming probe got silence, remembered across launches.
+
+    Silence followed by an ordinary handshake means the firmware fingerprint
+    belongs to a panel the quirk does not describe (a Trofeo Vision, #267), so
+    later connects skip the probe.  A hint, never an authority: the caller
+    forgets it when the ordinary handshake fails.  Without a state dir (a
+    device built outside the composition root) nothing is remembered.
+    """
+
+    def __init__(self, state_dir: Path | None, key: str) -> None:
+        log.debug("_ProbeMemory: state_dir=%s key=%s", state_dir, key)
+        self._path = None if state_dir is None else state_dir / _STREAMING_PROBE_FILE
+        self._key = key
+
+    def silent(self) -> bool:
+        silent = self._path is not None and read_state(self._path).get(self._key) == "silent"
+        log.info("HidLcd %s: streaming probe %s", self._key,
+                 "skipped — this unit answered the ordinary handshake before"
+                 if silent else "will run")
+        return silent
+
+    def remember(self, *, silent: bool) -> None:
+        if self._path is None:
+            log.debug("HidLcd %s: no state dir — nothing remembered", self._key)
+            return
+        state = read_state(self._path)
+        if silent:
+            state[self._key] = "silent"
+        else:
+            state.pop(self._key, None)
+        write_state(self._path, state)
+        log.info("HidLcd %s: streaming probe %s", self._key,
+                 "remembered as silent" if silent else "forgotten — will probe again")
+
+
 def _ceil_to_align(n: int, align: int = _USB_BULK_ALIGNMENT) -> int:
     """Round *n* up to the next multiple of *align*."""
-    log.debug("_ceil_to_align: n=%s align=%s", n, align)
+    frame_log.debug("_ceil_to_align: n=%s align=%s", n, align)
     return (n + align - 1) // align * align
 
 
 def _frame_timeout_ms(packet_size: int) -> int:
     """Scale frame timeout with packet size (USB 2.0 ≈ 4 KB/ms + 100ms margin)."""
-    log.debug("_frame_timeout_ms: packet_size=%s", packet_size)
+    frame_log.debug("_frame_timeout_ms: packet_size=%s", packet_size)
     return max(_DEFAULT_FRAME_TIMEOUT_MS, packet_size // 4 + 100)
 
 
@@ -107,7 +148,8 @@ class HidLcd(BaseBulkDevice, wire=Wire.HID):
 
     def _handshake_detail(self, result: HandshakeResult) -> str:
         """Which firmware variant answered — the two speak different packets."""
-        log.debug("_handshake_detail: result=%s", result)
+        log.debug("_handshake_detail: result=%s raw=%s",
+                  result, Blob(result.raw_response))
         return f" (type {self.info.device_type})"
 
     def _require_connected(self) -> None:
@@ -144,16 +186,35 @@ class HidLcd(BaseBulkDevice, wire=Wire.HID):
         told us nothing, so we fall through to the ordinary handshake rather
         than guess — see :meth:`_connect_streaming_firmware`.
         """
-        if self._quirks.skip_init:
+        memory = _ProbeMemory(self._state_dir, self.key)
+        probed = self._quirks.skip_init and not memory.silent()
+        if probed:
             if (result := self._connect_streaming_firmware()) is not None:
                 return result
             log.info("HidLcd %s: streaming firmware volunteered nothing — "
                      "falling through to the standard handshake",
                      self.info.key)
-        return self._handshake_retry(
-            self._build_init_packet(), self._response_size(),
-            self._validate_and_parse,
-        )
+        try:
+            result = self._handshake_retry(
+                self._build_init_packet(), self._response_size(),
+                self._validate_and_parse,
+            )
+        except HandshakeError:
+            if self._quirks.skip_init and not probed:
+                memory.remember(silent=False)   # probe again next time
+            raise
+        if probed:
+            memory.remember(silent=True)
+        if self._quirks.single_session:
+            # It took the init packet and answered, so it is not the firmware
+            # a reopen wedges (#228), whatever its fingerprint says.  Keeping
+            # the guess left a 4.07 PM 52 panel unable to reconnect after a
+            # stale handle -- 0 frames, forever (#283).
+            log.info("HidLcd %s: answered the ordinary handshake -- it may "
+                     "reconnect", self.info.key)
+            self.set_quirks(dataclasses.replace(self._quirks,
+                                                single_session=False))
+        return result
 
     def _validate_and_parse(self, resp: bytes) -> HandshakeResult:
         """Accept the reply or reject it as a retryable attempt."""
@@ -214,7 +275,7 @@ class HidLcd(BaseBulkDevice, wire=Wire.HID):
                  self.info.key, pm, sub)
 
         fbl = pm_to_fbl(pm, sub)
-        profile = self._portrait_native(self._base_profile(fbl, pm))
+        profile = self._portrait_native(self._base_profile(fbl, pm, sub))
         self._profile = profile
         log.info("HidLcd %s: streaming connect OK, portrait-native %s",
                  self.info.key, profile.resolution)
@@ -223,13 +284,15 @@ class HidLcd(BaseBulkDevice, wire=Wire.HID):
             pm_byte=pm, sub_byte=sub, fbl=fbl, raw_response=bytes(resp),
         )
 
-    def _base_profile(self, fbl: int | None, pm: int) -> DeviceProfile:
+    def _base_profile(self, fbl: int | None, pm: int, sub: int) -> DeviceProfile:
         """Resolve the pre-quirk geometry profile: from the FBL when known,
         else from the registry ``native_resolution`` (a streaming firmware that
         volunteered no handshake is still identified by its registry row)."""
-        log.debug("_base_profile: fbl=%s pm=%s", fbl, pm)
+        log.debug("_base_profile: fbl=%s pm=%s sub=%s", fbl, pm, sub)
         if fbl is not None:
-            return get_profile(fbl, pm)
+            # SUB too: a profile resolved without it takes the wrong encode
+            # angle on the panels whose angle depends on it (#290).
+            return get_profile(fbl, pm, sub)
         return DeviceProfile(*self.info.native_resolution)
 
     def _portrait_native(self, base: DeviceProfile) -> DeviceProfile:
@@ -316,7 +379,7 @@ class HidLcd(BaseBulkDevice, wire=Wire.HID):
         #228) — the magic alone is enough to accept it; PM/SUB still parse from
         [5]/[4].
         """
-        log.debug("_validate_response_type2: resp=%s", resp)
+        log.debug("_validate_response_type2: resp=%s", Blob(resp))
         if not (len(resp) >= 6 and resp[0:4] == _TYPE2_MAGIC):
             return False
         if self._quirks.short_handshake:
@@ -338,10 +401,10 @@ class HidLcd(BaseBulkDevice, wire=Wire.HID):
         panels share: a 1280×480 Trofeo Vision answering PM=128 was transposed
         to 480×1280 and never displayed (#244/#268).
         """
-        log.debug("_parse_response_type2: resp=%s", resp)
+        log.debug("_parse_response_type2: resp=%s", Blob(resp))
         pm = resp[5]
         sub = resp[4]
-        has_serial = len(resp) > 36 and resp[16] == 0x10
+        has_serial = len(resp) >= 36 and resp[16] == 0x10
         serial = resp[20:36].hex().upper() if has_serial else ""
         fbl = pm_to_fbl(pm, sub)
         # SUB reaches the profile, not just the FBL.  It selects the encode
@@ -370,7 +433,7 @@ class HidLcd(BaseBulkDevice, wire=Wire.HID):
         fall back to ``info.native_resolution`` so smoke tests that build
         frames before connect() still produce a valid header.
         """
-        log.debug("_build_frame_type2: image_data=%s", image_data)
+        frame_log.debug("_build_frame_type2: image_data=%s", Blob(image_data))
         is_jpeg = len(image_data) >= 2 and image_data[:2] == b'\xff\xd8'
         w, h = (self._profile.resolution if self._profile is not None
                 else self.info.native_resolution)
@@ -406,7 +469,7 @@ class HidLcd(BaseBulkDevice, wire=Wire.HID):
         duplication ``_f5`` exists to prevent — so widening the set there did not
         widen it here.
         """
-        log.debug("_validate_response_type3: resp=%s", resp)
+        log.debug("_validate_response_type3: resp=%s", Blob(resp))
         return len(resp) >= 14 and resp[0] in _f5.VALID_IDENTITY
 
     def _parse_response_type3(self, resp: bytes) -> HandshakeResult:
@@ -414,7 +477,7 @@ class HidLcd(BaseBulkDevice, wire=Wire.HID):
 
         Geometry comes from the FBL via ``get_profile`` (PM=FBL for Type 3).
         """
-        log.debug("_parse_response_type3: resp=%s", resp)
+        log.debug("_parse_response_type3: resp=%s", Blob(resp))
         serial = resp[10:14].hex().upper()
         fbl = resp[0] - 1
         # Sized from the identity at handshake, as the vendor does — a panel
@@ -433,7 +496,7 @@ class HidLcd(BaseBulkDevice, wire=Wire.HID):
 
     def _build_frame_type3(self, image_data: bytes) -> bytes:
         """Type 3 frame: 16-byte prefix + exactly this panel's payload size."""
-        log.debug("_build_frame_type3: image_data=%s", image_data)
+        frame_log.debug("_build_frame_type3: image_data=%s", Blob(image_data))
         size = getattr(self, "_f5_payload", _f5.DATA_SIZE)
         prefix = _f5.frame_header(size)
         if len(image_data) < size:
@@ -457,13 +520,13 @@ class HidLcd(BaseBulkDevice, wire=Wire.HID):
                 else _f5.RESPONSE_SIZE)
 
     def _validate_response(self, resp: bytes) -> bool:
-        log.debug("_validate_response: resp=%s", resp)
+        log.debug("_validate_response: resp=%s", Blob(resp))
         return (self._validate_response_type2(resp)
                 if self.info.device_type == 2
                 else self._validate_response_type3(resp))
 
     def _parse_response(self, resp: bytes) -> HandshakeResult:
-        log.debug("_parse_response: resp=%s", resp)
+        log.debug("_parse_response: resp=%s", Blob(resp))
         return (self._parse_response_type2(resp)
                 if self.info.device_type == 2
                 else self._parse_response_type3(resp))

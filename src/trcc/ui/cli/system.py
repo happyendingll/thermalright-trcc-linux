@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
 
@@ -28,17 +30,39 @@ from ...core.commands import (
     ListMemorySlots,
     ListSensors,
     MarkFirstRunDone,
+    RamLighting,
     ReadSensors,
     RefreshAutostart,
+    RgbFollow,
+    RgbLights,
     RunDoctor,
     RunHealthCheck,
     RunSetup,
     RunUpgrade,
+    ScanRgbLights,
     SetHddEnabled,
+    SetRamEffect,
+    SetRamLighting,
+    SetRgbFollow,
     SetSensorDashboard,
 )
-from ...core.models import AUTOSTART_TARGETS
+from ...core.models import (
+    AUTOSTART_TARGETS,
+    EffectDirection,
+    EffectSpeed,
+    FollowColors,
+    FollowMapping,
+    PanelConfig,
+    RamAccessState,
+    RamEffect,
+    RgbFollowMode,
+    SensorBinding,
+)
+from ...core.results import RgbLightsResult
 from ._ctx import emit_json, get_app
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 log = logging.getLogger(__name__)
 
@@ -218,8 +242,11 @@ def dashboard(
     log.info("cli system dashboard: save_auto_map=%s", auto_map)
     result = get_app().dispatch(GetSensorDashboard())
     typer.echo(result.message)
-    for panel in result.panels:
-        typer.echo(f"  [{panel.category_id}] {panel.name}")
+    for index, panel in enumerate(result.panels):
+        # The index is what ``dashboard-delete`` / ``-rename`` / ``-bind``
+        # take.  Names are NOT unique -- every added panel is called "Custom"
+        # until renamed -- so position is the only unambiguous handle.
+        typer.echo(f"  {index}  [{panel.category_id}] {panel.name}")
         for binding in panel.sensors:
             target = binding.sensor_id or "<unbound>"
             unit = f" [{binding.unit}]" if binding.unit else ""
@@ -229,6 +256,122 @@ def dashboard(
             SetSensorDashboard(panels=tuple(result.panels)),
         )
         typer.echo(written.message)
+
+
+@contextmanager
+def _dashboard_edit() -> Iterator[list[PanelConfig]]:
+    """Read the layout, let the caller edit it, write the WHOLE thing back.
+
+    ``SetSensorDashboard`` is a bulk verb, so every edit is the same three
+    steps and only the middle one differs.  A context manager rather than
+    four copies -- and the write is AFTER the ``yield``, so a
+    ``BadParameter`` raised while editing propagates and nothing is
+    persisted.
+
+    No empty-layout guard here on purpose: the Command itself refuses one,
+    and its refusal arrives as ``result.message`` plus a non-zero exit.
+    """
+    log.info("_dashboard_edit: reading layout")
+    trcc = get_app()
+    panels = list(trcc.dispatch(GetSensorDashboard()).panels)
+    yield panels
+    log.info("_dashboard_edit: writing %d panel(s)", len(panels))
+    result = trcc.dispatch(SetSensorDashboard(panels=tuple(panels)))
+    typer.echo(result.message)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+def _panel_at(panels: list[PanelConfig], index: int) -> PanelConfig:
+    """The panel at *index*, or a usable error naming the valid range."""
+    log.debug("_panel_at: index=%d of %d", index, len(panels))
+    if not 0 <= index < len(panels):
+        raise typer.BadParameter(
+            f"no panel {index} — the layout has {len(panels)} "
+            f"(0..{len(panels) - 1}).  Run `trcc system dashboard` to list.",
+        )
+    return panels[index]
+
+
+@app.command("dashboard-add")
+def dashboard_add(
+    name: str = typer.Option("Custom", "--name", help="Panel name."),
+) -> None:
+    """Add an empty custom panel to the sensor dashboard.
+
+    Four unbound rows, ready for ``dashboard-bind``.  What a new panel IS
+    lives on the model, so this, the GUI and qtgui all add the same thing.
+    """
+    log.info("cli system dashboard-add: name=%r", name)
+    with _dashboard_edit() as panels:
+        panels.append(PanelConfig.custom(name))
+
+
+@app.command("dashboard-delete")
+def dashboard_delete(
+    index: int = typer.Argument(..., help="Panel index from `dashboard`."),
+) -> None:
+    """Delete a panel from the sensor dashboard.
+
+    Deleting the only panel is refused — an empty layout would make the next
+    read fall back to defaults, a wipe dressed up as a write.
+    """
+    log.info("cli system dashboard-delete: index=%d", index)
+    with _dashboard_edit() as panels:
+        removed = _panel_at(panels, index)
+        panels.remove(removed)
+        typer.echo(f"Removed [{removed.category_id}] {removed.name}")
+
+
+@app.command("dashboard-rename")
+def dashboard_rename(
+    index: int = typer.Argument(..., help="Panel index from `dashboard`."),
+    name: str = typer.Argument(..., help="The new panel name."),
+) -> None:
+    """Rename a sensor-dashboard panel."""
+    log.info("cli system dashboard-rename: index=%d name=%r", index, name)
+    if not (name := name.strip()):
+        raise typer.BadParameter("name must not be blank")
+    with _dashboard_edit() as panels:
+        panel = _panel_at(panels, index)
+        typer.echo(f"Renamed {panel.name!r} -> {name!r}")
+        panel.name = name
+
+
+@app.command("dashboard-bind")
+def dashboard_bind(
+    index: int = typer.Argument(..., help="Panel index from `dashboard`."),
+    row: int = typer.Argument(..., help="Row within the panel (0-based)."),
+    sensor_id: str = typer.Argument(..., help="Sensor id from `list-sensors`."),
+) -> None:
+    """Bind one dashboard row to a sensor.
+
+    The sensor must exist on this machine — the GUIs bind by picking from a
+    list and cannot name one that does not, so neither can this.  The unit
+    comes from the sensor rather than the caller, for the same reason.
+    """
+    log.info("cli system dashboard-bind: index=%d row=%d sensor=%s",
+             index, row, sensor_id)
+    known = {s.sensor_id: s for s in get_app().dispatch(ListSensors()).sensors}
+    if (sensor := known.get(sensor_id)) is None:
+        raise typer.BadParameter(
+            f"no sensor {sensor_id!r} on this machine — "
+            f"run `trcc system list-sensors` for the {len(known)} available",
+        )
+    with _dashboard_edit() as panels:
+        panel = _panel_at(panels, index)
+        if not 0 <= row < len(panel.sensors):
+            raise typer.BadParameter(
+                f"no row {row} in {panel.name!r} — it has "
+                f"{len(panel.sensors)} (0..{len(panel.sensors) - 1})",
+            )
+        binding = panel.sensors[row]
+        panel.sensors[row] = SensorBinding(
+            label=binding.label or sensor.label or sensor_id,
+            sensor_id=sensor_id,
+            unit=sensor.unit,
+        )
+        typer.echo(f"Bound {panel.name!r} row {row} -> {sensor_id}")
 
 
 @app.command("list-languages")
@@ -315,27 +458,19 @@ def check_update() -> None:
 def upgrade(
     yes: bool = typer.Option(
         False, "--yes", "-y",
-        help="Skip confirmation and run the upgrade subprocess.",
+        help="Accepted for older scripts; nothing is run.",
     ),
     dry_run: bool = typer.Option(
         False, "--dry-run",
-        help="Print the command that would run, don't execute it.",
+        help="Accepted for older scripts; nothing is run.",
     ),
 ) -> None:
-    """Upgrade trcc-linux via the detected package manager."""
+    """Print the command that upgrades this TRCC install."""
     log.info("cli system upgrade: yes=%s dry_run=%s", yes, dry_run)
-    if not yes and not dry_run:
-        typer.echo("Refusing to run upgrade without --yes (sudo subprocess).")
-        typer.echo("Re-run with --dry-run to see the command, or --yes to confirm.")
-        raise typer.Exit(code=2)
-    r = get_app().dispatch(RunUpgrade(dry_run=dry_run))
+    r = get_app().dispatch(RunUpgrade())
     typer.echo(r.message)
-    if r.stdout:
-        typer.echo(r.stdout)
-    if r.stderr:
-        typer.echo(r.stderr, err=True)
     if not r.ok:
-        raise typer.Exit(code=r.exit_code or 1)
+        raise typer.Exit(code=1)
 
 
 @app.command("first-run-status")
@@ -377,6 +512,185 @@ def hdd_enabled(
         SetHddEnabled(enabled=state.lower() == "on"),
     )
     typer.echo(result.message)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("follow")
+def follow(
+    mode: str = typer.Argument(
+        "status", help="'off', 'openrgb', 'ram' or 'status'"),
+    host: str = typer.Option(
+        "", "--host", help="OpenRGB's SDK server (default: the saved one, "
+                           "127.0.0.1 at first)."),
+    port: int = typer.Option(
+        0, "--port", help="Its port (default: the saved one, 6742 at first)."),
+    source: str | None = typer.Option(
+        None, "--source", help="The device that leads: an LCD's key "
+        "(e.g. 0402:3922) to follow its picture, or '' for the first LED "
+        "cooler.  Default: the saved one."),
+    mapping: FollowMapping | None = typer.Option(
+        None, "--mapping", help="An LCD's picture on the followers: 'halves' "
+        "(left to the first, right to the second) or 'single' (one colour "
+        "each).  Default: the saved one."),
+    colors: FollowColors | None = typer.Option(
+        None, "--colors", help="How a region of an LCD's picture becomes a "
+        "light's colour: 'vivid' (its brightest pixels -- small bright "
+        "details show) or 'smooth' (its average -- steadier).  Default: the "
+        "saved one, vivid at first."),
+    target: list[str] | None = typer.Option(
+        None, "--target", help="A light that follows (a stick's "
+        "'i2c-3/0x19', an OpenRGB device's name); repeat for more.  "
+        "'--target all' for every one.  Default: the saved ones."),
+) -> None:
+    """Make other RGB follow the LED cooler's colours -- or an LCD's picture (#160).
+
+    'openrgb': TRCC connects to OpenRGB's SDK server -- start it in OpenRGB's
+    SDK Server tab -- and sends the cooler's colours to every OpenRGB device,
+    in OpenRGB's direct mode.  'ram': TRCC sends them to Corsair RGB memory
+    itself, with no OpenRGB -- close OpenRGB first, so the two never drive the
+    same sticks.  'off' stops.
+    """
+    log.info("cli system follow: mode=%s host=%r port=%s source=%r "
+             "mapping=%s colors=%s target=%s", mode, host, port, source,
+             mapping, colors, target)
+    choice = mode.lower()
+    modes = [m.value for m in RgbFollowMode]
+    if choice != "status" and choice not in modes:
+        raise typer.BadParameter(
+            f"mode must be one of {', '.join(modes)} or 'status', "
+            f"got {mode!r}")
+    result = get_app().dispatch(
+        RgbFollow() if choice == "status" else
+        SetRgbFollow(mode=RgbFollowMode(choice), host=host, port=port,
+                     source=source, mapping=mapping, colors=colors,
+                     targets=(None if target is None else
+                              () if target == ["all"] else tuple(target))))
+    typer.echo(result.message)
+    if not result.ok:
+        raise typer.Exit(code=1)
+    typer.echo(f"  following: {result.mode.value} "
+               f"(OpenRGB at {result.host}:{result.port})")
+    typer.echo(f"  source   : {result.source or 'the first LED cooler'}"
+               + (f" ({result.mapping.value}, {result.colors.value})"
+                  if result.source else ""))
+    typer.echo(f"  lights   : {', '.join(result.targets) or 'all'}")
+    if result.lead:
+        typer.echo(f"  cooler   : {result.lead}")
+    if result.devices:
+        typer.echo(f"  devices  : {', '.join(result.devices)}")
+    if result.error:
+        typer.echo(f"  problem  : {result.error}")
+
+
+@app.command("ram-lighting")
+def ram_lighting(
+    action: str = typer.Argument(
+        "status", help="'enable', 'disable' or 'status'"),
+) -> None:
+    """Let TRCC reach RGB memory's lighting -- opt-in, asks for a password.
+
+    RGB memory's lighting chips sit on the motherboard's SMBus, beside the
+    chips that hold the memory's own settings.  Linux can only open the whole
+    bus, so enabling lets programs you run reach all of it, not just TRCC.
+    Only the person logged in at this computer gets access, and only that
+    bus.  'disable' removes it completely.  It lasts across reboots.  Your
+    desktop asks for the password; the answer comes when you type it or close
+    the prompt.
+    """
+    log.info("cli system ram-lighting: %s", action)
+    choice = action.lower()
+    if choice not in ("enable", "disable", "status"):
+        raise typer.BadParameter(
+            f"action must be 'enable', 'disable' or 'status', got {action!r}")
+    result = get_app().dispatch(
+        RamLighting() if choice == "status" else
+        SetRamLighting(enabled=choice == "enable"))
+    typer.echo(result.message)
+    typer.echo(f"  state: {result.state.value}")
+    if result.command and result.state not in (RamAccessState.ON,
+                                               RamAccessState.ELSEWHERE):
+        typer.echo(f"  to enable: {result.command}")
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+def _echo_lights(result: RgbLightsResult) -> None:
+    """The lights, one per line, with what TRCC last saved on each stick."""
+    log.debug("_echo_lights: %d", len(result.lights))
+    if result.message:
+        typer.echo(result.message)
+    if not result.scanned:
+        typer.echo("  (not searched yet -- `trcc system rgb --scan`)")
+    for light in result.lights:
+        effect = (f"  effect: {light.effect.effect.value} (last set by TRCC)"
+                  if light.effect else "")
+        typer.echo(f"  {light.kind.value:<7} {light.ref:<24} {light.name} "
+                   f"({light.led_count} LEDs){effect}")
+    if result.openrgb_error:
+        typer.echo(f"  OpenRGB: {result.openrgb_error}")
+    typer.echo(f"  RAM access: {result.ram_access.value}")
+
+
+@app.command("rgb")
+def rgb(
+    scan: bool = typer.Option(
+        False, "--scan", help="Look for the lights first: RGB memory on the "
+        "SMBus, and OpenRGB's devices."),
+    host: str = typer.Option(
+        "", "--host", help="With --scan: look for OpenRGB here, and save it "
+                           "(default: the saved one, 127.0.0.1 at first)."),
+    port: int = typer.Option(
+        0, "--port", help="With --scan: OpenRGB's port (default: the saved "
+                          "one, 6742 at first)."),
+) -> None:
+    """The RGB lights TRCC can drive or hand colours to."""
+    log.info("cli system rgb: scan=%s host=%r port=%s", scan, host, port)
+    if (host or port) and not scan:
+        raise typer.BadParameter("--host and --port go with --scan")
+    result = get_app().dispatch(ScanRgbLights(host=host, port=port) if scan
+                                else RgbLights())
+    _echo_lights(result)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+def _parse_rgb(text: str) -> tuple[int, int, int]:
+    """``255,0,0`` -> (255, 0, 0)."""
+    log.debug("_parse_rgb: %r", text)
+    parts = text.split(",")
+    if len(parts) != 3 or not all(p.strip().isdigit() for p in parts):
+        raise typer.BadParameter(f"a colour is R,G,B -- got {text!r}")
+    r, g, b = (int(p) for p in parts)
+    return r, g, b
+
+
+@app.command("ram-effect")
+def ram_effect(
+    effect: RamEffect = typer.Argument(..., help="The effect to save on the RAM."),
+    stick: list[str] | None = typer.Option(
+        None, "--stick", help="A stick by ref (see `trcc system rgb`); "
+        "repeat for more.  Default: every stick."),
+    speed: EffectSpeed = typer.Option(EffectSpeed.MEDIUM, "--speed"),
+    direction: EffectDirection | None = typer.Option(None, "--direction"),
+    color: list[str] | None = typer.Option(
+        None, "--color", help="R,G,B; repeat for a second colour."),
+    random_colors: bool = typer.Option(
+        False, "--random", help="Let the stick pick the colours."),
+    brightness: int = typer.Option(255, "--brightness", min=0, max=255),
+) -> None:
+    """Save one of the memory's own effects on the sticks.
+
+    The stick keeps it after TRCC closes and through a reboot.  If the RAM
+    was following a device, following turns off first.
+    """
+    log.info("cli system ram-effect: %s sticks=%s", effect.value, stick)
+    result = get_app().dispatch(SetRamEffect(
+        effect=effect, refs=tuple(stick or ()), speed=speed,
+        direction=direction,
+        colors=tuple(_parse_rgb(c) for c in color or ()),
+        random_colors=random_colors, brightness=brightness))
+    _echo_lights(result)
     if not result.ok:
         raise typer.Exit(code=1)
 
@@ -591,14 +905,15 @@ def list_endpoints() -> None:
     """Enumerate every HTTP route the REST API exposes.
 
     Builds the FastAPI app (no uvicorn) and walks its router so the
-    output reflects what ``trcc api`` / ``trcc serve`` would serve.
+    output reflects what ``trcc api`` / ``trcc serve`` would serve.  Routes
+    only, no App: ``build_app()`` bare found or STARTED the shared App -- USB
+    and all -- to print a list.
     """
     log.info("cli system list-endpoints")
-    from ...ui.api.main import build_app
+    from ...ui.api.main import api_routes, build_app
 
-    api_app = build_app()
     rows: list[tuple[str, str]] = []
-    for route in api_app.routes:
+    for route in api_routes(build_app(serve=False)):
         path = getattr(route, "path", "")
         methods = getattr(route, "methods", None) or set()
         for method in sorted(m for m in methods if m != "HEAD"):

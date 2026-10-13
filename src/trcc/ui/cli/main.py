@@ -8,17 +8,23 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
 
-from ...core.commands import DaemonStatus, EnsureDaemon, StopDaemon
+from ...core.commands import DaemonStatus, StopDaemon
 from . import config, device, display, led, system, theme
-from ._ctx import dumps_json, get_app
+from ._ctx import dumps_json, get_app, warn_blanking_panels
+
+if TYPE_CHECKING:
+    from ...core.results import ApiTlsResult
+
+from ..presentation.display_source import describe_game_mode, describe_source
 
 log = logging.getLogger(__name__)
 
 app = typer.Typer(
-    help="TRCC — Thermalright LCD/LED cooler control (clean-slate build).",
+    help="TRCC — Thermalright LCD/LED cooler control.",
     no_args_is_help=True,
     add_completion=False,
 )
@@ -140,10 +146,9 @@ def qtgui(
         ),
     ),
 ) -> None:
-    """Launch the Qt-native GUI (clean-slate, layout-driven).
+    """Launch the Qt-native GUI (layout-driven).
 
-    This is the rebuild's GUI — built up over G1–G5 and used during
-    development.  See ``gui`` for the legacy Windows-style port.
+    See ``gui`` for the Windows-style one.
 
     ``--resume`` starts hidden in the tray, the same as ``gui``.  Without it
     qtgui could not be autostarted sanely: it would pop a window on every
@@ -185,12 +190,7 @@ def gui(
         ),
     ),
 ) -> None:
-    """Launch the legacy Windows-style GUI (port in progress).
-
-    Today's shell hosts the device sidebar + a diagnostic content
-    area — enough to prove the legacy-on-next/-bus pattern end to
-    end on real hardware.  Real feature panels (LCD handler, theme
-    settings, mask, video, LED) land in subsequent passes.
+    """Launch the Windows-style GUI.
 
     ``--resume`` starts hidden in the tray (XDG autostart-on-login);
     bare ``trcc gui`` shows the window.
@@ -216,8 +216,8 @@ def gui(
     log.info("cli gui: start_hidden=%s decorated=%s", start_hidden, want_frame)
     from ..gui import launch
     # SystemExit (not typer.Exit) — see qtgui above: this is a direct entry
-    # point too (the Windows trcc-gui.exe calls gui() outside typer), so
-    # typer.Exit would escape unhandled and crash the frozen build (#187).
+    # point too (the trcc-gui / trcc-lcd console scripts call gui() outside
+    # typer), so typer.Exit would escape unhandled (#187).
     raise SystemExit(launch(start_hidden=start_hidden, decorated=want_frame))
 
 
@@ -243,6 +243,18 @@ def api(
             "token.  Requires --token."
         ),
     ),
+    tls: bool = typer.Option(
+        False, "--tls",
+        help=(
+            "Serve HTTPS with a self-signed certificate, made once and kept "
+            "in the config directory.  Its SHA-256 fingerprint is printed so "
+            "a client can pin it."
+        ),
+    ),
+    tls_cert: Path | None = typer.Option(
+        None, "--tls-cert", help="Your own certificate (PEM).  Needs --tls-key; implies --tls."),
+    tls_key: Path | None = typer.Option(
+        None, "--tls-key", help="Your own private key (PEM).  Needs --tls-cert; implies --tls."),
 ) -> None:
     """Launch the REST API (FastAPI + uvicorn).
 
@@ -301,12 +313,36 @@ def api(
         typer.echo(f"Pairing code: {code}  (POST /pair?code={code})")
         typer.echo("")
 
+    tls_files = _api_tls(host, tls, tls_cert, tls_key)
+    scheme = "https" if tls_files else "http"
     if host in ("0.0.0.0", "::"):
         from ...adapters.infra.network import get_lan_ip
         lan_ip = get_lan_ip()
-        typer.echo(f"API reachable at: http://{lan_ip}:{port}")
-    serve(host=host, port=port)
+        typer.echo(f"API reachable at: {scheme}://{lan_ip}:{port}")
+    if tls_files:
+        typer.echo(f"TLS certificate SHA-256: {tls_files.fingerprint}")
+    # uvicorn's own "running on" line now goes to the log like every other
+    # record, which the terminal shows only at -v — so say it here.
+    typer.echo(f"Serving on {scheme}://{host}:{port} (Ctrl-C to stop)")
+    serve(host=host, port=port, tls=tls_files)
 
+
+def _api_tls(host: str, tls: bool, cert: Path | None,
+             key: Path | None) -> ApiTlsResult | None:
+    """The TLS files ``trcc api`` serves: the user's, a self-signed pair, or none.
+
+    ``--tls-cert`` and ``--tls-key`` come together or not at all; either one
+    means TLS.  The files come from ``ProvideApiTls`` — this UI never touches
+    the certificate or the network itself.
+    """
+    log.info("_api_tls: host=%s tls=%s cert=%s key=%s", host, tls, cert, key)
+    if (cert is None) != (key is None):
+        typer.echo("ERROR: --tls-cert and --tls-key go together.", err=True)
+        raise typer.Exit(code=2)
+    if not (tls or cert):
+        return None
+    from ...core.commands import ProvideApiTls
+    return get_app().dispatch(ProvideApiTls(bind_host=host, cert=cert, key=key))
 
 @app.command("serve")
 def serve(
@@ -320,6 +356,18 @@ def serve(
         False, "--pair",
         help="Same semantics as `trcc api --pair` — see `trcc api --help`.",
     ),
+    tls: bool = typer.Option(
+        False, "--tls",
+        help=(
+            "Serve HTTPS with a self-signed certificate, made once and kept "
+            "in the config directory.  Its SHA-256 fingerprint is printed so "
+            "a client can pin it."
+        ),
+    ),
+    tls_cert: Path | None = typer.Option(
+        None, "--tls-cert", help="Your own certificate (PEM).  Needs --tls-key; implies --tls."),
+    tls_key: Path | None = typer.Option(
+        None, "--tls-key", help="Your own private key (PEM).  Needs --tls-cert; implies --tls."),
 ) -> None:
     """Alias for ``trcc api`` — launches the REST API + uvicorn.
 
@@ -330,7 +378,8 @@ def serve(
         "cli serve: host=%s port=%s token_set=%s pair=%s",
         host, port, token is not None, pair,
     )
-    api(host=host, port=port, token=token, pair=pair)
+    api(host=host, port=port, token=token, pair=pair, tls=tls,
+        tls_cert=tls_cert, tls_key=tls_key)
 
 
 @app.command("daemon")
@@ -338,35 +387,15 @@ def daemon() -> None:
     """Run the background daemon that owns USB + serves CLI/API clients.
 
     One process per user.  Binds a Unix socket at
-    ``$XDG_RUNTIME_DIR/trcc.sock`` and serves Commands until
-    SIGTERM / SIGINT or a remote ``trcc kill``.  Sets
-    ``TRCC_DAEMON=1`` to route clients through this daemon.
+    ``$XDG_RUNTIME_DIR/trcc.sock`` (``~/.cache/trcc.sock`` where that is
+    unset, e.g. macOS) and serves Commands until
+    SIGTERM / SIGINT or a remote ``trcc kill``.  This is the shared App:
+    every other trcc command and window finds it and uses it, and the first
+    one to need it starts it when none is running.
     """
     log.info("cli daemon")
     from ...daemon import run_daemon
     raise typer.Exit(code=run_daemon())
-
-
-@app.command("ensure-daemon")
-def ensure_daemon_cmd(
-    timeout: float = typer.Option(
-        10.0, "--timeout", help="Seconds to wait for a spawned daemon."),
-) -> None:
-    """Start the background daemon if it is not already running.
-
-    *Is the daemon up?  No — create it.  Yes — nothing to do.*  Idempotent, so
-    a script can run it unconditionally before dispatching rather than probing
-    first and racing between the probe and the spawn.
-
-    Worth doing before a batch of commands: the daemon owns USB, the sensor
-    poll and the render loop, so every client that talks to it does that work
-    zero times instead of once each.
-    """
-    log.info("cli ensure-daemon: timeout=%s", timeout)
-    result = get_app().dispatch(EnsureDaemon(timeout=timeout))
-    typer.echo(result.message)
-    if not result.ok:
-        raise typer.Exit(code=1)
 
 
 @app.command("kill")
@@ -400,21 +429,37 @@ def status(
         DiscoverDevices,
         LcdSnapshot,
         LedSnapshot,
+        ListDevices,
     )
     from ...core.models import Kind
+    from ._ctx import daemon_owns_the_panels
 
     app_obj = get_app()
     app_snap = app_obj.dispatch(ControlCenterSnapshot())
-    discovery = app_obj.dispatch(DiscoverDevices())
+    if daemon_owns_the_panels(app_obj):
+        # The shared App has attached everything already.  Discovering here
+        # scanned USB -- a control transfer to every panel it was streaming
+        # to -- and announced each device to every open window.
+        attached = app_obj.dispatch(ListDevices()).devices
+        units = [(e.key, e.kind == Kind.LED.value, e.product) for e in attached]
+    else:
+        # In-process, nothing is attached until a scan, and no other process
+        # is driving the panels.  No handshake either, so the name is the
+        # catalog's guess for the USB id -- and says so (#176).
+        units = [(k, p.kind == Kind.LED, f"{p.product} (catalog)")
+                 for k, p in app_obj.dispatch(DiscoverDevices()).units()]
+    log.info("cli status: %d device(s)", len(units))
 
-    lcd_keys = [p.key for p in discovery.products if p.kind != Kind.LED]
-    led_keys = [p.key for p in discovery.products if p.kind == Kind.LED]
+    names = {k: name for k, _, name in units}
+    lcd_keys = [k for k, is_led, _ in units if not is_led]
+    led_keys = [k for k, is_led, _ in units if is_led]
     lcd_snaps = [app_obj.dispatch(LcdSnapshot(key=k)) for k in lcd_keys]
     led_snaps = [app_obj.dispatch(LedSnapshot(key=k)) for k in led_keys]
 
     if json_output:
         payload = {
             "app": dataclasses.asdict(app_snap),
+            "names": names,
             "lcd_devices": [dataclasses.asdict(s) for s in lcd_snaps],
             "led_devices": [dataclasses.asdict(s) for s in led_snaps],
         }
@@ -435,15 +480,19 @@ def status(
     for i, s in enumerate(lcd_snaps):
         typer.echo("")
         typer.echo(f"─ LCD {i} [{lcd_keys[i]}] ─────────────────────────")
+        typer.echo(f"  device:           {names[lcd_keys[i]]}")
         typer.echo(f"  orientation:      {s.orientation}")
         typer.echo(f"  brightness:       {s.brightness}%")
         typer.echo(f"  current theme:    {s.current_theme}")
         typer.echo(f"  overlay enabled:  {s.overlay_enabled}")
         typer.echo(f"  fit mode:         {s.fit_mode}")
+        typer.echo(f"  game mode:        {describe_game_mode(s.game_enabled, s.game_threshold)}")
+        typer.echo(f"  showing:          {describe_source(s.display_source, s.background_mode, s.media_player_uri)}")
 
     for i, s in enumerate(led_snaps):
         typer.echo("")
         typer.echo(f"─ LED {i} [{led_keys[i]}] ─────────────────────────")
+        typer.echo(f"  device:      {names[led_keys[i]]}")
         typer.echo(f"  mode:        {s.mode}")
         typer.echo(
             f"  color:       #{s.color[0]:02x}{s.color[1]:02x}{s.color[2]:02x}",
@@ -583,6 +632,7 @@ def _version_callback(value: bool) -> None:
 
 @app.callback()
 def _root(
+    ctx: typer.Context,
     verbose: int = typer.Option(
         0, "--verbose", "-v", count=True,
         help="Terminal log verbosity: -v INFO (major milestones), "
@@ -622,13 +672,19 @@ def _root(
     written either way.
     """
     log.debug("_root: verbose=%s version=%s", verbose, version)
+    # One exit hook for every subcommand: the only face that stops sending
+    # after one frame is this one, so it is the one that must say so (#228).
+    ctx.call_on_close(warn_blanking_panels)
     from ...adapters.infra.logging import ensure_configured
     from ...core.logs import levels_for
 
     # ``force``: the root callback OWNS verbosity, so it always configures.
     # Every other entry point calls ``ensure_configured()`` bare and the guard
     # keeps a bare call from downgrading this one.
-    ensure_configured(verbose, force=True)
+    # The log lives with the platform the CLI builds its App on: the host's
+    # in production, the mock's under ``dev/mock_cli.py``.
+    from ._ctx import platform_override
+    ensure_configured(verbose, force=True, platform=platform_override())
     levels = levels_for(verbose)
     # Logged AFTER configuration, so it lands in every report: a reader can see
     # which rung produced the file they are holding without asking.

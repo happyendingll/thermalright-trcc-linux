@@ -25,9 +25,12 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
+import threading
 from abc import abstractmethod
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager, nullcontext
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -39,6 +42,7 @@ from ...core.models import DeviceInfo, DisplayServer, DisplaySession, Wire
 from ...core.ports import (
     AutostartManager,
     HotplugMonitor,
+    HttpFetcher,
     PackageManager,
     Paths,
     Platform,
@@ -49,6 +53,7 @@ from ...core.ports import (
 )
 from ...core.registry import ALL_DEVICES
 from ..device._pyusb_find import find as usb_find
+from ..device._pyusb_find import usb_path
 from ..device.transport import PyUsbBulkTransport
 
 if TYPE_CHECKING:
@@ -95,6 +100,75 @@ class BasePaths(Paths):
         path = self._root / "trcc.log"
         log.debug("%s.log_file → %s", type(self).__name__, path)
         return path
+
+
+
+
+def disambiguate(infos: list[DeviceInfo]) -> list[DeviceInfo]:
+    """Give each unit a key of its own — but ONLY where one is needed.
+
+    ``key`` is the public identity: it names a device in 98 Commands, 115 API
+    routes and 87 CLI arguments, and it is the string ``trcc.json`` persists
+    per-device settings under.  Suffixing it unconditionally would orphan
+    every existing config and break every documented ``trcc … 0416:5302``, to
+    fix a problem almost nobody has.  So a VID/PID with ONE unit present is
+    left exactly as it has always been, and only a genuine collision — two of
+    the same cooler (#287) — earns a port suffix.
+
+    The consequence, stated rather than discovered: unplugging one of a pair
+    returns the survivor to the plain ``vid:pid``, and the settings it wrote
+    while disambiguated no longer match.  :meth:`Settings.for_device` is the
+    ONE lookup chokepoint and falls back to the plain key, so that case
+    degrades to "inherits the shared settings" instead of "loses them".
+
+    A colliding pair on a host that cannot supply a port (``path is None``)
+    is left collapsed and WARNED about, because the alternative — keying on
+    enumeration order — would hand two devices each other's settings the
+    first time they came up in a different order.
+    """
+    log.debug("disambiguate: %d device(s)", len(infos))
+    groups: dict[tuple[int, int], list[DeviceInfo]] = {}
+    for info in infos:
+        groups.setdefault((info.vid, info.pid), []).append(info)
+
+    out: list[DeviceInfo] = []
+    for (vid, pid), units in groups.items():
+        if len(units) == 1:
+            out.extend(units)
+            continue
+        if any(u.path is None for u in units):
+            log.warning(
+                "disambiguate: %d units of %04x:%04x but this host supplies "
+                "no USB port for at least one — they share the key %04x:%04x "
+                "and only one is usable (#287)",
+                len(units), vid, pid, vid, pid,
+            )
+            out.extend(units)
+            continue
+        log.info("disambiguate: %d units of %04x:%04x -> ports %s",
+                 len(units), vid, pid, [u.path for u in units])
+        out.extend(replace(u, unit=u.path or "") for u in units)
+    return out
+
+
+#: Where every TRCC release lives; ``latest/download/<alias>`` is each
+#: package's fixed-name copy, so an upgrade line never names a version.
+RELEASES_URL = "https://github.com/Lexonight1/thermalright-trcc-linux/releases/latest"
+#: The legacy deb's own venv: it reads as a "pip" install, but pip must not
+#: upgrade a venv a package owns.
+_LEGACY_DEB_VENV = "/opt/trcc-linux"
+
+
+def download_and_install(asset: str, installer: str) -> str:
+    """One copy-paste line: fetch the release's *asset*, install it.
+
+    ``wget -O``, never ``-c``: continuing onto a stale file of the same name
+    corrupts it or keeps the old one (measured, the #181 symptom).
+    """
+    line = (f"wget -O /tmp/{asset} {RELEASES_URL}/download/{asset} && "
+            f"{installer} /tmp/{asset}")
+    log.debug("download_and_install: %s", line)
+    return line
 
 
 class BaseOS(Platform):
@@ -181,27 +255,39 @@ class BaseOS(Platform):
         log.debug("%s.package_manager: none", type(self).__name__)
         return ""
 
-    def upgrade_command(self) -> tuple[str, ...]:
-        """Argv that upgrades trcc on this OS, or empty when there is none."""
-        log.debug("%s.upgrade_command: none", type(self).__name__)
-        return ()
+    def upgrade_hint(self) -> str:
+        """The command that upgrades THIS install -- shown, never run.
 
-    def usb_power_state(self, vid: int, pid: int) -> UsbPowerState | None:
+        It used to be argv that ``RunUpgrade`` ran under sudo: ``apt upgrade
+        -y trcc-linux`` upgraded the whole system and reported success,
+        because no distro repo carries trcc-linux.  How TRCC got here decides
+        the answer; the OS adds its native package (``LinuxOS``).
+        """
+        method = self.install_method()
+        if method == "pipx":
+            hint = "pipx upgrade trcc-linux"
+        elif method == "pip" and sys.prefix == _LEGACY_DEB_VENV:
+            hint = download_and_install("trcc-linux-latest.legacy_all.deb",
+                                        "sudo apt install")
+        elif method == "pip":
+            hint = f"{sys.executable} -m pip install --upgrade trcc-linux"
+        else:
+            hint = f"download the latest release from {RELEASES_URL}"
+        log.info("%s.upgrade_hint: %s install -> %s", type(self).__name__,
+                 method, hint)
+        return hint
+
+    def usb_power_state(self, vid: int, pid: int,
+                        unit: str = "") -> UsbPowerState | None:
         """Not exposed by default — only Linux publishes runtime PM per device.
 
         An honest ``None`` beats a stub inventing a value: this exists so a
         timed-out handshake can be told apart from a SUSPENDED panel (#150),
         and a wrong answer would mislead exactly the debugging it serves.
         """
-        log.debug("%s.usb_power_state: not exposed on this OS (%04x:%04x)",
-                  type(self).__name__, vid, pid)
+        log.debug("%s.usb_power_state: not exposed on this OS (%04x:%04x "
+                  "unit=%r)", type(self).__name__, vid, pid, unit)
         return None
-
-    def minimize_on_close(self) -> bool:
-        """Hide-to-tray — Linux / macOS / BSD behaviour.  Windows overrides."""
-        log.debug("%s.minimize_on_close: False (hide to tray)",
-                  type(self).__name__)
-        return False
 
     def configure_stdout(self) -> None:
         """Nothing to do — this OS's console already speaks UTF-8.
@@ -227,10 +313,12 @@ class BaseOS(Platform):
         log.info("%s: initialising", type(self).__name__)
         self._paths: Paths = self._make_paths()
         self._sensors: SensorEnumerator | None = None
+        self._sensors_lock = threading.Lock()
         self._autostart: AutostartManager | None = None
         self._hotplug: HotplugMonitor | None = None
         self._packages: PackageManager | None = None
         self._screen_capture: ScreenCapture | None = None
+        self._http_fetcher: HttpFetcher | None = None
 
     # ── Abstract hooks — the per-OS internals ────────────────────────────
 
@@ -314,7 +402,7 @@ class BaseOS(Platform):
 
     def _transport_openers(
         self,
-    ) -> Mapping[Wire, Callable[[int, int, str | None], Transport]]:
+    ) -> Mapping[Wire, Callable[..., Transport]]:
         """Wire → the opener that serves it.  **Unlisted wires use bulk.**
 
         The same shape as ``_udev._WIRE_SUBSYSTEMS``: a per-``(OS, wire)`` fact
@@ -332,24 +420,52 @@ class BaseOS(Platform):
         return openers
 
     def open_transport(self, wire: Wire, vid: int, pid: int,
-                       serial: str | None = None) -> Transport:
-        """Return an unopened transport for *wire* — the port's one entry point."""
-        opener = self._transport_openers().get(wire, self._open_bulk)
-        log.info("%s.open_transport: wire=%s %04x:%04x serial=%r → %s",
-                 type(self).__name__, wire.value, vid, pid, serial,
-                 getattr(opener, "__name__", opener))
-        return opener(vid, pid, serial)
+                       serial: str | None = None,
+                       unit: str = "", *,
+                       hid_reports: bool = False,
+                       report_id: int = 0x00) -> Transport:
+        """Return an unopened transport for *wire* — the port's one entry point.
 
-    def _open_bulk(self, vid: int, pid: int,
-                   serial: str | None = None) -> Transport:
-        """Open a bulk transport — identical on every OS (libusb)."""
-        log.debug("%s._open_bulk: %04x:%04x serial=%r",
-                  type(self).__name__, vid, pid, serial)
-        return PyUsbBulkTransport(vid, pid, serial)
+        *unit* names WHICH of several identical devices to open (#287); empty
+        is "the only one of this model", which is every single-device user and
+        therefore the behaviour this signature had before the keyword existed.
+        *hid_reports* asks the USB opener for the firmware override (#228),
+        writing HID report *report_id*.
+        """
+        if hid_reports:
+            log.info("%s.open_transport: wire=%s %04x:%04x unit=%s → "
+                     "_open_bulk(hid_reports, report 0x%02x)",
+                     type(self).__name__, wire.value, vid, pid,
+                     unit or "(only)", report_id)
+            return self._open_bulk(vid, pid, serial, unit, hid_reports=True,
+                                   report_id=report_id)
+        opener = self._transport_openers().get(wire, self._open_bulk)
+        log.info("%s.open_transport: wire=%s %04x:%04x serial=%r unit=%s → %s",
+                 type(self).__name__, wire.value, vid, pid, serial,
+                 unit or "(only)", getattr(opener, "__name__", opener))
+        return opener(vid, pid, serial, unit)
+
+    def _open_bulk(self, vid: int, pid: int, serial: str | None = None,
+                   unit: str = "", hid_reports: bool = False,
+                   report_id: int = 0x00) -> Transport:
+        """The USB opener — identical on every OS: libusb bulk, or, for the
+        firmware-4.07 override, HID output reports through hidapi (#228).
+
+        One opener for both, so a stand-in platform that scripts USB scripts
+        the override too: when it was built outside the Platform, a mock run
+        retried a failed handshake on a REAL hidapi handle.
+        """
+        log.debug("%s._open_bulk: %04x:%04x serial=%r unit=%s hid_reports=%s "
+                  "report=0x%02x", type(self).__name__, vid, pid, serial,
+                  unit or "(only)", hid_reports, report_id)
+        if hid_reports:
+            from ..device.transport import HidApiTransport
+            return HidApiTransport(vid, pid, serial, unit, report_id=report_id)
+        return PyUsbBulkTransport(vid, pid, serial, unit)
 
     @abstractmethod
-    def _open_scsi(self, vid: int, pid: int,
-                   serial: str | None = None) -> ScsiTransport:
+    def _open_scsi(self, vid: int, pid: int, serial: str | None = None,
+                   unit: str = "") -> ScsiTransport:
         """Open this OS's native SCSI passthrough — the one divergent path."""
 
     def scan_devices(self) -> list[DeviceInfo]:
@@ -372,12 +488,12 @@ class BaseOS(Platform):
                     serial = ""
                 bcd = int(getattr(dev, "bcdDevice", 0) or 0)
                 found.append(DeviceInfo(vid=vid, pid=pid, serial=serial or None,
-                                        bcd_device=bcd))
-                log.info("  found %04x:%04x serial=%r bcdDevice=%#06x",
-                         vid, pid, serial, bcd)
+                                        bcd_device=bcd, path=usb_path(dev)))
+                log.info("  found %04x:%04x serial=%r bcdDevice=%#06x path=%s",
+                         vid, pid, serial, bcd, usb_path(dev) or "(none)")
         log.info("%s.scan_devices: %d device(s) total",
                  type(self).__name__, len(found))
-        return found
+        return disambiguate(found)
 
     # ── Filesystem + memoised enumerators ────────────────────────────────
 
@@ -386,13 +502,24 @@ class BaseOS(Platform):
         return self._paths
 
     def sensors(self) -> SensorEnumerator:
-        if self._sensors is None:
-            log.info("%s.sensors: building enumerator", type(self).__name__)
-            self._sensors = self._build_sensors()
-        else:
-            frame_log.debug("%s.sensors: returning cached enumerator",
-                      type(self).__name__)
-        return self._sensors
+        """The one enumerator, built on first ask by whichever thread asks.
+
+        Under a lock, so two threads asking at once build it once (on Windows
+        a second build would spawn LibreHardwareMonitor twice).  Inside the
+        thread's OS setup, because the first ask is not always the main
+        thread -- the gui primes devices on its splash worker, and building
+        means WMI discovery, which needs a COM apartment on that thread.
+        """
+        with self._sensors_lock:
+            if self._sensors is None:
+                log.info("%s.sensors: building enumerator on %s",
+                         type(self).__name__, threading.current_thread().name)
+                with self.worker_thread_context():
+                    self._sensors = self._build_sensors()
+            else:
+                frame_log.debug("%s.sensors: returning cached enumerator",
+                                type(self).__name__)
+            return self._sensors
 
     def autostart(self) -> AutostartManager:
         if self._autostart is None:
@@ -421,6 +548,15 @@ class BaseOS(Platform):
             log.debug("%s.screen_capture: returning cached source",
                       type(self).__name__)
         return self._screen_capture
+
+    def http_fetcher(self) -> HttpFetcher:
+        """The real network -- one fetcher, built on first use."""
+        if self._http_fetcher is None:
+            from ..repo.http import UrllibHttpFetcher
+            log.info("%s.http_fetcher: building the urllib fetcher",
+                     type(self).__name__)
+            self._http_fetcher = UrllibHttpFetcher()
+        return self._http_fetcher
 
     def packages(self) -> PackageManager:
         if self._packages is None:

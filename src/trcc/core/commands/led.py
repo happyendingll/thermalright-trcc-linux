@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from ..errors import (
     DeviceNotConnectedError,
@@ -15,13 +16,24 @@ from ..events import (
     FrameSent,
     HddEnabledChanged,
     LedColorsChanged,
+    RamLightingChanged,
+    RgbFollowChanged,
 )
 from ..led_models import (
-    LED_SELECT_ALL_STYLES,
     LED_STYLES,
     LEDMode,
     LedPayload,
     LedRuntimeState,
+    is_select_all,
+    one_hot,
+)
+from ..logs import per_frame
+from ..models import (
+    FollowColors,
+    FollowMapping,
+    RamAccessState,
+    RamAccessStatus,
+    RgbFollowMode,
 )
 from ..results import (
     ClockFormatResult,
@@ -33,6 +45,8 @@ from ..results import (
     LedStylesListResult,
     LedZoneEntry,
     MemoryRatioResult,
+    RamLightingResult,
+    RgbFollowResult,
     WeekStartResult,
 )
 from ._base import Command, Query
@@ -40,9 +54,6 @@ from ._helpers import (
     _not_an_led,
     _publish_if_disconnect,
     _publish_led_settings_changed,
-)
-from .device import (
-    ConnectDevice,
 )
 
 if TYPE_CHECKING:
@@ -52,11 +63,13 @@ if TYPE_CHECKING:
     from ...services.led_segment import SegmentDisplay
 
 log = logging.getLogger(__name__)
+frame_log = per_frame(__name__)
 
 
 @dataclass(frozen=True, slots=True)
 class SetLedColors(Command[LedColorsResult]):
     """Set LED color array + on/off + brightness on a connected Led device."""
+    USES_DEVICE: ClassVar[bool] = True
     key: str
     colors: list[tuple[int, int, int]]
     global_on: bool = True
@@ -102,8 +115,13 @@ class SetLedColors(Command[LedColorsResult]):
             )
 
         if ok:
+            # Held until an LED settings change: the sensor observer and the
+            # animation loop replaced these colours within a tick (measured).
+            app.held.add(self.key)
+            log.info("SetLedColors: %s held", self.key)
             app.events.publish(LedColorsChanged(
                 key=self.key, color_count=len(self.colors),
+                colors=_rgb_tuples(self.colors),
             ))
         return LedColorsResult(
             ok=ok, key=self.key, colors=list(self.colors),
@@ -113,30 +131,29 @@ class SetLedColors(Command[LedColorsResult]):
 
 @dataclass(frozen=True, slots=True)
 class InitializeLed(Command[LedColorsResult]):
-    """Connect + render one initial LED frame in a single dispatch.
+    """Render ONE LED frame, connecting the device first — the one-shot render.
 
-    Convenience for the LED boot path — equivalent to ``ConnectDevice``
-    followed by ``RenderLed``, but wrapped so headless callers (CLI
-    autorestore, daemon startup) don't have to chain two Commands and
-    handle the intermediate Result.  Failures at either step surface
-    as the LED Result so the caller only inspects one shape.
+    :class:`RenderLed` is the per-tick Command: the observer and the animation
+    loop fire it many times a second, so it must never attempt a connect.  A
+    user asking for one frame (``led initialize``, ``led render``,
+    ``POST /led/render``) is a different intent, and this is its Command:
+    ``USES_DEVICE`` has ``App.dispatch`` connect first, for every UI, and the
+    optional *color* / *phase* are ``RenderLed``'s diagnostic overrides.
 
-    Distinct from :class:`RenderLed` (assumes already-connected) and
-    :class:`ConnectDevice` (handshakes but doesn't render).  Use this
-    on app start; use the individual Commands when you need finer
-    control over each step.
+    It used to call ``ConnectDevice`` itself, re-handshaking even a connected
+    device, while ``led render`` and the API route asked their own UI to
+    connect and then dispatched ``RenderLed`` directly.
     """
+    USES_DEVICE: ClassVar[bool] = True
     key: str
+    color: tuple[int, int, int] | None = None    # None = use Settings.led.color
+    phase: int = 0
 
     def execute(self, app: App) -> LedColorsResult:
-        log.info("InitializeLed: key=%s", self.key)
-        connect_result = app.dispatch(ConnectDevice(key=self.key))
-        if not connect_result.ok:
-            return LedColorsResult(
-                ok=False, key=self.key, colors=[],
-                message=f"connect failed: {connect_result.message}",
-            )
-        return app.dispatch(RenderLed(key=self.key))
+        log.info("InitializeLed: key=%s color=%s phase=%s", self.key,
+                 self.color, self.phase)
+        return app.dispatch(RenderLed(key=self.key, color=self.color,
+                                      phase=self.phase))
 
 @dataclass(frozen=True, slots=True)
 class RenderLed(Command[LedColorsResult]):
@@ -192,7 +209,7 @@ class RenderLed(Command[LedColorsResult]):
             current, metrics = enum.read_all(), enum.snapshot()
             log.debug("RenderLed %s: no broadcast yet — read sensors directly",
                       self.key)
-        log.debug(
+        frame_log.debug(
             "RenderLed %s: snapshot cpu_temp=%.0f cpu_pct=%.0f "
             "gpu_temp=%.0f gpu_usage=%.0f", self.key,
             metrics.cpu_temp, metrics.cpu_percent,
@@ -206,14 +223,14 @@ class RenderLed(Command[LedColorsResult]):
     ) -> int:
         """Which metric PAGE a multi-page segment display shows (C# LunBo).
 
-        CPU temp / CPU % / GPU temp / GPU %, and so on.  The selector buttons
-        persist the choice as ``selected_zone``; with the page carousel on (and
-        not a select-all style) it rotates the enabled pages instead.
+        CPU temp / CPU % / GPU temp / GPU %, and so on.  With the carousel off
+        the page picked on the panel (``selected_zone``, the first in the mask);
+        on (and not a select-all style), the carousel rotates the mask's pages.
 
         Gated on the display actually having more than one page, NOT on
         ``zones`` being populated — which it never is for page-style devices.
-        That was the bug: selecting a metric set ``selected_zone`` and the
-        render ignored it and stayed on page 0.
+        That was the bug: selecting a metric page changed nothing and the
+        render stayed on page 0.
 
         **Advances ``runtime``** when the carousel is live and this is a loop
         tick.  Only the animation loop (``advance=True``) may: reactive
@@ -221,11 +238,11 @@ class RenderLed(Command[LedColorsResult]):
         ``LedSettingsChanged`` — cannot race it forward.
         """
         if display.phase_count <= 1:
-            log.debug("RenderLed %s: single-page display — phase=%d",
+            frame_log.debug("RenderLed %s: single-page display — phase=%d",
                       self.key, self.phase)
             return self.phase
-        if not settings.zone_sync or style.value in LED_SELECT_ALL_STYLES:
-            log.debug("RenderLed %s: selected-zone phase=%d",
+        if not settings.zone_sync or is_select_all(style):
+            frame_log.debug("RenderLed %s: selected-zone phase=%d",
                       self.key, settings.selected_zone)
             return settings.selected_zone
         if self.advance:
@@ -235,7 +252,7 @@ class RenderLed(Command[LedColorsResult]):
                 runtime.zone_sync_current = app.led_effects.next_sync_zone(
                     settings.zone_sync_zones, runtime.zone_sync_current,
                 )
-        log.debug("RenderLed %s: zone-sync carousel phase=%d (advance=%s)",
+        frame_log.debug("RenderLed %s: zone-sync carousel phase=%d (advance=%s)",
                   self.key, runtime.zone_sync_current, self.advance)
         return runtime.zone_sync_current
 
@@ -308,6 +325,10 @@ class RenderLed(Command[LedColorsResult]):
             if explicit_color is not None else led_settings
         )
 
+        # A multi-zone style's device shows its zones alone (FormLED.cs:10958
+        # multiplies each zone by ITS brightness and on/off; ``SendHidVal``
+        # applies nothing global for styles 2/7).  Set below.
+        zoned = False
         display = get_display(style)
         if display is None:
             # Pure-RGB style (e.g. LF13): no segment digits — fill the panel's
@@ -319,7 +340,7 @@ class RenderLed(Command[LedColorsResult]):
                 effective_settings, runtime, current,
                 led_count=LED_STYLES[style].led_count,
             )
-            log.debug("RenderLed %s: color-only fill (%d RGB LEDs)",
+            frame_log.debug("RenderLed %s: color-only fill (%d RGB LEDs)",
                       self.key, len(colors))
         else:
             # Multi-zone styles (PA120/LF10) keep a per-zone colour/mode list;
@@ -360,7 +381,11 @@ class RenderLed(Command[LedColorsResult]):
             mask = compute_mask(
                 style, display_metrics, phase=phase,
                 temp_unit=device_settings.temp_unit,
-                is_24h=(device_settings.time_format == "24h"),
+                # The LED's OWN clock format -- FormLED keeps isTimer24 per
+                # cooler (FormLED.cs:945, drawn at :3938).  This read the LCD
+                # overlay's time_format, so the cooler's own 12/24h button
+                # did nothing and the LCD's format command drove it instead.
+                is_24h=effective_settings.clock_24h,
                 week_sunday=effective_settings.week_sunday,
                 memory_ratio=effective_settings.memory_ratio,
             )
@@ -374,7 +399,8 @@ class RenderLed(Command[LedColorsResult]):
             # — force that one colour on every LED at full brightness.
             if (zone_map is not None and effective_settings.zones
                     and explicit_color is None):
-                log.debug("RenderLed %s: multi-zone fill (%d zones)",
+                zoned = True
+                frame_log.debug("RenderLed %s: multi-zone fill (%d zones)",
                           self.key, len(zone_map))
                 colors = app.led_effects.tick_multi_zone(
                     effective_settings, runtime, current,
@@ -401,15 +427,17 @@ class RenderLed(Command[LedColorsResult]):
 
         # One writer: bake global brightness into the rendered signal so the
         # device wire and the GUI preview observe one identical colour list.
-        # (Per-zone brightness is already baked by tick_multi_zone; this is
-        # the global 0–100 % on top.)  Explicit-colour diagnostics force
-        # brightness=100 via effective_settings, so this is a no-op there.
-        colors = apply_brightness(colors, effective_settings.brightness)
+        # Not on a multi-zone style: tick_multi_zone has baked each zone's own
+        # brightness, and the global one is only what the panel shows.
+        # Explicit-colour diagnostics force brightness=100 via
+        # effective_settings, so this is a no-op there.
+        if not zoned:
+            colors = apply_brightness(colors, effective_settings.brightness)
 
         payload = LedPayload(
             colors=colors,
             is_on=mask or None,   # empty mask (pure-RGB) → None → wire lights all
-            global_on=effective_settings.global_on,
+            global_on=zoned or effective_settings.global_on,
         )
         try:
             ok = app.send(self.key, payload)
@@ -426,19 +454,15 @@ class RenderLed(Command[LedColorsResult]):
         if ok:
             app.events.publish(LedColorsChanged(
                 key=self.key, color_count=len(colors),
+                colors=_rgb_tuples(colors),
             ))
             # Same preview path as LCD: publish the rendered output on
             # FrameSent so the GUI preview shows exactly what went to the
-            # device.  ``colors`` is already brightness-baked above (the one
-            # writer), so the preview observes the same signal the wire does
-            # — the slider dims both.  Apply the on/off mask the device gets
-            # via is_on, else the preview colours EVERY segment and reads as
-            # "888".  Empty mask (pure-RGB styles) shows all.
-            shown = ([c if on else (0, 0, 0)
-                      for c, on in zip(colors, mask, strict=True)]
-                     if mask else colors)
+            # device — ``payload.shown``, the lit rule the wire itself sends,
+            # so the segment mask AND the off switch darken both.
             app.events.publish(FrameSent(
-                key=self.key, bytes_sent=len(colors), display_colors=shown,
+                key=self.key, bytes_sent=len(colors),
+                display_colors=payload.shown,
             ))
         rendered = (f"{sum(mask)}/{len(mask)} LEDs on" if mask
                     else f"{len(colors)} RGB LEDs")
@@ -453,11 +477,10 @@ class RenderLed(Command[LedColorsResult]):
 class SetLedMode(Command[LedColorsResult]):
     """Set the LED animation mode.
 
-    Global for ordinary devices; for a multi-zone style (PA120/LF10) the mode
-    applies to the *selected* zones (all when "select all"/``zone_sync`` is on,
-    else the ``zone_sync_zones`` mask) — the same per-zone path as
-    :class:`SetLedColor`.  Without this the mode/effect buttons did nothing on
-    a multi-zone device, because the render reads each zone's own mode (#192).
+    The global mode, plus the zones the edit reaches on a multi-zone style
+    (:func:`_write_edit_zones`).  Without the zones the mode buttons did
+    nothing on a multi-zone device, because the render reads each zone's own
+    mode (#192).
     """
     key: str
     mode: LEDMode
@@ -466,24 +489,9 @@ class SetLedMode(Command[LedColorsResult]):
         if (why := _not_an_led(app, self.key)) is not None:
             return LedColorsResult(ok=False, key=self.key, colors=[],
                                    message=why)
-        zone_count = _multi_zone_count(app, self.key)
-        if zone_count is not None:
-            app.settings.set_led_zone_count(self.key, zone_count)
-            s = app.settings.for_led(self.key)
-            if s.zone_sync:
-                targets = list(range(zone_count))
-            else:
-                mask = s.zone_sync_zones
-                targets = [i for i in range(zone_count)
-                           if i < len(mask) and mask[i]]
-                if not targets:
-                    targets = [0]
-            for i in targets:
-                app.settings.set_led_zone(self.key, i, mode=self.mode)
-            log.info("SetLedMode %s: %s → zone(s) %s",
-                     self.key, self.mode.name, targets)
-        else:
-            app.settings.set_led_mode(self.key, self.mode)
+        log.info("SetLedMode %s: %s", self.key, self.mode.name)
+        app.settings.set_led_mode(self.key, self.mode)
+        _write_edit_zones(app, self.key, mode=self.mode)
         # Phase counters reset on mode change so animation restarts cleanly
         runtime = app.led_runtime.setdefault(self.key, LedRuntimeState())
         runtime.breathe_phase = 0
@@ -496,6 +504,74 @@ class SetLedMode(Command[LedColorsResult]):
             message=f"LED mode set to {self.mode.name}",
         )
 
+def _edit_zones(settings: LedDeviceSettings, zone_count: int) -> list[int]:
+    """The zones a panel edit reaches on a multi-zone style — FormLED's rule.
+
+    Every zone with select-all on (``isLunBo``), else the multi-select mask
+    (``LunBo1..4``), FormLED.cs:2062.  Zone 0 when the mask is empty, which the
+    C# cannot reach: its last selected zone cannot be deselected.
+    """
+    mask = settings.zone_sync_zones
+    zones = (list(range(zone_count)) if settings.zone_sync
+             else [i for i in range(zone_count) if i < len(mask) and mask[i]] or [0])
+    log.debug("_edit_zones: select-all=%s mask=%s → %s",
+              settings.zone_sync, mask, zones)
+    return zones
+
+
+def _write_edit_zones(app: App, key: str, **fields: Any) -> list[int]:
+    """Copy a panel edit into the zones it reaches; none on other styles.
+
+    On a multi-zone style (PA120/LF10) every FormLED control writes the global
+    field AND the selected zones — colour :2057, on/off :2124, brightness
+    :2279, mode :2447 — and the device is driven by the zones alone.  The
+    global value is what the controls show.
+    """
+    zone_count = _ensure_zones(app, key)
+    if zone_count is None:
+        log.debug("_write_edit_zones: %s is not multi-zone — global only", key)
+        return []
+    zones = _edit_zones(app.settings.for_led(key), zone_count)
+    for i in zones:
+        app.settings.set_led_zone(key, i, **fields)
+    log.info("_write_edit_zones: %s %s → zone(s) %s", key, fields, zones)
+    return zones
+
+
+def _ensure_zones(app: App, key: str) -> int | None:
+    """Create a multi-zone device's zones if they do not exist yet.
+
+    Every Command that reads or sets the zone selection calls this FIRST.
+    Creating the zones turns select-all on (FormLED's first run), so a choice
+    applied before they existed — select-all off sent in the seconds after
+    connecting, before the first render — was switched back on by the next
+    edit.  Returns the zone count, or None for a device without zones.
+    """
+    zone_count = _multi_zone_count(app, key)
+    if zone_count is not None:
+        app.settings.set_led_zone_count(key, zone_count)
+    log.debug("_ensure_zones: %s → %s", key, zone_count)
+    return zone_count
+
+
+#: The most zones any LED style has -- the bound on a zone before the
+#: handshake says which style this cooler is.
+_MOST_ZONES = max(style.zone_count for style in LED_STYLES.values())
+
+
+def _style_of(app: App, key: str) -> LedStyle | None:
+    """The connected LED's resolved style, or None before its handshake."""
+    try:
+        device = app.get(key)
+    except DeviceNotFoundError:
+        log.debug("_style_of: %s is not attached", key)
+        return None
+    handshake = getattr(device, "led_handshake", None)
+    style = handshake.style if handshake is not None else None
+    log.debug("_style_of: %s → %s", key, style)
+    return style
+
+
 def _multi_zone_count(app: App, key: str) -> int | None:
     """Number of colour zones for a connected multi-zone LED, else None.
 
@@ -505,12 +581,7 @@ def _multi_zone_count(app: App, key: str) -> int | None:
     """
     log.debug("_multi_zone_count: app=%s key=%s", app, key)
     from ...services.led_segment import get_display
-    try:
-        device = app.get(key)
-    except DeviceNotFoundError:
-        return None
-    handshake = getattr(device, "led_handshake", None)
-    style = handshake.style if handshake is not None else None
+    style = _style_of(app, key)
     if style is None:
         return None
     display = get_display(style)
@@ -523,11 +594,9 @@ def _multi_zone_count(app: App, key: str) -> int | None:
 class SetLedColor(Command[LedColorsResult]):
     """Set the LED colour.
 
-    For ordinary LED devices this is the global colour (STATIC / BREATHING /
-    COLORFUL).  For a multi-zone style (PA120/LF10) the colour applies to the
-    *selected* zones — every zone when "select all" (``zone_sync``) is on, else
-    the multi-select mask (``zone_sync_zones``) — mirroring the C#
-    ``ucColor1Delegate`` (gate ``nowLedStyle == 2 || 7``).  (#192)
+    The global colour (STATIC / BREATHING / COLORFUL), plus the zones the edit
+    reaches on a multi-zone style (:func:`_write_edit_zones`), as the C#
+    ``ucColor1Delegate`` does (gate ``nowLedStyle == 2 || 7``).  (#192)
     """
     key: str
     color: tuple[int, int, int]
@@ -543,38 +612,24 @@ class SetLedColor(Command[LedColorsResult]):
                     message=f"{label} out of range (0-255): {value}",
                 )
         r, g, b = self.color
-        zone_count = _multi_zone_count(app, self.key)
-        if zone_count is not None:
-            app.settings.set_led_zone_count(self.key, zone_count)
-            s = app.settings.for_led(self.key)
-            if s.zone_sync:
-                targets = list(range(zone_count))
-            else:
-                mask = s.zone_sync_zones
-                targets = [i for i in range(zone_count)
-                           if i < len(mask) and mask[i]]
-                if not targets:
-                    targets = [0]   # default selection (configure: zone 0)
-            for i in targets:
-                app.settings.set_led_zone(self.key, i, color=self.color)
-            log.info("SetLedColor %s: #%02x%02x%02x → zone(s) %s",
-                     self.key, r, g, b, targets)
-            _publish_led_settings_changed(app, self.key)
-            return LedColorsResult(
-                ok=True, key=self.key, colors=[self.color],
-                message=(f"Zone colour #{r:02x}{g:02x}{b:02x} "
-                         f"applied to {len(targets)} zone(s)"),
-            )
+        log.info("SetLedColor %s: #%02x%02x%02x", self.key, r, g, b)
         app.settings.set_led_color(self.key, self.color)
+        zones = _write_edit_zones(app, self.key, color=self.color)
         _publish_led_settings_changed(app, self.key)
         return LedColorsResult(
             ok=True, key=self.key, colors=[self.color],
-            message=f"LED color set to #{r:02x}{g:02x}{b:02x}",
+            message=(f"LED color set to #{r:02x}{g:02x}{b:02x}"
+                     + (f" on {len(zones)} zone(s)" if zones else "")),
         )
 
 @dataclass(frozen=True, slots=True)
 class SetLedBrightness(Command[LedColorsResult]):
-    """Set the global LED brightness percent (0–100)."""
+    """Set the LED brightness percent (0–100): the global value, plus the
+    zones the edit reaches on a multi-zone style (FormLED ``ucScrollWDelegate``).
+
+    Only the zones reached the device's colours before: a PA120 at 100 % shone
+    at its zones' 65 %, the global value multiplied on top.
+    """
     key: str
     percent: int
 
@@ -589,6 +644,7 @@ class SetLedBrightness(Command[LedColorsResult]):
                 message=f"brightness out of range (0-100): {self.percent}",
             )
         app.settings.set_led_brightness(self.key, self.percent)
+        _write_edit_zones(app, self.key, brightness=self.percent)
         _publish_led_settings_changed(app, self.key)
         return LedColorsResult(
             ok=True, key=self.key, colors=[],
@@ -658,8 +714,12 @@ class ToggleLed(Command[LedColorsResult]):
             return LedColorsResult(ok=False, key=self.key, colors=[],
                                    message=why)
         if self.zone is None:
+            # The global switch, plus the zones the edit reaches on a
+            # multi-zone style (FormLED ``ucColor2Delegate``), whose device
+            # follows its zones alone.
             app.settings.set_led_global_on(self.key, self.on)
-            target = "global"
+            zones = _write_edit_zones(app, self.key, on=self.on)
+            target = f"zone(s) {zones}" if zones else "global"
         else:
             try:
                 app.settings.set_led_zone(self.key, self.zone, on=self.on)
@@ -797,7 +857,15 @@ class SetLedZoneBrightness(Command[LedColorsResult]):
 
 @dataclass(frozen=True, slots=True)
 class SetLedZoneSync(Command[LedColorsResult]):
-    """Enable/disable the zone-sync carousel for a device."""
+    """Enable/disable the zone-sync carousel for a device.
+
+    Switching it off on a page style keeps one page, the lowest selected, as
+    FormLED does (``buttonLB_Click``, :2600).  Not on a select-all style
+    (PA120/LF10), where it means "every zone" and the zones stay as picked --
+    and switching it ON there gives every zone the current mode, as FormLED
+    does (``myLedMode1..4 = myLedMode``, :2578-2595).  Only the mode: colour,
+    brightness and on/off stay per zone until the next edit reaches them all.
+    """
     key: str
     enabled: bool
 
@@ -806,7 +874,18 @@ class SetLedZoneSync(Command[LedColorsResult]):
         if (why := _not_an_led(app, self.key)) is not None:
             return LedColorsResult(ok=False, key=self.key, colors=[],
                                    message=why)
+        _ensure_zones(app, self.key)
         app.settings.set_led_zone_sync(self.key, self.enabled)
+        select_all = is_select_all(_style_of(app, self.key))
+        if self.enabled and select_all:
+            # Select-all reaches every zone now, so this writes them all.
+            _write_edit_zones(app, self.key,
+                              mode=app.settings.for_led(self.key).mode)
+        if not self.enabled and not select_all:
+            s = app.settings.for_led(self.key)
+            first = s.selected_zone
+            app.settings.set_led_zone_sync_zones(
+                self.key, one_hot(first, len(s.zone_sync_zones)))
         runtime = app.led_runtime.setdefault(self.key, LedRuntimeState())
         runtime.zone_sync_ticks = 0
         runtime.zone_sync_current = 0
@@ -858,6 +937,7 @@ class SetLedZoneSyncZones(Command[LedColorsResult]):
             return LedColorsResult(ok=False, key=self.key, colors=[],
                                    message=why)
         log.info("SetLedZoneSyncZones %s: zones=%s", self.key, list(self.zones))
+        _ensure_zones(app, self.key)
         app.settings.set_led_zone_sync_zones(self.key, list(self.zones))
         _publish_led_settings_changed(app, self.key)
         return LedColorsResult(
@@ -867,50 +947,54 @@ class SetLedZoneSyncZones(Command[LedColorsResult]):
 
 @dataclass(frozen=True, slots=True)
 class SelectZone(Command[LedColorsResult]):
-    """Pick the active zone (UI selection state)."""
+    """Select exactly this zone: the page a page-style cooler shows, or the
+    one zone a PA120/LF10 edit reaches.
+
+    Sets the mask to that zone alone, as a FormLED zone click does with the
+    carousel off (:2812).  It used to set a separate ``selected_zone`` and
+    leave the mask, so the panel's buttons and the cooler disagreed.  On a
+    select-all style it also turns select-all off: with it on, an edit
+    reaches every zone whatever the mask says.
+    """
     key: str
     zone: int
 
     def execute(self, app: App) -> LedColorsResult:
-        log.debug("execute: app=%s", app)
+        log.info("SelectZone %s: zone=%d", self.key, self.zone)
         if (why := _not_an_led(app, self.key)) is not None:
             return LedColorsResult(ok=False, key=self.key, colors=[],
                                    message=why)
-        try:
-            app.settings.set_led_selected_zone(self.key, self.zone)
-        except ValueError as e:
+        if self.zone < 0:
             return LedColorsResult(
-                ok=False, key=self.key, colors=[], message=str(e),
+                ok=False, key=self.key, colors=[],
+                message=f"zone must be >= 0, got {self.zone}",
             )
+        # The style's own count bounds the choice -- a zone 99 was accepted
+        # (on LC2 and LF13, which have none) and stored a 100-entry mask.
+        # Before the handshake the style is unknown, but no style has more
+        # zones than the largest: that bound kept zone=10_000_000 from storing
+        # a ten-million-entry mask in trcc.json.
+        style = _style_of(app, self.key)
+        count = LED_STYLES[style].zone_count if style is not None else None
+        bound = count if count is not None else _MOST_ZONES
+        if self.zone >= bound:
+            log.warning("SelectZone %s: zone %d is out of range — %s has %d",
+                        self.key, self.zone,
+                        style.name if style else "no style yet, at most", bound)
+            return LedColorsResult(
+                ok=False, key=self.key, colors=[],
+                message=(f"{self.key} has no zones to select" if not bound else
+                         f"zone must be 0..{bound - 1}, got {self.zone}"),
+            )
+        if _ensure_zones(app, self.key) is not None:
+            app.settings.set_led_zone_sync(self.key, False)
+        size = (count if count is not None else min(_MOST_ZONES, max(
+            len(app.settings.for_led(self.key).zone_sync_zones), self.zone + 1)))
+        app.settings.set_led_zone_sync_zones(self.key, one_hot(self.zone, size))
         _publish_led_settings_changed(app, self.key)
         return LedColorsResult(
             ok=True, key=self.key, colors=[],
             message=f"Selected zone {self.zone}",
-        )
-
-@dataclass(frozen=True, slots=True)
-class ToggleSegment(Command[LedColorsResult]):
-    """Flip one segment's on/off state (segment-display devices)."""
-    key: str
-    index: int
-    on: bool
-
-    def execute(self, app: App) -> LedColorsResult:
-        log.debug("execute: app=%s", app)
-        if (why := _not_an_led(app, self.key)) is not None:
-            return LedColorsResult(ok=False, key=self.key, colors=[],
-                                   message=why)
-        try:
-            app.settings.set_led_segment_on(self.key, self.index, self.on)
-        except IndexError as e:
-            return LedColorsResult(
-                ok=False, key=self.key, colors=[], message=str(e),
-            )
-        _publish_led_settings_changed(app, self.key)
-        state = "on" if self.on else "off"
-        return LedColorsResult(
-            ok=True, key=self.key, colors=[],
-            message=f"Segment {self.index} turned {state}",
         )
 
 @dataclass(frozen=True, slots=True)
@@ -993,6 +1077,152 @@ class SetHddEnabled(Command[HddEnabledResult]):
             message=f"HDD metrics {state}",
         )
 
+def _rgb_tuples(colors: Sequence[Sequence[int]]) -> tuple[tuple[int, int, int], ...]:
+    """Colours as ``(r, g, b)`` tuples -- over IPC they arrive as lists."""
+    frame_log.debug("_rgb_tuples: %d colour(s)", len(colors))
+    return tuple((int(c[0]), int(c[1]), int(c[2])) for c in colors)
+
+
+def _rgb_follow_result(app: App, message: str) -> RgbFollowResult:
+    """The follow setting and the follower's live status, as one Result."""
+    settings, status = app.settings.app, app.rgb_mirror.status
+    mode = app.settings.rgb_follow_mode()
+    log.debug("_rgb_follow_result: %s connected=%s", mode.value,
+              status.connected)
+    return RgbFollowResult(
+        ok=True, mode=mode,
+        host=settings.openrgb_host, port=settings.openrgb_port,
+        source=settings.rgb_follow_source,
+        mapping=app.settings.rgb_follow_mapping(),
+        targets=app.settings.rgb_follow_targets(),
+        colors=app.settings.rgb_follow_colors(),
+        connected=status.connected, devices=status.devices,
+        lead=status.lead, error=status.error, message=message,
+    )
+
+
+def _rgb_follow_label(mode: RgbFollowMode, host: str, port: int,
+                      source: str = "") -> str:
+    """What follows which device, in words -- *source* empty is the cooler."""
+    log.debug("_rgb_follow_label: %s source=%r", mode.value, source)
+    lead = f"device {source}" if source else "the cooler"
+    match mode:
+        case RgbFollowMode.OPENRGB:
+            return f"OpenRGB at {host}:{port} follows {lead}"
+        case RgbFollowMode.RAM:
+            return f"Corsair RAM follows {lead}"
+    return "Nothing follows -- TRCC sends no colours to other lights"
+
+
+@dataclass(frozen=True, slots=True)
+class SetRgbFollow(Command[RgbFollowResult]):
+    """Pick what follows the LED cooler's colours (#160): one at a time.
+
+    TRCC leads.  ``OPENRGB``: TRCC connects to the OpenRGB SDK server at
+    host:port as a client and sends the cooler's colours to every OpenRGB
+    device, in OpenRGB's direct mode.  ``RAM``: TRCC sends them to Corsair RGB
+    memory over the SMBus itself, with no OpenRGB running.  ``OFF`` stops.
+    An empty host or a port of 0 keeps the one saved.
+
+    ``source`` is the device that leads: empty for the first LED cooler, an
+    LCD's key to follow its picture, mapped by ``mapping``, each region
+    becoming one colour by ``colors``.  ``targets`` are the lights that
+    follow (refs; empty for every one).  None keeps each saved.
+    """
+    mode: RgbFollowMode
+    host: str = ""
+    port: int = 0
+    source: str | None = None
+    mapping: FollowMapping | None = None
+    targets: tuple[str, ...] | None = None
+    colors: FollowColors | None = None
+
+    def execute(self, app: App) -> RgbFollowResult:
+        current = app.settings.app
+        host = self.host or current.openrgb_host
+        port = self.port or current.openrgb_port
+        source = (current.rgb_follow_source if self.source is None
+                  else self.source)
+        mapping = (app.settings.rgb_follow_mapping() if self.mapping is None
+                   else self.mapping)
+        targets = (app.settings.rgb_follow_targets() if self.targets is None
+                   else self.targets)
+        colors = (app.settings.rgb_follow_colors() if self.colors is None
+                  else self.colors)
+        log.info("SetRgbFollow: %s %s:%d source=%r %s %s targets=%s",
+                 self.mode.value, host, port, source, mapping.value,
+                 colors.value, list(targets) or "all")
+        try:
+            app.settings.set_rgb_follow(self.mode, host, port, source,
+                                        mapping, targets, colors=colors)
+        except ValueError as e:
+            log.warning("SetRgbFollow: refused — %s", e)
+            return RgbFollowResult(ok=False, message=str(e))
+        app.rgb_mirror.configure(self.mode, host, port, source, mapping,
+                                 targets, colors=colors)
+        app.events.publish(RgbFollowChanged(mode=self.mode))
+        return _rgb_follow_result(
+            app, _rgb_follow_label(self.mode, host, port, source))
+
+
+@dataclass(frozen=True, slots=True)
+class RgbFollow(Query[RgbFollowResult]):
+    """What follows the cooler, and what it is doing (#160)."""
+
+    def execute(self, app: App) -> RgbFollowResult:
+        log.debug("RgbFollow: query")
+        current = app.settings.app
+        return _rgb_follow_result(app, _rgb_follow_label(
+            app.settings.rgb_follow_mode(), current.openrgb_host,
+            current.openrgb_port, current.rgb_follow_source))
+
+
+def _ram_lighting_result(status: RamAccessStatus, *,
+                         ok: bool = True) -> RamLightingResult:
+    """A ``RamAccessStatus`` as the Result every UI reads."""
+    log.debug("_ram_lighting_result: %s ok=%s", status, ok)
+    return RamLightingResult(ok=ok, state=status.state, message=status.message,
+                             command=status.command)
+
+
+@dataclass(frozen=True, slots=True)
+class RamLighting(Query[RamLightingResult]):
+    """Whether TRCC may reach RGB memory's bus -- read from files, no bus."""
+
+    def execute(self, app: App) -> RamLightingResult:
+        log.debug("RamLighting: query")
+        return _ram_lighting_result(app.platform.ram_access().status())
+
+
+@dataclass(frozen=True, slots=True)
+class SetRamLighting(Command[RamLightingResult]):
+    """Switch the opt-in RAM-lighting grant on or off.
+
+    The grant lets the user at this seat open the chipset SMBus, where RGB
+    memory's lighting controller answers -- beside the memory's own settings
+    chips, which is why it is never on by default and asks for a password
+    every time.  ``ok`` says whether the asked-for state was reached: a
+    closed password prompt changes nothing and answers ``ok=False``.
+    """
+    #: Answers when the person types the password or closes the prompt.
+    WAITS_ON_USER: ClassVar[bool] = True
+    enabled: bool
+
+    def execute(self, app: App) -> RamLightingResult:
+        log.info("SetRamLighting: %s", "on" if self.enabled else "off")
+        access = app.platform.ram_access()
+        status = access.enable() if self.enabled else access.disable()
+        reached = (status.state in (RamAccessState.ON, RamAccessState.ELSEWHERE)
+                   if self.enabled else
+                   status.state not in (RamAccessState.ON,
+                                        RamAccessState.NOT_APPLIED))
+        if not reached:
+            log.warning("SetRamLighting: still %s -- %s", status.state.value,
+                        status.message)
+        app.events.publish(RamLightingChanged(state=status.state))
+        return _ram_lighting_result(status, ok=reached)
+
+
 @dataclass(frozen=True, slots=True)
 class ListLedStyles(Query[LedStylesListResult]):
     """Enumerate every LED style the PM registry can resolve."""
@@ -1067,7 +1297,12 @@ class LedSnapshot(Query[LedSnapshotResult]):
 
     def execute(self, app: App) -> LedSnapshotResult:
         log.debug("execute: app=%s", app)
+        from ...services.led_segment import get_display
         s = app.settings.for_led(self.key)
+        # The connected panel's segment total, from the same source as
+        # ListLedStyles.  It was the length of a per-segment list nothing filled,
+        # so a fresh device reported "segments 0".
+        display = get_display(_style_of(app, self.key))
         return LedSnapshotResult(
             ok=True, key=self.key,
             mode=s.mode.name,
@@ -1081,14 +1316,13 @@ class LedSnapshot(Query[LedSnapshotResult]):
             zone_sync_interval_ticks=s.zone_sync_interval_ticks,
             selected_zone=s.selected_zone,
             zone_count=len(s.zones),
-            segment_count=len(s.segment_on),
+            segment_count=display.mask_size if display is not None else 0,
             zones=tuple(
                 LedZoneEntry(mode=z.mode.name, color=z.color,
                              brightness=z.brightness, on=z.on)
                 for z in s.zones
             ),
             zone_sync_zones=tuple(s.zone_sync_zones),
-            segment_on=tuple(s.segment_on),
             clock_24h=s.clock_24h,
             week_sunday=s.week_sunday,
             memory_ratio=s.memory_ratio,

@@ -19,12 +19,13 @@ Two rules follow, and ``tests/test_ui_bus.py`` gates both:
 
 The CLI is absent on purpose.  It is the **router**, not a leaf face: it
 composes lazily per subcommand (``_ctx.get_app()``), so putting it through
-``compose() -> run(app)`` would build an App it discards — and under
-``TRCC_DAEMON=1`` would spawn a daemon that a ``trcc --help`` never needed.
+``compose() -> run(app)`` would build an App it discards — and would find
+or start the shared App, which a ``trcc --help`` never needed.
 """
 from __future__ import annotations
 
 import logging
+import threading
 from typing import TYPE_CHECKING, Any
 
 from ._base import UserInterface
@@ -32,11 +33,13 @@ from ._base import UserInterface
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    import uvicorn
     from PySide6.QtWidgets import QWidget
 
     from ..app import App
     from ..core.ports import Platform, Renderer
-    from ..ipc import SingleInstance
+    from ..core.results import ApiTlsResult
+    from ..ipc import AppLock, IPCServer, SingleInstance
 
     # ``TYPE_CHECKING`` only: these names cost NOTHING at runtime, so the
     # module stays light while the faces keep real types.  A ``type: ignore``
@@ -46,24 +49,25 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-class ApiUI(UserInterface, name="api"):
+class ApiUI(UserInterface, key="api"):
     """The REST API — a headless server face.
 
-    ``needs_session`` is **False**, which preserves today's behaviour exactly:
-    the API brings up no coldplug and no live loops (measured — it dispatches
-    neither ``start_session`` nor ``discover_and_connect`` anywhere).
-    ``App.start_session``'s own docstring calls that out as the #148
-    divergence, and flipping it here would change what the API does to USB on
-    startup.  That is a behavioural fix and belongs in its own increment where
-    it can be verified against a real fleet, not folded into a structural one.
+    It runs a session like every other long-lived UI: coldplug, hotplug, the
+    live loops, and the session prime that shows a panel's saved display on
+    connect.  It used to be the one exception (``needs_session = False``),
+    which is #148: a panel served by the API stayed blank until a caller
+    happened to poll ``/tick``, and ``/tick`` restored the theme on every poll
+    to make up for it.
     """
 
-    needs_session = False
-
-    def __init__(self, *, host: str = "127.0.0.1", port: int = 8080) -> None:
-        log.info("ApiUI.__init__: host=%s port=%d", host, port)
+    def __init__(self, *, host: str = "127.0.0.1", port: int = 8080,
+                 tls: ApiTlsResult | None = None) -> None:
+        log.info("ApiUI.__init__: host=%s port=%d tls=%s", host, port,
+                 tls is not None)
         self.host = host
         self.port = port
+        self.tls = tls
+        self._server: uvicorn.Server | None = None
 
     def compose(self, platform: Platform | None) -> App:
         """Headless composition: the API renders preview frames, has no widgets."""
@@ -78,12 +82,40 @@ class ApiUI(UserInterface, name="api"):
         import uvicorn
 
         from .api.main import build_app
-        uvicorn.run(build_app(trcc=self._app), host=self.host, port=self.port,
-                    log_level="info")
+        # log_config=None: uvicorn's default config goes through dictConfig,
+        # which CLOSES every handler already attached — ours included, while
+        # leaving them on the root logger.  Every record after this line was
+        # dropped, so no API request ever reached ``trcc report``'s file.
+        # access_log=False: each route logs its own entry (params sanitized);
+        # a second line per request would let a ``/tick`` poller rotate the
+        # diagnosis out of the file within hours.
+        # ssl_* None is uvicorn's own "plain HTTP" — no branch needed here.
+        # A Server we hold, not ``uvicorn.run``: :meth:`stop` must reach it.
+        self._server = server = uvicorn.Server(uvicorn.Config(
+            build_app(trcc=self), host=self.host, port=self.port,
+            log_level="info", log_config=None, access_log=False,
+            ssl_certfile=self.tls and self.tls.cert,
+            ssl_keyfile=self.tls and self.tls.key))
+        if self._stop_requested:
+            log.info("ApiUI.run: stopped before serving")
+            return 0
+        server.run()
+        if not server.started:
+            # ``uvicorn.run``'s own verdict: it exits 3 when startup failed --
+            # a port in use, a bad certificate.
+            log.error("ApiUI.run: the server never started on %s:%d",
+                      self.host, self.port)
+            return 3
         return 0
 
+    def stop(self) -> None:
+        """Ask uvicorn to finish: it checks ``should_exit`` every tick."""
+        log.info("ApiUI.stop: server=%s", self._server is not None)
+        if self._server is not None:
+            self._server.should_exit = True
 
-class DaemonUI(UserInterface, name="daemon"):
+
+class DaemonUI(UserInterface, key="daemon"):
     """The background process that owns USB and serves every other face.
 
     A UI like the others -- "daemon should be a command that any ui can
@@ -94,6 +126,9 @@ class DaemonUI(UserInterface, name="daemon"):
     def __init__(self, *, renderer: Renderer | None = None) -> None:
         log.info("DaemonUI.__init__: renderer=%s", renderer is not None)
         self._renderer = renderer
+        self._server: IPCServer | None = None
+        self._lock: AppLock | None = None
+        self._serving: threading.Thread | None = None
 
     def preflight(self) -> int | None:
         """Refuse to start if another daemon already owns the socket.
@@ -111,6 +146,14 @@ class DaemonUI(UserInterface, name="daemon"):
             log.warning("DaemonUI.preflight: another daemon already owns %s",
                         ipc.socket_path())
             return 1
+        # The socket says nothing while an App is still starting; the lock
+        # does, so two Apps launched together cannot both own USB (#314).
+        lock = ipc.AppLock()
+        if not lock.acquire():
+            log.warning("DaemonUI.preflight: another App is starting — "
+                        "this one exits")
+            return 1
+        self._lock = lock
         from ..daemon import mark_started
         mark_started()
         return None
@@ -133,26 +176,64 @@ class DaemonUI(UserInterface, name="daemon"):
         os.environ.pop(_ENV_FLAG, None)
         return _build_local_app(platform=platform, renderer=self._renderer)
 
+    def bring_up(self) -> bool:
+        """Serve FIRST, then coldplug.
+
+        Bound after the coldplug -- every handshake, the video prime -- the
+        socket did not exist for as long as that took, and a UI gave up after
+        10 s and built an App of its own: two owners of one panel (#314).  A
+        Command that arrives mid-coldplug waits on the App's connect lock; a
+        Query answers from what is connected so far.
+        """
+        from .. import ipc
+        self._server = server = ipc.IPCServer(self._app)
+        if self._stop_requested:
+            log.info("DaemonUI.bring_up: stopped before the server bound")
+            return True
+        server.start()
+        self._serving = threading.Thread(target=server.serve_forever,
+                                         name="trcc-ipc-serve", daemon=True)
+        self._serving.start()
+        log.info("DaemonUI.bring_up: serving %s before the coldplug",
+                 ipc.socket_path())
+        try:
+            return super().bring_up()
+        except BaseException:
+            server.shutdown()
+            raise
+
     def run(self) -> int:
-        """Bind the socket and serve Commands until shutdown.
+        """Serve Commands until shutdown (the server began in bring_up).
 
         ``App.close()`` is NOT called here: :meth:`UserInterface.start` owns
         it.  Closing in both places ran the whole detach-and-blank sequence
         twice -- the same double-teardown the GUI window had removed once
         already.
         """
-        log.info("DaemonUI.run: binding the IPC server")
-        from .. import ipc
-        from ..daemon import _install_signal_handlers
-        server = ipc.IPCServer(self._app)
-        server.start()
-        _install_signal_handlers(server)
+        log.info("DaemonUI.run: serving until shutdown")
+        server, serving = self._server, self._serving
         try:
-            server.serve_forever()
+            # A timed join, so a stop signal still runs on this main thread.
+            while serving is not None and serving.is_alive():
+                serving.join(0.5)
         finally:
-            server.shutdown()
+            if server is not None:
+                server.shutdown()
         log.info("DaemonUI.run: served to completion")
         return 0
+
+    def teardown(self) -> None:
+        """Drop the one-App lock once this App has closed."""
+        log.info("DaemonUI.teardown: releasing the App lock")
+        if self._lock is not None:
+            self._lock.release()
+            self._lock = None
+
+    def stop(self) -> None:
+        """Stop serving: flip the server's flag and wake its accept loop."""
+        log.info("DaemonUI.stop: server=%s", self._server is not None)
+        if self._server is not None:
+            self._server.shutdown()
 
 
 class _QtUI(UserInterface):
@@ -168,39 +249,58 @@ class _QtUI(UserInterface):
         from .qapp import build_qt_app
         return build_qt_app(platform)
 
-    @staticmethod
-    def _install_quit_handlers() -> None:
-        """SIGINT / SIGTERM must reach the Qt loop, or teardown never runs.
+    def stop(self) -> None:
+        """Queue an exit for the Qt loop -- and for any loop nested in it.
 
-        SIGTERM is what the session manager sends at PC shutdown.  Without a
-        handler the process dies before ``qapp.exec()`` returns, the cleanup
-        never happens, and the panel is left mid-stream showing its last frame
-        (#143).
+        Queued, not called: it is honoured the moment a loop runs.  One that
+        lands before :meth:`_exec` ends whatever nested loop is up -- a modal,
+        the splash (which then waits out its coldplug) -- and
+        :meth:`UserInterface.start` reads the flag instead.
         """
-        import signal
-
+        from PySide6.QtCore import Q_ARG, QMetaObject, Qt
         from PySide6.QtWidgets import QApplication
+        qapp = QApplication.instance()
+        log.info("%s.stop: queueing exit (qapp=%s)", type(self).__name__,
+                 qapp is not None)
+        if qapp is not None:
+            # From any thread: the App's stop notice arrives on the proxy's
+            # watcher thread, where a QTimer would never fire.  ``exit``, not
+            # ``quit``: Qt 6 lets a window REFUSE a quit, and an open modal
+            # did -- "devices did not connect" stayed up and the face with it
+            # (driven 2026-10-07: quit ignored, exit ended it in 0.5 s).
+            QMetaObject.invokeMethod(qapp, "exit",
+                                     Qt.ConnectionType.QueuedConnection,
+                                     Q_ARG(int, 0))
 
-        def _quit(*_args: object) -> None:
-            log.info("_install_quit_handlers: quit signal — stopping the loop")
-            qapp = QApplication.instance()
-            if qapp is not None:
-                qapp.quit()
+    def announce(self, text: str) -> None:
+        """Show *text* the way the window shows any error, once it is up.
 
-        signal.signal(signal.SIGINT, _quit)
-        signal.signal(signal.SIGTERM, _quit)
+        Queued to the event loop: the window that displays it is built in
+        :meth:`run`, after this is called.
+        """
+        from functools import partial
 
-    @staticmethod
-    def _exec() -> int:
-        """Run the Qt event loop to completion."""
+        from PySide6.QtCore import QTimer
+
+        from ..core.events import ErrorOccurred
+        log.warning("%s.announce: %s", type(self).__name__, text)
+        QTimer.singleShot(0, partial(self.events.publish,
+                                     ErrorOccurred(message=text, kind="app")))
+
+    def _exec(self) -> int:
+        """Run the Qt event loop to completion -- unless a stop came first."""
         from PySide6.QtWidgets import QApplication
         qapp = QApplication.instance()
         assert qapp is not None, "compose() must have built a QApplication"
+        if self._stop_requested:
+            log.info("_exec: stopped while the window was built — not entering "
+                     "the Qt event loop")
+            return 0
         log.info("_exec: entering the Qt event loop")
         return qapp.exec()
 
 
-class GuiUI(_QtUI, name="gui"):
+class GuiUI(_QtUI, key="gui"):
     """The shipping GUI — legacy chrome, one window, single-instance."""
 
     def __init__(self, *, decorated: bool = False, start_hidden: bool = False,
@@ -226,9 +326,12 @@ class GuiUI(_QtUI, name="gui"):
             log.info("GuiUI.preflight: single-instance disabled (dev mock)")
             return None
         from ..ipc import SingleInstance
-        self._instance = SingleInstance("gui")
+        # A hidden launch (--resume) leaves a running window as it is.
+        self._instance = SingleInstance("gui", raise_peer=not self.start_hidden)
         if self._instance is None:
-            log.info("GuiUI.preflight: peer GUI raised — exiting cleanly")
+            log.info("GuiUI.preflight: a GUI is already running (%s) — "
+                     "exiting cleanly",
+                     "left hidden" if self.start_hidden else "raised")
             return 0
         return None
 
@@ -245,7 +348,16 @@ class GuiUI(_QtUI, name="gui"):
         The coldplug runs on a background QThread so the splash can paint
         per-device progress; ``start_session`` afterwards is idempotent and
         skips the coldplug it already did, starting only the loops.
+
+        ``--resume`` (autostart, hidden in the tray) shows no splash: a window
+        flashing up at login is what starting hidden exists to avoid, and the
+        C# never shows one at all (``FormStart`` is hidden 1 ms after it is
+        shown, ``Form1.cs:519-521``).  The shared bring-up does the same
+        coldplug inline.
         """
+        if self.start_hidden:
+            log.info("GuiUI.bring_up: --resume — no splash")
+            return super().bring_up()
         log.info("GuiUI.bring_up: splash bootstrap")
         from .gui.splash import run_bootstrap_with_splash
         if not run_bootstrap_with_splash(self._app):
@@ -257,12 +369,7 @@ class GuiUI(_QtUI, name="gui"):
         from ..core.commands import DeviceConnectionIssues
         from .gui.trcc_app import TRCCApp
 
-        if self._platform is None:
-            raise RuntimeError(
-                "GuiUI needs the host Platform it was started with: the "
-                "window's screen capture belongs to the window's session")
-        window = TRCCApp(app=self._app, platform=self._platform,
-                         decorated=self.decorated)
+        window = TRCCApp(app=self, decorated=self.decorated)
         if self._instance is not None:
             # Fired from SingleInstance's accept thread; the Qt signal marshals
             # it onto the GUI thread (a direct cross-thread QWidget call
@@ -271,7 +378,6 @@ class GuiUI(_QtUI, name="gui"):
         window.replay_initial_devices()
         if self.on_ready is not None:
             self.on_ready(window)
-        self._install_quit_handlers()
         if not self.start_hidden:
             window.show()
             # Surface devices found but not connected, read from the bus: the
@@ -289,7 +395,7 @@ class GuiUI(_QtUI, name="gui"):
             self._instance = None
 
 
-class QtGuiUI(_QtUI, name="qtgui"):
+class QtGuiUI(_QtUI, key="qtgui"):
     """The native-skin rebuild.  No single-instance lock — it never had one."""
 
     def __init__(self, *, start_hidden: bool = False,
@@ -305,15 +411,17 @@ class QtGuiUI(_QtUI, name="qtgui"):
         Inline rather than on a worker (the gui's shape): one handshake per
         attached device is fast, and doing it first means the pickers and
         browsers populate at construction instead of booting blank.
+        ``--resume`` shows no splash, for the gui's reason.
         """
-        log.info("QtGuiUI.bring_up: splash + session")
-        from PySide6.QtWidgets import QApplication
+        log.info("QtGuiUI.bring_up: splash=%s + session", not self.start_hidden)
+        if not self.start_hidden:
+            from PySide6.QtWidgets import QApplication
 
-        from .qtgui.splash import show_splash
-        self._splash = show_splash()
-        qapp = QApplication.instance()
-        if qapp is not None:
-            qapp.processEvents()
+            from .qtgui.splash import show_splash
+            self._splash = show_splash()
+            qapp = QApplication.instance()
+            if qapp is not None:
+                qapp.processEvents()
         return super().bring_up()
 
     def run(self) -> int:
@@ -321,7 +429,7 @@ class QtGuiUI(_QtUI, name="qtgui"):
         from .qtgui.app import MainWindow
         from .qtgui.splash import auto_close
 
-        window = MainWindow(self._app)
+        window = MainWindow(self)
         if self.start_hidden:
             log.info("QtGuiUI.run: --resume — starting hidden in the tray")
         else:
@@ -331,47 +439,32 @@ class QtGuiUI(_QtUI, name="qtgui"):
             self._splash = None
         if self.on_ready is not None:
             self.on_ready(window)
-        self._install_quit_handlers()
         return self._exec()
 
 
-class CliUI(UserInterface, name="cli"):
-    """The terminal face — and the router that launches the others.
+class CliUI(UserInterface, key="cli"):
+    """The terminal face.  ``_ctx.get_app()`` returns one, so every CLI command
+    body dispatches through it and the log reads ``[cli] dispatch …``.
 
-    The CLI is both, which is why it was left out of the registry at first:
-    ``trcc gui`` is this process starting a DIFFERENT face, while
-    ``trcc device list`` is this face doing its own work.  Being the launcher
-    does not stop it being a UI, and leaving it out made "every UI is a
-    ``UserInterface``" false for the surface users touch most.
-
-    What kept it out was cost, and lazy composition removed it.  Measured,
-    ``trcc --help`` builds **zero** Apps in 65 ms; composing eagerly in
-    :meth:`start` would have added a platform scan plus a 111 ms
-    ``QtRenderer`` to every ``--help`` and every text command.  Now nothing is
-    composed until something dispatches, so joining the bus costs a ``--help``
-    exactly nothing.
+    The CLI does NOT run :meth:`start`: a one-shot command must leave its
+    frame on the panel, and ``start`` ends in ``App.close``, which sleeps every
+    connected panel — ``trcc color`` would blank the colour it just sent.
+    ``_entry`` hands argv straight to Typer, so :meth:`run` is unused.
 
     ``needs_session`` is **False**: a one-shot command must not pay for a
-    coldplug it will never use — ``App.start_session``'s own docstring says
-    one-shot scripts skip it.  A command that does need a device asks for one
-    explicitly through ``EnsureConnected``.
+    coldplug it will never use.  A Command that needs a device connects it
+    in ``App.dispatch`` (``USES_DEVICE``).
     """
 
     needs_session = False
 
     def compose(self, platform: Platform | None) -> App:
-        """The SAME lazy singleton the command bodies already use.
-
-        ``_ctx.get_app()`` is ``@lru_cache``'d and read by 113 command bodies.
-        Returning it here means this face and those bodies share ONE App
-        rather than composing a second one behind their backs — the bus is a
-        different door onto the same object, not a parallel world.
-        """
-        log.info("CliUI.compose: reusing the CLI's lazy App singleton")
-        from .cli._ctx import get_app, set_platform
+        """The CLI's App, from the overrides the tests and harnesses set."""
+        log.info("CliUI.compose: composing the CLI's App")
+        from .cli._ctx import compose_app, set_platform
         if platform is not None:
             set_platform(platform)
-        return get_app()
+        return compose_app()
 
     def run(self) -> int:
         """Parse argv and run one command.  Typer owns the exit code."""

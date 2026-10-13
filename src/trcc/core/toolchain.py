@@ -79,6 +79,20 @@ def resolve(tool: str) -> str | None:
     return None
 
 
+def executable(tool: str) -> str:
+    """``argv[0]`` for *tool*: the name that provides it here, else its own.
+
+    The fallback keeps a missing tool failing the way it always has — the
+    caller's ``OSError`` handler sees "no such file" for ``ffmpeg`` — while a
+    machine that only has ``ffmpeg7`` runs ``ffmpeg7``.  An argv that starts
+    with the literal name instead works only where the unversioned binary
+    exists, which is why ``tests/test_toolchain.py`` refuses one.
+    """
+    found = resolve(tool)
+    log.debug("toolchain.executable: %s -> %s", tool, found or tool)
+    return found or tool
+
+
 #: Directories a binary plausibly lives in while PATH does not include it.
 #:
 #: This is the difference between "install it" and "you already have it".  A
@@ -130,6 +144,23 @@ def tried(tool: str) -> str:
     names = ", ".join(TOOL_ALIASES.get(tool, (tool,)))
     log.debug("toolchain.tried: %s -> %s", tool, names)
     return names
+
+
+def generic_install_hint(tool: str) -> str:
+    """The hint when no platform is at hand to name the package."""
+    log.debug("toolchain.generic_install_hint: %s", tool)
+    return f"install {tool} with your system's package manager"
+
+
+def missing(tool: str, hint: str) -> str:
+    """The one message for a tool that is not installed: what was looked
+    for, then how to get it -- *hint* is the platform's own
+    (``Platform.software_install_hint``), so it is right per OS and distro.
+    Four copies told every OS to run a Fedora package command, for a
+    package stock Fedora does not even ship."""
+    message = f"{tool} not found on PATH (looked for: {tried(tool)}) — {hint}"
+    log.debug("toolchain.missing: %s", message)
+    return message
 
 
 def installed_elsewhere(distribution: str) -> str | None:

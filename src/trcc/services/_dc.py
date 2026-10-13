@@ -17,17 +17,33 @@ Three classes live here:
 from __future__ import annotations
 
 import logging
+import re
 import struct
 from pathlib import Path
 from typing import Any
 
 from ..core.errors import ThemeError
-from ..core.models import DATE_FORMATS, METRICS, DisplaySource
+from ..core.logs import Blob, per_frame
+from ..core.models import (
+    DATE_FORMATS,
+    METRICS,
+    TIME_FORMATS,
+    DisplaySource,
+    default_metric_format,
+    format_index,
+)
 
 log = logging.getLogger(__name__)
+frame_log = per_frame(__name__)
 
 
 _MAGIC_DC = 0xDC
+
+#: A metric the DC pair table cannot name, carried in the element's text.
+#: Only a sensor id is ever read back -- never a format (see
+#: ``default_metric_format``).
+_TRCC_TAG = "trcc:"
+_TRCC_TAGGED = re.compile(r"trcc:([a-z0-9_.\-]+(?::[a-z0-9_.\-]+)+)")
 _MAGIC_DD = 0xDD
 _FONT_SLOTS = 13
 _ELEMENT_SLOTS = 13
@@ -68,8 +84,10 @@ _TRAILER_HEAD: tuple[tuple[str, Any], ...] = (
 )
 _TRAILER_TAIL: tuple[tuple[str, Any], ...] = (
     ("display_source", 0),               # myMode      → DisplaySource
-    ("screencast_border", False),        # myYcbk      buttonXSBK — show border
-    ("screencast_rect", (0, 0, 0, 0)),   # JpX JpY JpW JpH
+    # myYcbk is HIDE the region frame (C# default True, FormCZTV.cs:316); the
+    # key keeps its old name so saved themes still load.
+    ("screencast_border", True),         # myYcbk      buttonXSBK — HIDE border
+    ("screencast_rect", (0, 0, 240, 320)),  # JpX JpY JpW JpH (C# default)
     ("mask_visible", False),             # myMbxs      蒙版显示 — mask
     ("mask_position", (0, 0)),           # XvalMB YvalMB
 )
@@ -130,9 +148,12 @@ def _sensor_to_hw() -> dict[str, tuple[int, int]]:
     log.debug("_sensor_to_hw")
     global _SENSOR_TO_HW
     if _SENSOR_TO_HW is None:
-        _SENSOR_TO_HW = {
-            sensor: pair for pair, (sensor, _fmt) in _HW_TO_SENSOR.items()
-        }
+        # From the CANONICAL pairs only.  An alias reads as its sensor, but is
+        # never what that sensor is WRITTEN as: inverting every pair let the
+        # Fan-LCD sentinel (10000, 1) win for fan:cpu, so each saved CPU-fan
+        # element became the cooler's own fan -- blank in the C# on any panel
+        # that is not a fan LCD.
+        _SENSOR_TO_HW = {METRICS[pair].sensor_id: pair for pair in METRICS}
     return _SENSOR_TO_HW
 
 
@@ -312,36 +333,36 @@ class _Reader:
     __slots__ = ("data", "pos")
 
     def __init__(self, data: bytes, start: int) -> None:
-        log.debug("__init__: data=%s start=%s", data, start)
+        log.debug("__init__: data=%s start=%s", Blob(data), start)
         self.data = data
         self.pos = start
 
     def read_int32(self) -> int:
-        log.debug("read_int32")
+        frame_log.debug("read_int32")
         val = struct.unpack_from("<i", self.data, self.pos)[0]
         self.pos += 4
         return val
 
     def read_bool(self) -> bool:
-        log.debug("read_bool")
+        frame_log.debug("read_bool")
         val = self.data[self.pos] != 0
         self.pos += 1
         return val
 
     def read_byte(self) -> int:
-        log.debug("read_byte")
+        frame_log.debug("read_byte")
         val = self.data[self.pos]
         self.pos += 1
         return val
 
     def read_float(self) -> float:
-        log.debug("read_float")
+        frame_log.debug("read_float")
         val = struct.unpack_from("<f", self.data, self.pos)[0]
         self.pos += 4
         return val
 
     def read_string(self) -> str:
-        log.debug("read_string")
+        frame_log.debug("read_string")
         if self.pos >= len(self.data):
             return ""
         length = self.data[self.pos]
@@ -424,7 +445,7 @@ def _read_run(r: _Reader, run: tuple[tuple[str, Any], ...],
             into[key] = [r.read_int32() for _ in default]
         else:
             into[key] = r.read_int32()
-    log.debug("_read_run: %s",
+    frame_log.debug("_read_run: %s",
               {key: into[key] for key, _ in run})
 
 
@@ -433,7 +454,9 @@ def _write_run(w: _Writer, run: tuple[tuple[str, Any], ...],
     """Write one declared run, padding a short tuple with its default.
 
     A field must occupy its full width or every byte after it shifts, so a
-    config carrying a 3-int ``screencast_rect`` still writes four.
+    config carrying a 3-int ``screencast_rect`` still writes four -- the
+    missing ones from the SAME positions of the default.  It took the
+    default's head, which only went unnoticed while every default was zero.
     """
     log.debug("_write_run: %s",
               {key: config.get(key, default) for key, default in run})
@@ -442,7 +465,7 @@ def _write_run(w: _Writer, run: tuple[tuple[str, Any], ...],
         if isinstance(default, bool):
             w.write_bool(bool(value))
         elif isinstance(default, tuple):
-            for item in (*value, *default)[:len(default)]:
+            for item in (*value, *default[len(value):])[:len(default)]:
                 w.write_int32(int(item))
         else:
             w.write_int32(int(value))
@@ -588,13 +611,10 @@ def _parse_dc(data: bytes, theme_name: str) -> dict[str, Any]:
         flag_clock_master = r.read_bool()
         flag_date = r.read_bool()
         flag_time = r.read_bool()
-        # The DC stores the date/time format the theme was DESIGNED for —
-        # honour it (legacy kept it as the element's mode_sub) instead of
-        # forcing the global yyyy/MM/dd default.  Date maps cleanly to a
-        # strftime pattern; time keeps the global path (its 12h handling is
-        # not a bare strftime — see resolve_clock).
+        # The DC stores the date and time format the theme was DESIGNED for,
+        # per element as the C#'s myModeSub -- each clock draws in its own.
         date_format_idx = r.read_int32()
-        time_format_idx = r.read_int32()  # noqa: F841 — time stays global
+        time_format_idx = r.read_int32()
         date_x = r.read_int32()
         date_y = r.read_int32()
         time_x = r.read_int32()
@@ -616,6 +636,8 @@ def _parse_dc(data: bytes, theme_name: str) -> dict[str, Any]:
             if flag_time:
                 elements.append({
                     "type": "clock", "source": "time",
+                    "format": TIME_FORMATS.get(time_format_idx,
+                                               TIME_FORMATS[0]),
                     "x": time_x, "y": time_y, **time_font,
                 })
             if flag_weekday:
@@ -684,7 +706,7 @@ def _parse_dd(data: bytes, theme_name: str) -> dict[str, Any]:
 
 
 def _read_dd_font(r: _Reader) -> dict[str, Any]:
-    log.debug("_read_dd_font: r=%s", r)
+    frame_log.debug("_read_dd_font: r=%s", r)
     name = r.read_string() or _DEFAULT_FONT_NAME
     size = _clamp_font_size(r.read_float())
     style = r.read_byte()
@@ -719,6 +741,9 @@ def _build_dd_element(
     match mode:
         case 0:
             entry = _HW_TO_SENSOR.get((main_count, sub_count))
+            if entry is None and (tag := _TRCC_TAGGED.fullmatch(custom_text)):
+                entry = (tag[1], default_metric_format(tag[1]))
+                log.info("0xDD HARDWARE element: trcc tag -> %s", tag[1])
             if entry is None:
                 log.debug(
                     "0xDD HARDWARE element (%d, %d) has no sensor mapping; skipping",
@@ -737,12 +762,19 @@ def _build_dd_element(
                 return None
             return {**base, "type": "text", "text": custom_text}
         case 1:
-            return {**base, "type": "clock", "source": "time"}
+            return {**base, "type": "clock", "source": "time",
+                    "format": TIME_FORMATS.get(mode_sub, TIME_FORMATS[0])}
         case 2:
             return {**base, "type": "clock", "source": "weekday"}
         case 3:
             return {**base, "type": "clock", "source": "date",
                     "format": DATE_FORMATS.get(mode_sub, DATE_FORMATS[0])}
+        case 5:
+            # The C#'s icon/shortcut element (UCShortcut).  Not ported: 0 of
+            # 9809 0xDD files on disk carry one -- named so a report says so.
+            log.debug("0xDD: icon element (C# mode 5, UCShortcut) at (%d, %d) "
+                      "is not supported; skipping", x, y)
+            return None
         case _:
             log.debug("0xDD: unknown element mode %d; skipping", mode)
             return None
@@ -752,7 +784,7 @@ def _clamp_font_size(raw: float, default: float = 24.0) -> float:
     # Theme fonts span ~8 px labels up to the panel's hero number (the 001-series
     # temperature is authored at 128).  Only reject values a misaligned/garbage
     # read produces (NaN, negative, or absurdly large); everything else is real.
-    log.debug("_clamp_font_size: raw=%s default=%s", raw, default)
+    frame_log.debug("_clamp_font_size: raw=%s default=%s", raw, default)
     if 8.0 <= raw <= 512.0:
         return raw
     return default
@@ -818,16 +850,29 @@ def _element_to_legacy(
         return (_MODE_CUSTOM, 0, 0, 0, str(element.get("text", "")))
     if kind == "metric":
         sensor = str(element.get("metric", ""))
-        main_c, sub_c = _sensor_to_hw().get(sensor, (0, 0))
-        return (_MODE_HARDWARE, 0, main_c, sub_c, "")
+        show_unit = int(bool(element.get("show_unit", True)))
+        # mode_sub is the unit-switch the reader turns into show_unit; writing
+        # 0 dropped it, so every exported metric came back without its unit.
+        if (pair := _sensor_to_hw().get(sensor)) is not None:
+            return (_MODE_HARDWARE, show_unit, *pair, "")
+        # No DC pair names it (a board probe, a voltage, one DIMM).  It was
+        # written as (0, 0) and dropped on read, so a user mask lost the
+        # element at the next ApplyMask.  The id rides in the element's text:
+        # the C# draws label2 for a mode-0 element, never myText
+        # (UCScreenImage.cs:1130, FormLCD.cs:572), and (0, 0) leaves label2
+        # empty, so Windows shows nothing there and writes the text back.
+        log.warning("_element_to_legacy: no DC pair for %r -- kept as a trcc "
+                    "tag; the Windows app draws nothing for it", sensor)
+        return (_MODE_HARDWARE, show_unit, 0, 0, f"{_TRCC_TAG}{sensor}")
     if kind == "clock":
-        source = element.get("source", "time")
-        mode = {
-            "time": _MODE_TIME,
-            "weekday": _MODE_WEEKDAY,
-            "date": _MODE_DATE,
-        }.get(source, _MODE_TIME)
-        return (mode, 0, 0, 0, "")
+        mode, table = {
+            "time": (_MODE_TIME, TIME_FORMATS),
+            "weekday": (_MODE_WEEKDAY, {}),
+            "date": (_MODE_DATE, DATE_FORMATS),
+        }.get(element.get("source", "time"), (_MODE_TIME, TIME_FORMATS))
+        # The element's own format, as the C# writes myModeSub per element.
+        return (mode, format_index(table, str(element.get("format", ""))),
+                0, 0, "")
     return (_MODE_CUSTOM, 0, 0, 0, "")
 
 

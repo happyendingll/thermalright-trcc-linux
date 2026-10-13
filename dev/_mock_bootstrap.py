@@ -6,8 +6,9 @@ The post-cutover ``Platform`` port is the only seam we need.
 ``DevPlatform`` subclasses the host's production platform (just
 ``LinuxOS`` here — Mac/Windows/BSD can extend later) and overrides
 only ``paths()`` to point at the dev directories.  Real USB, real
-sensors, real autostart — same code paths a packaged install runs, just
-isolated to a throwaway data root.
+sensors -- same code paths a packaged install runs, just isolated to a
+throwaway data root.  Autostart runs the real XDG adapter code with its entry
+kept under ``dev/.trcc/`` (``_SandboxedAutostart``).
 
 For a hardware-less smoke (CI, ergonomics dev box without a real LCD),
 plug in ``FakePlatform`` from ``tests/conftest.py`` instead — the
@@ -17,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -24,16 +26,31 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from trcc.core.models import DeviceInfo, Wire
     from trcc.core.ports import (
+        AutostartManager,
         BulkTransport,
         HotplugMonitor,
+        HttpFetcher,
         Platform,
+        RamAccess,
         ScsiTransport,
+        SmBus,
     )
 
+from _refuse import refuse_while_trcc_runs
+
 # Make src/ importable without requiring the caller to set PYTHONPATH.
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / 'src'))
 sys.path.insert(0, str(_REPO_ROOT))
+
+# Dev mocks build their App IN-PROCESS.  The dev platforms are stand-ins
+# (``_boot._stand_in``: not this host's own class), which is what keeps them
+# local whatever the shell exports; this default covers the paths that hand
+# ``trcc()`` no platform at all.  (It used to say smoke_daemon_gui sets
+# TRCC_DAEMON=1 itself -- it does not: it pops the variable for its child and
+# builds its own AppProxy against a private runtime dir.)
+os.environ.setdefault("TRCC_DAEMON", "0")
 
 
 # ─── Dev paths (every mock_* script writes here, not ~/.trcc) ────────────────
@@ -114,6 +131,20 @@ def load_device_specs(report_path: str | None = None) -> list[dict]:
 # Default discreteness per vendor.  Intel is the CPU's integrated graphics;
 # nvidia/amd are add-in cards unless told otherwise.
 _GPU_DISCRETE_DEFAULT = {"nvidia": True, "amd": True, "intel": False}
+
+
+def _pop_online_flag() -> bool:
+    """Pull ``--online`` out of argv: let this dev run reach the network.
+
+    Offline is the default.  The App's downloads -- the update check at the
+    gui's startup and every hour, the data archives on each auto-connect, the
+    dev console's prefetch of every resolution -- used to run on every mock
+    launch, unasked.  Popped in :func:`bootstrap` like ``--gpus``.
+    """
+    if "--online" not in sys.argv:
+        return False
+    sys.argv.remove("--online")
+    return True
 
 
 def _pop_gpu_flag() -> str | None:
@@ -209,7 +240,7 @@ def variant_resolution(wire: Wire, pm: int, sub: int) -> tuple[int, int]:
     Bulk is the reason this function exists.  Resolving it as
     ``get_profile(pm_to_fbl(pm, sub), pm)`` — which is what this module used
     to do — disagrees with the shipping path for every square bulk cooler:
-    :func:`bulk_profile` diverts any PM outside ``_BULK_KNOWN_PMS`` to the
+    :func:`bulk_profile` diverts any PM outside ``in_pm_ladder`` to the
     480x480 base *precisely so* an unknown PM is not echoed into
     ``get_profile`` as a bogus FBL.  Skipping it mocked GRAND VISION, CORE
     VISION, HYPER VISION and PA120 at 320x320 while the app drove them at
@@ -281,12 +312,11 @@ def _fingerprint_is_catalogued(wire: Wire, pm: int, sub: int) -> bool:
     bulk is the one wire with its own fallback (unknown PM → FBL 72), so it is
     asked its own question.
     """
-    from trcc.adapters.device.bulk_lcd import _BULK_KNOWN_PMS
     from trcc.core.models import Wire as _W
-    from trcc.core.protocol import FBL_PROFILES, pm_to_fbl
+    from trcc.core.protocol import FBL_PROFILES, in_pm_ladder, pm_to_fbl
 
     if wire is _W.BULK:
-        return pm in _BULK_KNOWN_PMS or (pm == 1 and sub in (48, 49))
+        return in_pm_ladder(pm, sub)
     return pm_to_fbl(pm, sub) in FBL_PROFILES
 
 
@@ -366,19 +396,68 @@ def all_variant_specs() -> list[dict]:
 
 # ─── DevPaths / DevPlatform — production Platform with paths redirected ──────
 
-def _build_dev_platform(specs: list[dict] | None = None) -> Platform:
+class _NoRealSetup:
+    """A dev run never performs the host's real one-time setup.
+
+    On Linux that re-executes under sudo with THIS checkout's ``src/`` first
+    on root's path, writes ``/etc/udev/rules.d`` and ``/etc/modprobe.d``,
+    loads modules, and pip-installs GPU extras into whichever interpreter
+    runs the mock.  The dry run only reads, so it stays the real one.  Placed
+    before the host class, so ``super()`` is the host's own ``setup``.
+    """
+
+    def setup(self, dry_run: bool = False) -> int:
+        if dry_run:
+            log.info("dev platform: setup dry run — the host's, read-only")
+            return super().setup(dry_run=True)  # type: ignore[misc]
+        log.warning("dev platform: refusing the real setup (sudo, /etc, pip)")
+        print("dev platform: `system setup` writes /etc via sudo and installs "
+              "into this interpreter — run the installed `trcc setup` instead "
+              "(--dry-run is allowed here).")
+        return 1
+
+
+
+class _SandboxedAutostart:
+    """A dev run's login entry lives under ``dev/.trcc/``, never the user's.
+
+    The host's adapter wrote ``~/.config/autostart/trcc.desktop`` -- the
+    user's REAL login item -- and the gui enables or refreshes it on launch,
+    so a dev run with a fresh ``dev/.trcc`` switched the user's autostart back
+    on, or pointed it at this checkout's interpreter.  The XDG adapter is the
+    one used on every host: its enable/disable/refresh cycle still runs for
+    real, into a file nothing logs in from.
+    """
+
+    def _build_autostart(self) -> AutostartManager:
+        from trcc.adapters.system._autostart import XdgDesktopAutostart
+
+        log.info("dev platform: autostart kept under %s", DEV_TRCC)
+        return XdgDesktopAutostart(config_home=DEV_TRCC)
+
+
+def _offline_fetcher() -> HttpFetcher:
+    """A dev platform's network without ``--online``: none."""
+    from trcc.adapters.repo.http import OfflineHttpFetcher
+
+    log.debug("_offline_fetcher: dev run without --online")
+    return OfflineHttpFetcher()
+
+
+def _build_dev_platform(specs: list[dict] | None = None, *,
+                        online: bool = False) -> Platform:
     """Return a Platform rooted at ``dev/.trcc/`` for the host OS.
 
-    Always subclasses the production host Platform so sensors, autostart,
-    setup, distro detection — everything except the filesystem layout — run
-    as the real packaged app does.
+    Always subclasses the production host Platform so sensors, setup and
+    distro detection run as the real packaged app does; the filesystem and
+    the login entry are kept under ``dev/.trcc/``.
 
     * No ``specs`` → ``DevPlatform``: real USB enumeration + real hotplug too.
       "Drive the real GUI against my own hardware without polluting ~/.trcc."
     * ``specs`` → ``DevMockPlatform``: additionally overrides ONLY the USB
       seam (``scan_devices`` + scripted ``open_scsi``/``open_bulk``) and forces
-      Noop hotplug (a simulated fleet has no live attach).  Sensors/autostart/
-      setup/distro stay the real host code, so the mock IS the real app with
+      Noop hotplug (a simulated fleet has no live attach).  Sensors/setup/
+      distro stay the real host code, so the mock IS the real app with
       three methods swapped — which is exactly why it surfaces real bugs.
     """
     from trcc.core.ports import Paths
@@ -404,7 +483,7 @@ def _build_dev_platform(specs: list[dict] | None = None) -> Platform:
             return DEV_TRCC / "trcc.log"
 
     # Pick the host's production Platform impl as the base so sensors +
-    # autostart + setup + distro all work the way the packaged app does.
+    # setup + distro all work the way the packaged app does.
     # Mirrors production launch (ui/gui/__init__.run_gui + _boot).
     from trcc.adapters.system import current_platform
     host = current_platform()
@@ -415,11 +494,14 @@ def _build_dev_platform(specs: list[dict] | None = None) -> Platform:
     dev_paths = DevPaths()
 
     if not specs:
-        class DevPlatform(host_cls):
+        class DevPlatform(_NoRealSetup, _SandboxedAutostart, host_cls):
             """Production host platform with paths redirected to ``dev/.trcc/``."""
 
             def paths(self) -> Paths:
                 return dev_paths
+
+            def http_fetcher(self) -> HttpFetcher:
+                return super().http_fetcher() if online else _offline_fetcher()
 
         return DevPlatform()
 
@@ -428,20 +510,34 @@ def _build_dev_platform(specs: list[dict] | None = None) -> Platform:
     # (tests.mock_platform) so there is exactly one source for it.
     from tests.mock_platform import (
         DeviceSpec,
+        ScriptedAuraController,
+        ScriptedRamAccess,
+        is_aura,
         scripted_bulk_transport,
+        scripted_ram,
         scripted_scsi_transport,
     )
     parsed = [DeviceSpec.parse(s) for s in specs]
     by_key = {sp.key: sp for sp in parsed}
 
-    class DevMockPlatform(host_cls):
+    class DevMockPlatform(_NoRealSetup, _SandboxedAutostart, host_cls):
         """Real host platform with the USB seam swapped for a scripted fleet."""
+
+        def http_fetcher(self) -> HttpFetcher:
+            return super().http_fetcher() if online else _offline_fetcher()
 
         def __init__(self) -> None:
             super().__init__()
             # Exact handshake reply the dev console pins per vid:pid.  Read at
             # open_*() time, so a set_active_reply() + reconnect re-presents.
             self._reply_override: dict[tuple[int, int], tuple[int, int, int]] = {}
+            #: The fleet's RAM: what the RGB follower and effects write to.
+            self.ram = scripted_ram()
+            #: Its grant: switched in memory, never through the host's polkit.
+            self.ram_grant = ScriptedRamAccess()
+            #: The board's Aura lighting controller -- scripted, so a mock
+            #: run with the fan following never lights the host's real one.
+            self.aura = ScriptedAuraController()
 
         def paths(self) -> Paths:
             return dev_paths
@@ -472,13 +568,46 @@ def _build_dev_platform(specs: list[dict] | None = None) -> Platform:
         # Only the two OPENERS are scripted — ``BaseOS.open_transport`` and its
         # Wire→opener table are inherited from the real host platform, so the
         # mock exercises the production dispatch rather than a copy of it.
+        #
+        # That inheritance is the point AND the exposure: ``open_transport``
+        # calls ``opener(vid, pid, serial, unit)``, so an opener that does not
+        # match its signature is a TypeError on every connect.  #287 step 4
+        # added ``unit``, taught ``tests/mock_platform.py`` about it, and
+        # missed these two — every dev harness (mock_gui / mock_cli / mock_api /
+        # mock) died on ConnectDevice while the suite stayed green, because no
+        # test built a ``DevMockPlatform``.  ``tests/test_dev_mock_platform.py``
+        # now does.
+        #
+        # *unit* is accepted and not used to pick a script, for the reason
+        # ``tests/mock_platform.py`` gives: two units of one model are the SAME
+        # model, so they replay the same handshake.
         def _open_scsi(self, vid: int, pid: int,
-                       serial: str | None = None) -> ScsiTransport:
+                       serial: str | None = None,
+                       unit: str = "") -> ScsiTransport:
             return scripted_scsi_transport(by_key, vid, pid, self._reply_override)
 
+        # *hid_reports* is the firmware-4.07 override (#228): the same USB
+        # opener serves it, so it is scripted here too and a failed ordinary
+        # handshake can never retry on a REAL hidapi handle.
         def _open_bulk(self, vid: int, pid: int,
-                       serial: str | None = None) -> BulkTransport:
+                       serial: str | None = None,
+                       unit: str = "",
+                       hid_reports: bool = False,
+                       report_id: int = 0x00) -> BulkTransport:
+            if hid_reports and is_aura(vid, pid):
+                return self.aura
             return scripted_bulk_transport(by_key, vid, pid, self._reply_override)
+
+        # The SMBus is a seam too: the RAM follower writes colours to whatever
+        # bus this returns.  Inherited, a mock run with "RAM follows" on would
+        # light the dev box's own memory -- so the fleet brings its own sticks.
+        def smbuses(self) -> tuple[SmBus, ...]:
+            log.info("DevMockPlatform.smbuses: the scripted sticks, not the host's")
+            return (self.ram,)
+
+        def ram_access(self) -> RamAccess:
+            log.debug("DevMockPlatform.ram_access: scripted, not the host's")
+            return self.ram_grant
 
     log.info("DevMockPlatform: %d simulated device(s) on real %s base",
              len(parsed), host_cls.__name__)
@@ -524,11 +653,19 @@ def bootstrap(report_path: str | None = None,
     if specs:
         source = "device= CLI"
     elif hardware:
+        refuse_while_trcc_runs("--hardware")
         source = "--hardware (real attached device)"
         specs = None
     elif report_path:
         source = "--report"
         specs = load_device_specs(report_path)
+        if not specs:
+            # Falling through to ``_build_dev_platform(None)`` meant the REAL
+            # hardware, silently -- a replay that parsed nothing drove the
+            # panel on the desk instead.
+            sys.exit(f"--report {report_path}: no devices parsed from it, so "
+                     "there is nothing to replay.  (It used to fall back to "
+                     "the real hardware without saying so.)")
     elif all_devices:
         # --all still means something now that the fleet is the default: it
         # OVERRIDES a local devices.json, so you can get full coverage without
@@ -541,7 +678,8 @@ def bootstrap(report_path: str | None = None,
     else:
         source = "full fleet (default)"
         specs = all_variant_specs()
-    platform = _build_dev_platform(specs or None)
+    online = _pop_online_flag()
+    platform = _build_dev_platform(specs or None, online=online)
 
     # Say what was NOT covered.  The old banner named the source and stopped
     # there, so a 3-device devices.json read as "the mock" rather than as 2 of
@@ -574,9 +712,11 @@ def bootstrap(report_path: str | None = None,
         per_frame=verbosity > 0,
     )
     log.info(
-        "dev bootstrap: platform=%s paths.config=%s source=%s specs=%d",
+        "dev bootstrap: platform=%s paths.config=%s source=%s specs=%d "
+        "network=%s",
         type(platform).__name__, platform.paths().config_dir(), source,
         len(specs or []),          # --hardware leaves specs None on purpose
+        "online" if online else "offline (--online to fetch)",
     )
     # A simulated GPU fleet is orthogonal to the device fleet — it fakes what
     # the box HAS, not what's plugged into USB — so it applies to either
@@ -590,6 +730,25 @@ def bootstrap(report_path: str | None = None,
 
 
 # ─── Summoning a variant (the mock's whole job) ──────────────────────────────
+
+def app_behind(window: Any) -> Any:
+    """The App a mock window dispatches on — the harness's one door to it.
+
+    The harness plays the HARDWARE: it scripts handshake replies on the
+    platform, plants scan results and prefetches data, so it needs App
+    internals that the ``CommandBus`` a window holds does not expose.  Since
+    2026-09-28 a window holds its ``UserInterface`` (its dispatches then log
+    the UI's name); a harness that built a window around a bare App still
+    holds that App.  One named function, so the next refactor of the UI
+    wiring breaks here and nowhere else — four harnesses reached
+    ``window._app`` by hand, and broke together when it changed.
+    """
+    from trcc.ui._base import UserInterface
+    bus = window._app
+    app = bus._app if isinstance(bus, UserInterface) else bus
+    log.debug("app_behind: %s -> %s", type(bus).__name__, type(app).__name__)
+    return app
+
 
 def summon_variant(app: Any, vid: int, pid: int, *,
                    pm: int, sub: int, fbl: int) -> Any:

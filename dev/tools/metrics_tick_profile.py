@@ -37,13 +37,22 @@ thread, so their totals are NOT additive with each other, only within a stage.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import threading
 import time
 from collections import defaultdict
 from pathlib import Path
 
+# In-process on purpose: this measures the App's work in THIS process, and the
+# production default would hand it a proxy to a daemon doing the work elsewhere.
+# In-process measurement, whatever the shell exports: through the shared App
+# this would time a different process.  ``main`` refuses while one runs.
+os.environ["TRCC_DAEMON"] = "0"
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # dev/
+from _refuse import refuse_while_trcc_runs
 
 REPORT_S = 20.0
 
@@ -225,6 +234,7 @@ def main() -> int:
     threading.Thread(target=report_forever, daemon=True).start()
     if "--selftest" in sys.argv:
         return _selftest()
+    refuse_while_trcc_runs("metrics_tick_profile")
     return launch(start_hidden="--shown" not in sys.argv)
 
 

@@ -6,7 +6,7 @@ the normalized keys overlays use:
     cpu:temp | cpu:usage | cpu:freq | cpu:power
     gpu:primary:temp | gpu:0:temp | gpu:nvidia:0:temp | gpu:amd:0:temp
     memory:used | memory:available | memory:total | memory:percent
-    fan:cpu:rpm | fan:gpu:percent | fan:<key>:rpm
+    fan:<key>:rpm | fan:<key>:percent | fan:{cpu,gpu,ssd,sys2}
     disk:temp | disk:read | disk:write | disk:activity
     net:up | net:down | net:total_up | net:total_down
     time:{hour,minute,second} | date:{year,month,day,dow}
@@ -29,6 +29,8 @@ from contextlib import AbstractContextManager, nullcontext
 from ...core.logs import per_frame
 from ...core.models import (
     DEFAULT_REFRESH_INTERVAL_S,
+    FAN_PANEL_SLOTS,
+    METRICS,
     SensorReading,
 )
 from ...core.ports import (
@@ -41,15 +43,18 @@ from ...core.ports import (
     MemorySource,
     QuantitySource,
     SensorEnumerator,
+    VoltageSource,
 )
 from .hwmon import (
     HwmonCpu,
-    SpdClock,
+    MemoryClock,
     discover_amd_gpus,
     discover_disk_temp,
     discover_dram_temp,
     discover_fans,
     discover_intel_gpus,
+    discover_nouveau_gpus,
+    discover_voltages,
     find_cpu_temp_device,
     scan_hwmon_devices,
 )
@@ -106,66 +111,86 @@ def _store(readings: dict[str, float], key: str, value: float | None) -> None:
         readings[key] = float(value)
 
 
-def _cpu_keys() -> list[tuple[str, str, str]]:
-    """(key, category, unit) triples for the 4 CPU readings."""
+#: A catalog row: (key, category, unit, what it measures).  The last is the
+#: picker's name for the quantity -- every reading used to be labelled with
+#: its DEVICE alone, so a GPU's eight rows all read "113-D7070100-101" and
+#: nothing told temperature from power (#301).  Devices prefix their name.
+_Row = tuple[str, str, str, str]
+
+
+def _cpu_keys() -> list[_Row]:
+    """The 4 CPU readings."""
     log.debug("_cpu_keys")
     return [
-        ("cpu:temp", "temperature", "°C"),
-        ("cpu:usage", "usage", "%"),
-        ("cpu:freq", "clock", "MHz"),
-        ("cpu:power", "power", "W"),
+        ("cpu:temp", "temperature", "°C", "Temperature"),
+        ("cpu:usage", "usage", "%", "Usage"),
+        ("cpu:freq", "clock", "MHz", "Clock"),
+        ("cpu:power", "power", "W", "Power"),
     ]
 
 
-def _memory_keys() -> list[tuple[str, str, str]]:
+def _memory_keys() -> list[_Row]:
     log.debug("_memory_keys")
     return [
-        ("memory:used", "memory", "MB"),
-        ("memory:available", "memory", "MB"),
-        ("memory:total", "memory", "MB"),
-        ("memory:percent", "memory", "%"),
-        ("memory:temp", "temperature", "°C"),
-        ("memory:clock", "clock", "MHz"),
+        ("memory:used", "memory", "MB", "Used"),
+        ("memory:available", "memory", "MB", "Available"),
+        ("memory:total", "memory", "MB", "Total"),
+        ("memory:percent", "memory", "%", "Usage"),
+        ("memory:temp", "temperature", "°C", "Temperature"),
+        ("memory:clock", "clock", "MHz", "Clock"),
     ]
 
 
-def _gpu_reading_keys(prefix: str) -> list[tuple[str, str, str]]:
+#: One GPU's readings: (key suffix, GpuSource method, category, unit, name).
+#: The ONE list the poll, discover and the unsupported check walk -- the poll
+#: used to spell each quantity three times by hand.  The method is explicit
+#: because a suffix is not one: every temperature id must END in ``:temp``,
+#: which is what the °F conversion and the overlay key on.
+_GPU_QUANTITIES: tuple[tuple[str, str, str, str, str], ...] = (
+    ("temp", "temp", "temperature", "°C", "Temperature"),
+    ("hotspot:temp", "hotspot", "temperature", "°C", "Hot Spot"),
+    ("mem:temp", "mem_temp", "temperature", "°C", "Memory Temperature"),
+    ("usage", "usage", "usage", "%", "Usage"),
+    ("clock", "clock", "clock", "MHz", "Clock"),
+    ("power", "power", "power", "W", "Power"),
+    ("fan", "fan", "fan", "%", "Fan"),
+    ("fan_rpm", "fan_rpm", "fan", "RPM", "Fan Speed"),
+    ("vram_used", "vram_used", "gpu_memory", "MB", "VRAM Used"),
+    ("vram_total", "vram_total", "gpu_memory", "MB", "VRAM Total"),
+)
+
+
+def _gpu_reading_keys(prefix: str) -> list[_Row]:
     log.debug("_gpu_reading_keys: prefix=%s", prefix)
-    return [
-        (f"{prefix}:temp", "temperature", "°C"),
-        (f"{prefix}:usage", "usage", "%"),
-        (f"{prefix}:clock", "clock", "MHz"),
-        (f"{prefix}:power", "power", "W"),
-        (f"{prefix}:fan", "fan", "%"),
-        (f"{prefix}:vram_used", "gpu_memory", "MB"),
-        (f"{prefix}:vram_total", "gpu_memory", "MB"),
-    ]
+    return [(f"{prefix}:{suffix}", cat, unit, name)
+            for suffix, _, cat, unit, name in _GPU_QUANTITIES]
 
 
-def _io_keys() -> list[tuple[str, str, str]]:
+def _io_keys() -> list[_Row]:
+    """Disk and network -- no device name, so the quantity names both."""
     log.debug("_io_keys")
     return [
-        ("disk:temp", "temperature", "°C"),
-        ("disk:read", "disk_io", "MB/s"),
-        ("disk:write", "disk_io", "MB/s"),
-        ("disk:activity", "disk_io", "%"),
-        ("net:up", "network_io", "KB/s"),
-        ("net:down", "network_io", "KB/s"),
-        ("net:total_up", "network_io", "MB"),
-        ("net:total_down", "network_io", "MB"),
+        ("disk:temp", "temperature", "°C", "Disk Temperature"),
+        ("disk:read", "disk_io", "MB/s", "Disk Read"),
+        ("disk:write", "disk_io", "MB/s", "Disk Write"),
+        ("disk:activity", "disk_io", "%", "Disk Activity"),
+        ("net:up", "network_io", "KB/s", "Upload"),
+        ("net:down", "network_io", "KB/s", "Download"),
+        ("net:total_up", "network_io", "MB", "Total Uploaded"),
+        ("net:total_down", "network_io", "MB", "Total Downloaded"),
     ]
 
 
-def _time_keys() -> list[tuple[str, str, str]]:
+def _time_keys() -> list[_Row]:
     log.debug("_time_keys")
     return [
-        ("time:hour", "datetime", ""),
-        ("time:minute", "datetime", ""),
-        ("time:second", "datetime", ""),
-        ("date:year", "datetime", ""),
-        ("date:month", "datetime", ""),
-        ("date:day", "datetime", ""),
-        ("date:dow", "datetime", ""),
+        ("time:hour", "datetime", "", "Hour"),
+        ("time:minute", "datetime", "", "Minute"),
+        ("time:second", "datetime", "", "Second"),
+        ("date:year", "datetime", "", "Year"),
+        ("date:month", "datetime", "", "Month"),
+        ("date:day", "datetime", "", "Day"),
+        ("date:dow", "datetime", "", "Day of Week"),
     ]
 
 
@@ -187,7 +212,8 @@ class BaselineSensors(SensorEnumerator):
                  disks: list[DiskSource] | None = None,
                  dram: list[DramSource] | None = None,
                  board_temps: list[BoardTempSource] | None = None,
-                 spd_clock: SpdClock | None = None,
+                 voltages: list[VoltageSource] | None = None,
+                 memory_clock: MemoryClock | None = None,
                  thread_context: Callable[[], AbstractContextManager[None]]
                      = nullcontext) -> None:
         self._cpu = cpu or PsutilCpu()
@@ -197,7 +223,8 @@ class BaselineSensors(SensorEnumerator):
         self._disks: list[DiskSource] = disks or []
         self._dram: list[DramSource] = dram or []
         self._board: list[BoardTempSource] = board_temps or []
-        self._spd_clock = spd_clock
+        self._voltages: list[VoltageSource] = voltages or []
+        self._memory_clock = memory_clock
         # Per-thread OS setup the poll thread enters before touching OS
         # sensor APIs (Windows → COM apartment for WMI; others → no-op).
         # Injected as a narrow callable so this OS-neutral aggregator never
@@ -297,17 +324,23 @@ class BaselineSensors(SensorEnumerator):
         """
         log.debug("_optional_reads: gpus=%d fans=%d",
                   len(self._gpus), len(self._fans))
-        for key, _, _ in _cpu_keys():
+        for key, *_ in _cpu_keys():
             yield key, self._cpu, key.rsplit(":", 1)[1]
+        primary = self.primary_gpu()
         for idx, gpu in enumerate(self._gpus):
-            for prefix in (f"gpu:{idx}", f"gpu:{gpu.key}"):
-                for key, _, _ in _gpu_reading_keys(prefix):
-                    yield key, gpu, key.rsplit(":", 1)[1]
-        if (primary := self.primary_gpu()) is not None:
-            for key, _, _ in _gpu_reading_keys("gpu:primary"):
-                yield key, primary, key.rsplit(":", 1)[1]
+            for prefix in self._gpu_prefixes(idx, gpu, primary):
+                for suffix, method, *_ in _GPU_QUANTITIES:
+                    yield f"{prefix}:{suffix}", gpu, method
         for fan in self._fans:
             yield f"fan:{fan.key}:percent", fan, "percent"
+
+    @staticmethod
+    def _gpu_prefixes(idx: int, gpu: GpuSource,
+                      primary: GpuSource | None) -> list[str]:
+        """Every id spelling one GPU's readings are served under."""
+        frame_log.debug("_gpu_prefixes: %d %s", idx, gpu.key)
+        return [f"gpu:{idx}", f"gpu:{gpu.key}",
+                *(["gpu:primary"] if gpu is primary else [])]
 
     def unsupported(self) -> frozenset[str]:
         """Normalized keys no backend here can read.  Computed once, kept.
@@ -365,50 +398,37 @@ class BaselineSensors(SensorEnumerator):
         current = self.read_all()
         readings: list[SensorReading] = []
 
-        for key, cat, unit in _cpu_keys():
-            readings.append(SensorReading(
-                sensor_id=key, category=cat,
-                value=current.get(key, 0.0), unit=unit, label=self._cpu.name,
-            ))
-
-        for key, cat, unit in _memory_keys():
-            readings.append(SensorReading(
-                sensor_id=key, category=cat,
-                value=current.get(key, 0.0), unit=unit, label="Memory",
-            ))
-
-        for idx, gpu in enumerate(self._gpus):
-            label = gpu.name
-            # indexed keys
-            for key, cat, unit in _gpu_reading_keys(f"gpu:{idx}"):
+        def add(rows: list[_Row], device: str = "") -> None:
+            frame_log.debug("discover.add: %d row(s) for %r", len(rows), device)
+            for key, cat, unit, quantity in rows:
                 readings.append(SensorReading(
-                    sensor_id=key, category=cat,
-                    value=current.get(key, 0.0), unit=unit, label=label,
-                ))
-            # vendor keys
-            for key, cat, unit in _gpu_reading_keys(f"gpu:{gpu.key}"):
-                readings.append(SensorReading(
-                    sensor_id=key, category=cat,
-                    value=current.get(key, 0.0), unit=unit, label=label,
+                    sensor_id=key, category=cat, value=current.get(key, 0.0),
+                    unit=unit, label=f"{device} {quantity}".strip(),
                 ))
 
-        # primary GPU alias
-        primary = self.primary_gpu()
-        if primary is not None:
-            for key, cat, unit in _gpu_reading_keys("gpu:primary"):
-                readings.append(SensorReading(
-                    sensor_id=key, category=cat,
-                    value=current.get(key, 0.0), unit=unit, label=primary.name,
-                ))
-
+        add(_cpu_keys(), self._cpu.name)
+        add(_memory_keys(), "Memory")
+        for dimm in self._dram:
+            add([(f"memory:{dimm.key}:temp", "temperature", "°C",
+                  "Temperature")], dimm.name)
+        # Each GPU was offered THREE times -- ``gpu:N``, ``gpu:<vendor>:N`` and
+        # ``gpu:primary`` -- so one card filled a picker with 24 rows (#301).
+        # The primary alias is the one a single-GPU box needs; the vendor key
+        # is the canonical per-card id (what SetGpuDevice pins; ``gpu:N``
+        # renumbers when a card is added), offered only when there is a
+        # choice.  ``read_all`` still serves all three, so a saved binding or
+        # theme on any spelling keeps its value.
+        if (primary := self.primary_gpu()) is not None:
+            add(_gpu_reading_keys("gpu:primary"), primary.name)
+        if len(self._gpus) > 1:
+            for gpu in self._gpus:
+                add(_gpu_reading_keys(f"gpu:{gpu.key}"), gpu.name)
         for fan in self._fans:
-            for metric, cat, unit in (("rpm", "fan", "RPM"),
-                                      ("percent", "fan", "%")):
-                key = f"fan:{fan.key}:{metric}"
-                readings.append(SensorReading(
-                    sensor_id=key, category=cat,
-                    value=current.get(key, 0.0), unit=unit, label=fan.name,
-                ))
+            add([(f"fan:{fan.key}:rpm", "fan", "RPM", "Speed"),
+                 (f"fan:{fan.key}:percent", "fan", "%", "Duty")], fan.name)
+        # The panel's fan slots, so a dashboard row shows what the LCD shows.
+        add([(slot, "fan", "RPM", f"{METRICS[slot].label} (auto)")
+             for slot in FAN_PANEL_SLOTS if slot in current])
 
         # Board / super-I/O temperatures.  Plural and user-chosen, exactly
         # like fans -- and read off the SAME chip, which is the part that made
@@ -420,12 +440,11 @@ class BaselineSensors(SensorEnumerator):
                 sensor_id=key, category="temperature",
                 value=current.get(key, 0.0), unit="°C", label=board.name,
             ))
+        # Raw, as the chip reports them -- see VoltageSource (#259).
+        for volt in self._voltages:
+            add([(f"volt:{volt.key}", "voltage", "V", "")], volt.name)
 
-        for key, cat, unit in _io_keys() + _time_keys():
-            readings.append(SensorReading(
-                sensor_id=key, category=cat,
-                value=current.get(key, 0.0), unit=unit,
-            ))
+        add(_io_keys() + _time_keys())
 
         withheld = self.unsupported()
         advertised = [r for r in readings if r.sensor_id not in withheld]
@@ -478,7 +497,12 @@ class BaselineSensors(SensorEnumerator):
         frame_log.debug("_refresh_if_stale: cache %.2fs old >= %.2fs interval "
                         "and no poll thread — polling inline",
                         age, self._interval_s)
-        self._poll_once()
+        # The sources keep thread-local WMI handles that need a COM apartment
+        # on THIS thread -- the one _poll_loop opens for itself.  An inline
+        # sweep runs on whoever asked (the gui's splash worker, a CLI command,
+        # a daemon request), so it opens one too.
+        with self._thread_context():
+            self._poll_once()
 
     # ── Polling ────────────────────────────────────────────────────
 
@@ -583,29 +607,11 @@ class BaselineSensors(SensorEnumerator):
         # plus primary alias pointing at the same underlying readings.
         primary = self.primary_gpu()
         for idx, gpu in enumerate(self._gpus):
-            temp = self._read(gpu.temp, f"gpu:{idx}:temp")
-            usage = self._read(gpu.usage, f"gpu:{idx}:usage")
-            clock = self._read(gpu.clock, f"gpu:{idx}:clock")
-            power = self._read(gpu.power, f"gpu:{idx}:power")
-            fan = self._read(gpu.fan, f"gpu:{idx}:fan")
-            vram_used = self._read(gpu.vram_used, f"gpu:{idx}:vram_used")
-            vram_total = self._read(gpu.vram_total, f"gpu:{idx}:vram_total")
-            for prefix in (f"gpu:{idx}", f"gpu:{gpu.key}"):
-                _store(r, f"{prefix}:temp", temp)
-                _store(r, f"{prefix}:usage", usage)
-                _store(r, f"{prefix}:clock", clock)
-                _store(r, f"{prefix}:power", power)
-                _store(r, f"{prefix}:fan", fan)
-                _store(r, f"{prefix}:vram_used", vram_used)
-                _store(r, f"{prefix}:vram_total", vram_total)
-            if gpu is primary:
-                _store(r, "gpu:primary:temp", temp)
-                _store(r, "gpu:primary:usage", usage)
-                _store(r, "gpu:primary:clock", clock)
-                _store(r, "gpu:primary:power", power)
-                _store(r, "gpu:primary:fan", fan)
-                _store(r, "gpu:primary:vram_used", vram_used)
-                _store(r, "gpu:primary:vram_total", vram_total)
+            values = {suffix: self._read(getattr(gpu, method), f"gpu:{idx}:{suffix}")
+                      for suffix, method, *_ in _GPU_QUANTITIES}
+            for prefix in self._gpu_prefixes(idx, gpu, primary):
+                for suffix, value in values.items():
+                    _store(r, f"{prefix}:{suffix}", value)
 
         # Fans
         for fan in self._fans:
@@ -613,6 +619,7 @@ class BaselineSensors(SensorEnumerator):
                    self._read(fan.rpm, f"fan:{fan.key}:rpm"))
             _store(r, f"fan:{fan.key}:percent",
                    self._read(fan.percent, f"fan:{fan.key}:percent"))
+        r.update(self.fan_slots(r))
 
         # Disk temperature — one DiskSource per drive; the model carries a
         # single ``disk_temp`` slot, so collapse to the HOTTEST drive (the one
@@ -641,18 +648,22 @@ class BaselineSensors(SensorEnumerator):
         for board in self._board:
             _store(r, f"board:{board.key}:temp",
                    self._read(board.temp, f"board:{board.key}:temp"))
+        for volt in self._voltages:
+            _store(r, f"volt:{volt.key}", self._read(volt.volts, f"volt:{volt.key}"))
 
-        dram_temps = [
-            t for d in self._dram
-            if (t := self._read(d.temp, f"memory:{d.key}:temp")) is not None
-        ]
+        # Each DIMM under its own id too (#310); ``memory:temp`` stays the max.
+        dram_temps: list[float] = []
+        for d in self._dram:
+            if (t := self._read(d.temp, f"memory:{d.key}:temp")) is not None:
+                _store(r, f"memory:{d.key}:temp", t)
+                dram_temps.append(t)
         if dram_temps:
             _store(r, "memory:temp", max(dram_temps))
 
         # Memory channel clock — static SPD nameplate (cached at construction).
-        if self._spd_clock is not None:
+        if self._memory_clock is not None:
             _store(r, "memory:clock",
-                   self._read(self._spd_clock.clock, "memory:clock"))
+                   self._read(self._memory_clock.clock, "memory:clock"))
 
         # IO + time
         try:
@@ -701,15 +712,18 @@ def build_linux_sensors() -> BaselineSensors:
     gpus.extend(discover_nvidia_gpus())
     gpus.extend(discover_amd_gpus(hwmon_devices))
     gpus.extend(discover_intel_gpus(hwmon_devices))
+    gpus.extend(discover_nouveau_gpus(hwmon_devices))
     fans = discover_fans(hwmon_devices)
     disks = discover_disk_temp(hwmon_devices)
     dram = discover_dram_temp(hwmon_devices)
     board_temps = discover_board_temps()
-    spd_clock = SpdClock()
-    log.info("Linux sensors: cpu_temp=%s, gpus=%d, fans=%d, disks=%d, dram=%d, "
-             "mem_clock=%s",
+    voltages = discover_voltages(hwmon_devices)
+    memory_clock = MemoryClock()
+    log.info("Linux sensors: cpu_temp=%s, gpus=%d, fans=%d, disks=%d, dram=%d "
+             "(mem_clock read on first poll)",
              "yes" if cpu.temp() is not None else "no",
-             len(gpus), len(fans), len(disks), len(dram), spd_clock.clock())
+             len(gpus), len(fans), len(disks), len(dram))
     return BaselineSensors(cpu=cpu, memory=PsutilMemory(),
                            gpus=gpus, fans=fans, disks=disks, dram=dram,
-                           board_temps=board_temps, spd_clock=spd_clock)
+                           board_temps=board_temps, voltages=voltages,
+                           memory_clock=memory_clock)

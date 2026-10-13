@@ -3,7 +3,7 @@
 Self-contained handler for a single LCD device.  Holds:
 
 * ``_device_key`` — vid:pid; ``app.devices[key]`` is the live Device
-* ``_app: App`` — universal command/event hub
+* ``_app: CommandBus`` — universal command/event hub
 * ``_pm.state: DeviceState`` — cached canvas / mask / theme info,
   refreshed on connect / orientation / theme-load events
 * ``_w`` — shared GUI widgets (preview, theme tabs, cuts, etc.)
@@ -17,50 +17,51 @@ exist on the ``AppProxy`` a daemon-mode UI holds, #249).
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QPixmap
 
 from ...core.commands import (
-    AdvanceSlideshow,
     ApplyMask,
     BuildPreview,
     CurrentFrame,
     DeviceState,
     EnableOverlay,
-    ExportTheme,
+    ExportCurrentTheme,
     GetPaths,
     ImportTheme,
     LcdSnapshot,
     ListThemes,
     LoadCloudTheme,
     LoadTheme,
-    OrientedThemeTarget,
     PreviewSize,
+    ResolveOverlay,
     ResolveThemeDirectories,
-    RestoreDeviceState,
     SaveTheme,
-    SendScreencastFrame,
+    SetBackgroundMode,
     SetBrightness,
     SetFitMode,
     SetMaskPosition,
+    SetMediaPlayer,
     SetOrientation,
-    SetOverlayConfig,
-    SetSplitMode,
-    SleepDevice,
     StopVideo,
     ToggleVideo,
     UploadCustomMask,
     VideoStatus,
 )
+from ...core.logs import per_frame
 from ..presentation.lcd_presentation_model import LcdPresentationModel
-from ..presentation.overlay_serialization import dc_as_legacy_overlay_config
+from ..presentation.overlay_serialization import entries_to_configs
 from .base_handler import BaseHandler
 
 if TYPE_CHECKING:
-    from ...app import App
+    from collections.abc import Callable
+
+    from ...core.commands import Command
+    from ...core.ports import CommandBus
     from ...core.results import (
         LcdSnapshotResult,
         ThemeResult,
@@ -96,10 +97,9 @@ class LCDHandler(BaseHandler):
         self,
         key: str,
         widgets: dict[str, Any],
-        make_timer: Any,
         data_dir: Path,
         is_visible_fn: Any = None,
-        app: App | None = None,
+        app: CommandBus | None = None,
         lcd_idx: Any = '',
     ) -> None:
         super().__init__(key, 'form')
@@ -107,7 +107,7 @@ class LCDHandler(BaseHandler):
             raise RuntimeError(
                 "LCDHandler requires an App handle — composition root must pass one"
             )
-        self._app: App = app
+        self._app: CommandBus = app
         # ``lcd_idx`` carries the device key in the next/ port (legacy
         # passed an int index into Trcc._lcd_devices).
         self._device_key: str = str(lcd_idx) if lcd_idx else key
@@ -127,39 +127,34 @@ class LCDHandler(BaseHandler):
         # the device list, and the same reason.
         self._dirs_signature: tuple[object, ...] | None = None
         self.log: logging.Logger = log
+        self.frame_log: logging.Logger = per_frame(__name__)
 
         # Qt-free coordination model — owns the per-device DeviceState cache
         # AND the activation/view-lifecycle flags (ui_active gate, configured
         # first-load gate, brightness/split/background state).  PM-refactor
         # increment 5 grows the decisions onto it; the handler keeps the Qt.
         self._pm = LcdPresentationModel(self._device_key)
-        # Slideshow cursor lives on ``app.slideshow`` (SlideshowService);
-        # don't duplicate state here (S1.1 audit).
+        # The slideshow is the App's: ``SetSlideshow`` drives it and the
+        # handler follows ``SlideshowChanged`` / ``ThemeLoaded``.
 
         # QPixmap cache keyed by frame index — avoids QImage→QPixmap
         # conversion on every video tick when the surface hasn't changed.
         self._pixmap_cache: dict[int, tuple[int, QPixmap]] = {}
         self._last_render_id: int | None = None
 
-        # Animation observability: log one INFO line at first tick (proves
-        # the QTimer fires) and on each silent-skip TRANSITION (so we see
-        # "device disconnected" once, not every 66 ms).  Per-tick stays
-        # DEBUG — flipping these on info-level when the timer starts is
-        # how we tell a "didn't fire" bug apart from a "fired but skipped"
-        # bug without reading the code.
-        self._animation_first_tick_logged: bool = False
-        self._animation_last_skip_reason: str | None = None
+        # Whether this device's video is playing (not paused).  The core's
+        # VideoLoop does the ticking (#249); this flag is the handler's view
+        # of it — "video owns the wire" and the preview's fast mode read it.
+        self._video_playing: bool = False
 
         # Thread-safe notifier for background data extraction → UI refresh
         self._data_notifier = _DataReadyNotifier()
         self._data_notifier.ready.connect(self._on_data_ready)
 
-        # Timers (parent factory + signal wiring; lifetime owned here)
-        self._animation_timer: QTimer = make_timer(self._on_video_tick)
-        self._slideshow_timer: QTimer = make_timer(self._on_slideshow_tick)
-        self._flash_timer: QTimer = make_timer(
-            self._on_flash_timeout, single_shot=True,
-        )
+        #: The orientation the shared widgets show for this panel; None until
+        #: it has taken them (``_refresh``), so the first restore always runs.
+        self._shown_rotation: int | None = None
+
 
     # ── Public API ───────────────────────────────────────────────────
 
@@ -228,20 +223,6 @@ class LCDHandler(BaseHandler):
         )
         return snap
 
-    def has_video_playback(self) -> bool:
-        """True iff MediaService has frames bound for this device.
-
-        ``playing`` alone is not enough: a bound playback that decoded zero
-        frames is not something to animate, which is why this tests the count
-        as well — and why ``frame_count`` is ``None`` rather than ``0`` when
-        there is no playback at all.
-        """
-        status = self._video_status()
-        answer = status.playing and bool(status.frame_count)
-        self.log.debug("has_video_playback: %s (playing=%s frames=%s)",
-                       answer, status.playing, status.frame_count)
-        return answer
-
     # ── LCDDevice Config (C# ReadSystemConfiguration) ─────────────────
 
     def apply_device_config(self, key: str, w: int, h: int) -> None:
@@ -255,17 +236,16 @@ class LCDHandler(BaseHandler):
         self._pm.configured = True
         # Per-device child logger — tags handler logs with the key
         self.log = logging.getLogger(f"{__name__}.{key}")
-        # First connect: load the persisted theme onto the device.
-        self._refresh(w, h, first_load=True)
+        self.frame_log = per_frame(f"{__name__}.{key}")
+        self._refresh(w, h)
 
     def reactivate(self, w: int, h: int) -> None:
         """Return to known device — device already configured from connect()."""
         self.log.info("reactivate: %dx%d", w, h)
         self._pm.ui_active = True
-        # Re-select: read what the device is already showing; do NOT re-load.
-        self._refresh(w, h, first_load=False)
+        self._refresh(w, h)
 
-    def _refresh(self, w: int, h: int, *, first_load: bool = False) -> None:
+    def _refresh(self, w: int, h: int) -> None:
         """Update widgets from the device's current persisted settings.
 
         ``first_load`` distinguishes the two callers: first connect
@@ -307,24 +287,20 @@ class LCDHandler(BaseHandler):
         # in favour of dataclass attribute access (typed by pyright,
         # defaults baked into DeviceSettings itself).
         ds = self._lcd_settings()
+        self._shown_rotation = None     # this panel is (re)taking the widgets
 
         self._w['preview'].set_resolution(w, h)
         self._w['preview'].set_image(None)
         self._w['image_cut'].set_resolution(w, h)
         self._w['video_cut'].set_resolution(w, h)
-        self._w['theme_setting'].set_resolution(w, h)
 
-        auto_loaded = self._update_theme_directories()
+        self._update_theme_directories()
 
-        self._restore_brightness(ds)
-        self._restore_rotation(ds)
-        self._restore_split_mode(ds, w, h)
+        self._show_settings(ds)
         self._restore_slideshow(ds)
         self._update_device_info()
 
-        if auto_loaded:
-            return
-        self._restore_theme_and_preview(first_load=first_load)
+        self._restore_theme_and_preview()
 
     def notify_data_ready(self) -> None:
         """Background install finished — re-list this device's grids.
@@ -342,8 +318,13 @@ class LCDHandler(BaseHandler):
         """Background data extraction finished — re-probe dirs and update UI."""
         log.info("_on_data_ready")
         self.log.info("_on_data_ready: refreshing dirs and theme lists")
-        auto_loaded = self._update_theme_directories(force=True)
-        self.log.info("_on_data_ready: done, auto_loaded=%s", auto_loaded)
+        self._update_theme_directories(force=True)
+        # The session primed this panel as the data landed (``App._prime``
+        # runs before any UI hears DataInstalled), so there is now a theme to
+        # show.  Only the active handler may write the shared preview.
+        self.log.info("_on_data_ready: done, active=%s", self._pm.ui_active)
+        if self._pm.ui_active:
+            self._restore_theme_and_preview()
 
     def _update_device_info(self) -> None:
         """Populate the selectable fingerprint line for the active device.
@@ -369,20 +350,66 @@ class LCDHandler(BaseHandler):
         self._w['device_info_label'].setText(text)
 
 
+    # The three ``_restore_*`` below are READ only, like ``_restore_slideshow``.
+    # Each used to write the value it had just read back to the App, so merely
+    # OPENING the gui sent SetBrightness / SetOrientation / SetSplitMode for
+    # every panel (measured: 6 for a 2-panel fleet; qtgui sent none) -- an
+    # event to every other UI, and a stale overwrite if one changed it
+    # between the read and the write.  Opening a UI changes nothing.
+
+    def follow_app(self) -> None:
+        """Show a setting the App now holds, changed here or by another UI.
+
+        READ only, like the ``_restore_*`` it runs.  Not ``_refresh``: that
+        blanks the preview and re-lists the theme browser, which is for
+        becoming the active panel, not for a brightness change.
+        """
+        self.log.info("follow_app: %s active=%s",
+                      self._device_key, self._pm.ui_active)
+        if not self._pm.ui_active:   # the widgets are shared with the other LCDs
+            return
+        self._show_settings(self._lcd_settings())
+
+    def _show_settings(self, ds: LcdSnapshotResult) -> None:
+        """Put the App's settings for this panel on the shared widgets — READ only.
+
+        Opening the gui, switching to this panel and following another UI's
+        change all come through here, so the three cannot show different
+        things.  The mask fields were set only on a follow, so on open they
+        showed whatever the previous panel had left in them.
+        """
+        self.log.info(
+            "_show_settings: brightness=%d orientation=%d split=%d overlay=%s "
+            "mask visible=%s at %s", ds.brightness, ds.orientation,
+            ds.split_mode, ds.overlay_enabled, ds.mask_visible, ds.mask_position)
+        self._restore_brightness(ds)
+        self._restore_rotation(ds)
+        self._restore_split_mode(ds)
+        self._show_overlay_layout()
+        settings = self._w['theme_setting']
+        settings.set_mask_visible(ds.mask_visible)
+        settings.show_sources(ds.display_source, ds.background_mode != "transparent")
+        # None is the default place, which the render draws at (0, 0).
+        settings.set_mask_position(*(ds.mask_position or (0, 0)))
+        self._w['theme_local'].show_game_mode(ds.game_enabled, ds.game_threshold)
+
     def _restore_brightness(self, ds: LcdSnapshotResult) -> None:
         self._pm.brightness_level = ds.brightness
-        self.log.info("Restoring brightness: %d%%", self._pm.brightness_level)
-        self._app.dispatch(SetBrightness(
-            key=self._device_key, percent=self._pm.brightness_level,
-        ))
+        self.log.info("Showing brightness: %d%%", self._pm.brightness_level)
 
     def _restore_rotation(self, ds: LcdSnapshotResult) -> None:
+        """Show the orientation -- and redo the geometry work only when it
+        CHANGED.  ``follow_app`` runs this on every event, a drag move
+        included, and each run cost a ResolveThemeDirectories + PreviewSize
+        (two socket round trips under a shared App) for nothing."""
         rotation_index = ds.orientation // 90
         rotation = rotation_index * 90
+        if rotation == self._shown_rotation:
+            self.log.debug("_restore_rotation: still %d° — nothing to redo",
+                           rotation)
+            return
         self.log.debug("_restore_rotation: rotation=%d", rotation)
-        self._app.dispatch(SetOrientation(
-            key=self._device_key, degrees=rotation,
-        ))
+        self._shown_rotation = rotation
         self._sync_rotation_state(rotation)
         self._w['rotation_combo'].blockSignals(True)
         self._w['rotation_combo'].setCurrentIndex(rotation_index)
@@ -390,111 +417,67 @@ class LCDHandler(BaseHandler):
         self._sync_preview_size()   # composed orientation, not pre-rotation (#136)
         self._update_theme_directories()
 
-    def _restore_split_mode(
-        self, ds: LcdSnapshotResult, w: int, h: int,
-    ) -> None:
-        mode = self._pm.apply_split_mode(ds.split_mode, (w, h))
-        self.log.debug("_restore_split_mode: split_mode=%d ldd_is_split=%s mode=%d",
-                       self._pm.split_mode, self._pm.ldd_is_split, mode)
-        self._app.dispatch(SetSplitMode(key=self._device_key, mode=mode))
+    def _restore_split_mode(self, ds: LcdSnapshotResult) -> None:
+        self._pm.apply_split_mode(ds.split_mode, self._pm.state.canvas_size)
+        self.log.debug("_restore_split_mode: split_mode=%d ldd_is_split=%s",
+                       self._pm.split_mode, self._pm.ldd_is_split)
 
     def _restore_slideshow(self, ds: LcdSnapshotResult) -> None:
-        """Restore slideshow UI state from typed DeviceSettings.
+        """Show the saved slideshow in the local-theme panel — READ only.
 
-        ``SlideshowService`` owns the transient rotation cursor;
-        ``DeviceSettings.slideshow_*`` owns the persisted config
-        (themes / interval / enabled flag).  This slot just pushes
-        the persisted state into the legacy local-theme panel widgets
-        so the next ``_update_slideshow_state`` reads back what
-        ``ConfigureSlideshow`` / ``SetSlideshow`` saved.
+        It used to re-dispatch ``ConfigureSlideshow`` / ``SetSlideshow`` and
+        start this window's own timer; the App's session resumes a saved
+        slideshow now (``RestoreDeviceState``), for every UI.
         """
+        self._show_slideshow(ds.slideshow_themes, ds.slideshow_enabled,
+                             ds.slideshow_interval_s)
+
+    def _show_slideshow(self, themes: Sequence[str], enabled: bool,
+                        interval_s: float) -> None:
+        """Put a slideshow state into the shared local-theme widgets."""
+        self.log.info("_show_slideshow: enabled=%s themes=%d interval=%ss",
+                      enabled, len(themes), interval_s)
         local = self._w['theme_local']
-        if ds.slideshow_themes or ds.slideshow_enabled:
-            interval = max(1, int(ds.slideshow_interval_s))
-            # Public API on the panel (backed by its SlideshowModel) — no
-            # reaching into private attrs.
-            local.set_slideshow_state(
-                list(ds.slideshow_themes), ds.slideshow_enabled, interval,
-            )
-            self._update_slideshow_state()
-        else:
-            self._slideshow_timer.stop()
-            local.set_slideshow_state([], False, local.get_slideshow_interval())
+        interval = max(1, int(interval_s)) if themes or enabled \
+            else local.get_slideshow_interval()
+        # Public API on the panel (backed by its SlideshowModel) — no reaching
+        # into private attrs.
+        local.set_slideshow_state(list(themes), enabled, interval)
 
-    def _restore_theme_and_preview(self, *, first_load: bool = False) -> None:
-        """Show the device's theme + overlay in the GUI.
+    def _restore_theme_and_preview(self) -> None:
+        """Show what the device is rendering — READ only, dispatching nothing.
 
-        On a re-select (``first_load=False``) this READS what the device is
-        already rendering — the cached current frame via
-        ``display.rendered_surface`` (``rebuild_preview``) plus the overlay
-        editor repopulated from the active theme — and dispatches NOTHING to
-        the device.  Re-loading there (the old behaviour) ran RestoreLastTheme
-        → LoadTheme → StopVideo, which cleared the user's cloud background +
-        overlay overrides and disturbed the running device just because the
-        GUI changed tabs.  Only first connect (``first_load=True``) loads the
-        persisted theme onto the device.
+        The cached current frame (``rebuild_preview``) plus the overlay editor
+        showing what the App holds for the panel.  Loading the saved theme is the
+        session's job (``App._prime``, on connect and when data lands), for
+        every UI: it used to be done here on first connect, and before that by
+        a gui-only first-install auto-load, while qtgui and the API each had
+        their own copy.  Re-loading here also ran LoadTheme → StopVideo, which
+        cleared the user's cloud background + overlay overrides just because
+        the GUI changed tabs.
         """
-        if not first_load:
-            current = self._lcd_settings().current_theme
-            if not current:
-                self._w['preview'].set_image(None)
-                return
-            self.log.info(
-                "_restore_theme_and_preview: re-select — reading current "
-                "frame for %s (theme=%s), no re-load", self._device_key,
-                current,
-            )
-            self._pm.state.current_theme_path = Path(current)
-            # Repopulate the overlay editor from the active theme (GUI only —
-            # no EnableOverlay / render / send to the device).  The toggle
-            # shows the DEVICE's persisted state, not "does this theme carry
-            # elements" — a sidebar switch must report what is on screen.
-            self._restore_overlay_editor(Path(current))
-            # Show what the device is already rendering — no re-render/send.
-            self.rebuild_preview()
-            return
-
-        # METHOD_UI.md's entry contract: display-start dispatches
-        # RestoreDeviceState, not the raw RestoreLastTheme.  It is a SUPERSET
-        # — the persisted theme, else the first available one, and then the
-        # persisted ``background_path`` video replayed on top.  gui wrote that
-        # override on every video pick (``SetBackground``) and never once read
-        # it back, so a user's cloud/user background was lost on every restart
-        # while cli and api both restored it.
-        #
-        # Idempotent, and reached only when ``_refresh``'s auto-load did NOT
-        # fire (``if auto_loaded: return`` above), so it cannot double-load.
-        result = self._app.dispatch(RestoreDeviceState(key=self._device_key))
-        if not result.ok:
-            self.log.info("_restore_theme_and_preview: no saved theme — %s",
-                          result.message)
+        current = self._lcd_settings().current_theme
+        self._w['theme_local'].show_current_theme(Path(current) if current else None)
+        if not current:
+            self.log.info("_restore_theme_and_preview: %s has no theme",
+                          self._device_key)
             self._w['preview'].set_image(None)
             return
-
         self.log.info(
-            "_restore_theme_and_preview: loaded %s from %s",
-            result.theme_name, result.theme_path,
+            "_restore_theme_and_preview: reading current frame for %s "
+            "(theme=%s), no re-load", self._device_key, current,
         )
-        # Restore the overlay grid from the theme's persisted config1.dc
-        # (or trcc.json).  Without this the overlay UI is empty on every
-        # restart even though the theme renders correctly on the device.
-        if result.theme_path:
-            self._restore_overlay_editor(Path(result.theme_path))
-        # Track the restored theme directory so deletion / re-renders
-        # can reference it.  For video-backed themes the VideoStarted
-        # observer (``on_video_started``) takes over animating; for
-        # static themes we refresh the preview here.
-        self._pm.state.current_theme_path = (
-            Path(result.theme_path) if result.theme_path else None
-        )
-        if not self._video_status().playing:
-            self.rebuild_preview()
+        self._pm.state.current_theme_path = Path(current)
+        # The toggle shows the DEVICE's persisted state, not "does this theme
+        # carry elements" — a sidebar switch must report what is on screen.
+        self._show_overlay_layout()
+        self.rebuild_preview()
 
     # ── Theme (C# Theme_Click_Event) ───────────────────────────────
     # _select_theme is gone — next/'s LoadTheme Command owns the whole
     # build/cache/render/persist cycle.  Callers dispatch LoadTheme
-    # directly through _select_theme_from_path / select_cloud_theme /
-    # _on_slideshow_tick.
+    # directly through _select_theme_from_path / select_cloud_theme; the
+    # App's slideshow driver dispatches it for rotations.
 
     def select_theme_from_path(self, path: Path, persist: bool = True) -> None:
         """Public entry for theme selection by path (local theme clicks)."""
@@ -515,10 +498,8 @@ class LCDHandler(BaseHandler):
         if not path.exists():
             self.log.warning("_select_theme_from_path: path does not exist: %s", path)
             return
-        self._slideshow_timer.stop()
         self._app.dispatch(EnableOverlay(key=self._device_key, enabled=False))
 
-        self._pm.background_active = False
         # LoadTheme internally dispatches StopVideo (clears the previous
         # playback + cloud-bg override + publishes VideoStopped which
         # stops the timer via the bus_bridge observer) and, if the new
@@ -531,10 +512,6 @@ class LCDHandler(BaseHandler):
         # This panel used to clear it here by hand, which made the behaviour
         # the gui's rather than the Command's — every other UI switched
         # themes with the old mask still layered on.
-        self._w['theme_setting'].background_panel.set_enabled(False)
-        self._w['theme_setting'].screencast_panel.set_enabled(False)
-        self._w['theme_setting'].video_panel.set_enabled(False)
-
         # LoadTheme dispatches through the App — the Command owns the
         # theme info build, scene cache invalidation, and (if persist)
         # the per-device current_theme update in app.settings.
@@ -544,8 +521,8 @@ class LCDHandler(BaseHandler):
         self._pm.state.current_theme_path = path if result.ok else None
         if result.ok:
             self._sync_preview_size()   # bezel matches portrait/landscape theme (#136)
-        if overlay_config:
-            self._load_theme_overlay_config(path)
+        if overlay_config and result.ok:
+            self._adopt_loaded_overlay()
 
         if not persist or not self._device_key:
             self.log.warning("_select_theme_from_path: not persisting (persist=%s, key=%s)",
@@ -570,11 +547,6 @@ class LCDHandler(BaseHandler):
         """
         self.log.info("select_cloud_theme: %s (video=%s)", theme_info.name,
                       getattr(theme_info, 'video', None))
-        self._slideshow_timer.stop()
-        self._pm.background_active = False
-        self._w['theme_setting'].background_panel.set_enabled(False)
-        self._w['theme_setting'].screencast_panel.set_enabled(False)
-
         theme_id = getattr(theme_info, 'id', None) or theme_info.name
         if not theme_id:
             self.log.warning(
@@ -603,8 +575,6 @@ class LCDHandler(BaseHandler):
             self._w['preview'].set_status(f"Mask: {mask_info.name}")
             return
         mask_dir = Path(mask_info.path)
-        # DC first — sets overlay resolution + element positions for this mask
-        self._load_theme_overlay_config(mask_dir)
         is_custom = getattr(mask_info, 'is_custom', False)
         if is_custom:
             r = self._app.dispatch(UploadCustomMask(
@@ -616,6 +586,7 @@ class LCDHandler(BaseHandler):
             ))
         if r.ok:
             self._w['preview'].set_status(r.message)
+            self._adopt_loaded_overlay()
         else:
             self._w['preview'].set_status(f"Mask failed: {r.message}")
 
@@ -625,114 +596,78 @@ class LCDHandler(BaseHandler):
         self._app.dispatch(SetMaskPosition(
             key=self._device_key, x=x, y=y,
         ))
-        self._render_and_send()
 
     def save_theme(self, name: str, *, overwrite: bool = False) -> ThemeResult:
         self.log.info("save_theme: name=%s overwrite=%s", name, overwrite)
         r = self._app.dispatch(SaveTheme(
             key=self._device_key, name=name, overwrite=overwrite,
         ))
+        # The grid re-lists on the ThemeSaved that follows, as it does for a
+        # save made in any other UI.
         self._w['preview'].set_status(r.message)
-        if r.ok:
-            # Re-list via ListThemes so the new theme appears with user-
-            # precedence (same universal path as the initial listing).
-            self._update_theme_directories(force=True)
         return r
 
-    def export_config(self, path: Path) -> None:
-        r = self._app.dispatch(ExportTheme(
-            key=self._device_key,
-            theme_name=path.stem,
-            archive_path=path,
+    def export_theme(self, path: Path) -> None:
+        """Write what this panel shows, saved or not, to *path* (the C#'s
+        ``buttonDaoChu_Click``)."""
+        self.log.info("export_theme: %s device=%s", path, self._device_key)
+        r = self._app.dispatch(ExportCurrentTheme(
+            key=self._device_key, archive_path=path,
         ))
         self._w['preview'].set_status(r.message)
 
-    def import_config(self, path: Path) -> None:
+    def import_theme(self, path: Path) -> None:
+        """Import *path* and show it on this panel (the C#'s
+        ``buttonDaoRu_Click``); the grid re-lists on ``ThemeImported``."""
+        self.log.info("import_theme: %s device=%s", path, self._device_key)
         r = self._app.dispatch(ImportTheme(
             key=self._device_key, archive_path=path,
         ))
         self._w['preview'].set_status(r.message)
-        if r.ok:
-            self._update_theme_directories(force=True)   # re-list via ListThemes
 
     # ── DC File Loading ────────────────────────────────────────────
 
-    def _read_overlay_layout(self, theme_dir: Path) -> dict[str, dict[str, Any]]:
-        """The theme's persisted overlay layout, in the grid's shape.
+    def _show_overlay_layout(self) -> None:
+        """Put the overlay the App holds for this panel on the editor — READ only.
 
-        Reads only — ``trcc.json`` ``elements`` for saved themes,
-        ``config1.dc`` / legacy ``config.json`` for older/packaged ones (see
-        ``dc_as_legacy_overlay_config``).  Touches no widget and dispatches
-        nothing, so a caller that must NOT write device state can still ask
-        what the theme carries.
+        The grid and its switch, from ``ResolveOverlay``: the device's working
+        layer, which every UI edits, each element with its id.  The grid used
+        to be filled from the theme's FILES, so it never showed another UI's
+        edit and sent its stale copy back over it on the next change; it also
+        preferred ``trcc.json`` where the App reads ``config1.dc``.
+
+        Dispatches no Command, so a reconnect cannot decide the switch (#276):
+        ``DeviceSettings.overlay_enabled`` is the single authority.
         """
-        layout = dc_as_legacy_overlay_config(theme_dir)
-        self.log.info("_read_overlay_layout: dir=%s → %d element(s)",
-                      theme_dir, len(layout))
-        return layout
-
-    def _show_overlay_layout(
-        self, layout: dict[str, dict[str, Any]], enabled: bool,
-    ) -> None:
-        """Put a layout + toggle state on the grid.  GUI only.
-
-        Dispatches nothing and persists nothing — the two callers that DO
-        own device state (``_load_theme_overlay_config`` for a user-initiated
-        load, ``_restore_overlay_editor`` for a reconnect) decide that for
-        themselves.  Order matches the original: enable first, then load, so
-        the grid's model sees the toggle before the elements.
-        """
-        self.log.info("_show_overlay_layout: %d element(s) enabled=%s",
-                      len(layout), enabled)
-        self._w['theme_setting'].set_overlay_enabled(enabled)
-        if layout:
-            self._w['theme_setting'].load_from_overlay_config(layout)
-
-    def _restore_overlay_editor(self, theme_dir: Path) -> None:
-        """Show the persisted overlay state on reconnect — never write it.
-
-        An automatic restore must not DECIDE overlay-enabled.
-        ``DeviceSettings.overlay_enabled`` is the single authority (see the
-        ``build_overlay`` comment in ``services/display.py``) and the user set
-        it deliberately; deriving it from "does this theme carry elements"
-        overwrote that on every boot, so an overlay switched off came back on
-        at the next launch (#276).  ``_load_theme_overlay_config`` used to
-        take a ``persist`` flag meant to express exactly this, but the body
-        never read it — the restore path passed ``persist=False`` and got a
-        persisted ``EnableOverlay`` anyway.
-        """
-        self.log.info("_restore_overlay_editor: dir=%s", theme_dir)
-        enabled = self._lcd_settings().overlay_enabled
-        self._show_overlay_layout(self._read_overlay_layout(theme_dir), enabled)
-        self._pm.state.overlay_enabled = enabled
-
-    def _load_theme_overlay_config(self, theme_dir: Path) -> None:
-        """Adopt a theme's overlay layout as the device's live overlay.
-
-        For USER-INITIATED loads only — a theme click, a mask apply, a
-        slideshow advance.  The theme establishes both the layout and the
-        toggle (a theme with no layout switches the overlay off), which is
-        legacy's behaviour and the one the GUI standards document.  A
-        reconnect goes through ``_restore_overlay_editor`` instead, which
-        honours the persisted toggle rather than replacing it.
-
-        Not replayed through ``SetOverlayConfig``: that Command takes
-        next/-shape elements with ids, used by the editor when the user drops
-        a new element, not by a load.
-        """
-        layout = self._read_overlay_layout(theme_dir)
-        enabled = bool(layout)
+        layout = self._app.dispatch(ResolveOverlay(key=self._device_key))
         self.log.info(
-            "_load_theme_overlay_config: dir=%s → %d element(s), "
-            "overlay %s", theme_dir, len(layout),
-            "enabled" if enabled else "disabled (theme carries no layout)",
+            "_show_overlay_layout: %s → %d element(s) from the %s layer, "
+            "enabled=%s", self._device_key, len(layout.elements),
+            layout.source, layout.enabled,
         )
-        self._show_overlay_layout(layout, enabled)
+        settings = self._w['theme_setting']
+        settings.set_overlay_enabled(layout.enabled)
+        settings.load_configs(entries_to_configs(layout.elements))
+        self._pm.state.overlay_enabled = layout.enabled
+
+    def _adopt_loaded_overlay(self) -> None:
+        """After a USER load (theme click, mask apply) the switch follows it.
+
+        The load has already copied its layout into the device's working
+        layer.  A layout switches the overlay on and none switches it off —
+        legacy's behaviour and the one the GUI standards document.  A
+        reconnect goes through ``_show_overlay_layout`` alone, which honours
+        the persisted switch instead (#276).
+        """
+        enabled = bool(self._app.dispatch(
+            ResolveOverlay(key=self._device_key)).elements)
+        self.log.info("_adopt_loaded_overlay: %s → overlay %s",
+                      self._device_key,
+                      "enabled" if enabled else "disabled (no layout)")
         self._app.dispatch(EnableOverlay(
             key=self._device_key, enabled=enabled,
         ))
-        self._pm.state.overlay_enabled = enabled
-        self._render_and_send()
+        self._show_overlay_layout()
 
     # ── Video lifecycle (bus_bridge observers) ─────────────────────
 
@@ -755,9 +690,7 @@ class LCDHandler(BaseHandler):
             "on_video_started: %s frames=%d interval=%dms",
             event.path, event.frame_count, event.interval_ms,
         )
-        self._start_animation_timer(
-            event.interval_ms, reason="video-started",
-        )
+        self._set_video_playing(True, reason="video-started")
         if self._pm.ui_active:
             self._w['preview'].set_playing(True)
             self._w['preview'].show_video_controls(True)
@@ -772,7 +705,7 @@ class LCDHandler(BaseHandler):
         if event.key != self._device_key:
             return
         self.log.info("on_video_stopped: device=%s", self._device_key)
-        self._stop_animation_timer(reason="video-stopped")
+        self._set_video_playing(False, reason="video-stopped")
         if self._pm.ui_active:
             self._w['preview'].set_playing(False)
             self._w['preview'].show_video_controls(False)
@@ -793,19 +726,23 @@ class LCDHandler(BaseHandler):
                 self._device_key, result.message,
             )
             return
-        playing = not result.paused
-        self.log.info("play_pause: → playing=%s", playing)
-        self._w['preview'].set_playing(playing)
-        # Pause is a transient toggle on an EXISTING playback — no
-        # VideoStarted / VideoStopped is published.  Drive the Qt timer
-        # directly here through the same start/stop helpers so the
-        # observability hooks fire (entry log + first-tick reset).
-        if playing:
-            self._start_animation_timer(
-                self._video_interval_ms(), reason="play_pause-resume",
-            )
-        else:
-            self._stop_animation_timer(reason="play_pause-pause")
+        # Shown by ``on_video_pause_changed``, as a toggle from any UI is.
+        self.log.info("play_pause: → paused=%s", result.paused)
+
+    def on_video_pause_changed(self, event: Any) -> None:
+        """Paused or resumed -- by this window or any other UI.
+
+        The playback stays loaded, so no VideoStarted / VideoStopped fires.
+        The core's VideoLoop already skips a paused playback; this keeps the
+        handler's view in step, so metric refreshes redraw the paused frame.
+        The preview's button is shared, so only the active handler writes it.
+        """
+        playing = not event.paused
+        self.log.info("on_video_pause_changed: playing=%s active=%s",
+                      playing, self._pm.ui_active)
+        self._set_video_playing(playing, reason="pause_changed")
+        if self._pm.ui_active:
+            self._w['preview'].set_playing(playing)
 
     def stop_video(self) -> None:
         self.log.info("stop_video: device=%s", self._device_key)
@@ -815,19 +752,17 @@ class LCDHandler(BaseHandler):
         self._w['preview'].set_playing(False)
         self._w['preview'].show_video_controls(False)
 
-    def seek(self, percent: float) -> None:
-        """Jump playback to ``percent`` (0.0-1.0) of total frames."""
+    def seek(self, frame: int) -> None:
+        """Jump playback to *frame* -- the slider counts frames, so no maths."""
         from ...core.commands import SeekVideo
         status = self._video_status()
         if not status.playing or not status.frame_count:
             self.log.warning(
-                "seek(%.3f): no playback bound for %s — dropped",
-                percent, self._device_key,
+                "seek(%d): no playback bound for %s — dropped",
+                frame, self._device_key,
             )
             return
-        total = status.frame_count
-        frame = self._pm.seek_frame(percent, total)
-        self.log.info("seek: percent=%.3f frame=%d/%d", percent, frame, total)
+        self.log.info("seek: frame=%d/%d", frame, status.frame_count)
         self._app.dispatch(SeekVideo(key=self._device_key, frame=frame))
 
     def set_video_fit_mode(self, mode: str) -> None:
@@ -835,177 +770,55 @@ class LCDHandler(BaseHandler):
         self._app.dispatch(SetFitMode(key=self._device_key, mode=mode))
         # Re-render preview on the next FrameSent / tick
 
-    def _video_interval_ms(self) -> int:
-        """Return ms-per-frame for the active playback, 33 as fallback.
-
-        Only used by ``play_pause`` to resume an EXISTING paused
-        playback — load-new-video paths get the interval from the
-        ``VideoStarted`` event payload instead (DIP: don't query the
-        service if the event already carries the answer).
-        """
-        return self._pm.video_interval_ms(self._video_status().fps)
-
-    def _start_animation_timer(self, interval_ms: int, reason: str) -> None:
-        """Single entry point for starting the per-frame video timer.
-
-        Phase 4 collapses the previous three call sites (cloud theme
-        select, restore-last-theme, inactive-restore) onto a single
-        VideoStarted observer that routes here.  Centralising the start
-        site is the SRP win — it also lets the first-tick diagnostic be
-        reset in exactly one place.
-        """
-        self._animation_first_tick_logged = False
-        self._animation_last_skip_reason = None
-        self.log.info(
-            "_start_animation_timer: %dms (reason=%s) device=%s",
-            interval_ms, reason, self._device_key,
-        )
-        self._animation_timer.start(max(1, interval_ms))
-
-    def _stop_animation_timer(self, reason: str) -> None:
-        """Single entry point for stopping the per-frame video timer.
-
-        Idempotent: no log when already stopped.  Phase 4 routes the
-        VideoStopped observer here.
-        """
-        if not self._animation_timer.isActive():
+    def _set_video_playing(self, playing: bool, reason: str) -> None:
+        """Single entry point for the handler's "video is playing" view."""
+        if playing == self._video_playing:
             return
-        self.log.info(
-            "_stop_animation_timer: reason=%s device=%s",
-            reason, self._device_key,
-        )
-        self._animation_timer.stop()
-        self._animation_first_tick_logged = False
-        self._animation_last_skip_reason = None
+        self.log.info("_set_video_playing: %s -> %s (reason=%s) device=%s",
+                      self._video_playing, playing, reason, self._device_key)
+        self._video_playing = playing
 
-    def _on_video_tick(self) -> None:
-        """Timer callback: advance one video frame.
+    def on_video_advanced(self, event: Any) -> None:
+        """A frame advanced (``VideoAdvanced``) — move the progress bar.
 
-        next/ owns playback in :class:`MediaService`; ``RenderAndSend``
-        builds + encodes + sends the current cursor's frame.  Preview
-        widget refreshes via the ``FrameSent`` → ``rebuild_preview``
-        bridge — no per-tick image plumbing here.
-
-        Observability rule (CLAUDE.md "Logging coverage is mandatory"):
-        first tick of every animation logs at INFO; subsequent ticks at
-        DEBUG.  Silent-skip branches log at INFO on STATE TRANSITION
-        only — same skip reason in a row stays DEBUG so a disconnected
-        device doesn't spam 15 lines/s.
+        Per-frame, so DEBUG.  The core's VideoLoop does the ticking (#249);
+        the position used to come back as the result of this handler's own
+        timer.  MULTI-DISPLAY GATE — load-bearing: every LCDHandler shares ONE
+        preview/progress widget set, so only the active one may write to it.
         """
-        from ...core.commands import TickDisplay
-
-        if not self._animation_first_tick_logged:
-            self.log.info(
-                "_on_video_tick: first tick fired for %s",
-                self._device_key,
-            )
-            self._animation_first_tick_logged = True
-
-        # ONE Command does advance + render + send.  The cursor deliberately
-        # advances before the connected-check inside the Command, preserving
-        # the old order: an unplugged device's video keeps running so it
-        # resumes in sync rather than frozen where it dropped.
-        result = self._app.dispatch(TickDisplay(key=self._device_key))
-
-        if result.frame_count is None or result.cursor is None:
-            # Animation timer is firing but the playback was cleared —
-            # WARN once (state-transition); the timer should have been
-            # stopped when the playback was cleared.  TickDisplay sets the
-            # video fields as a set, so either being None means "no playback";
-            # testing both is what lets the type checker prove it too.
-            self.log.warning(
-                "_on_video_tick: timer firing but device %s has no playback — "
-                "stopping animation timer",
-                self._device_key,
-            )
-            self._stop_animation_timer(reason="playback-cleared")
+        if event.key != self._device_key:
             return
-
-        # MULTI-DISPLAY GATE — load-bearing.  Every LCDHandler shares ONE
-        # preview/progress widget set, so only the handler that owns the panel
-        # may write to it.  The DISPATCH above is deliberately NOT gated: a
-        # background device must keep ticking or its LCD freezes while another
-        # device owns the GUI (see ``set_inactive``).
+        self.frame_log.debug("on_video_advanced: %d/%d", event.cursor, event.frame_count)
         if self._pm.ui_active:
-            percent = self._pm.progress_fraction(
-                result.cursor, result.frame_count,
-            )
             self._w['preview'].set_progress(
-                percent, result.cursor, result.frame_count,
+                event.cursor, event.frame_count, event.fps,
             )
-
-        # ``connected is False`` — never falsiness: ``None`` means the Command
-        # failed before it looked the device up, which is not a disconnect.
-        if result.connected is False:
-            self._log_tick_skip(
-                reason="device-not-connected",
-                detail=f"device {self._device_key} not connected — skip send",
-            )
-            return
-
-        # Cleared on the happy path so a subsequent disconnect re-logs.
-        self._animation_last_skip_reason = None
-
-        if not result.ok:
-            # Render failure during animation playback is a real user-
-            # visible bug (frozen / stuttering LCD).  WARN, not DEBUG.
-            self.log.warning(
-                "_on_video_tick: render failed cursor=%d/%d — %s",
-                result.cursor, result.frame_count, result.message,
-            )
-
-    def _log_tick_skip(self, *, reason: str, detail: str) -> None:
-        """Log a per-tick skip at INFO on first occurrence of *reason*,
-        DEBUG on repeats — preserves the diagnostic value while keeping
-        per-frame noise out of the log."""
-        if reason != self._animation_last_skip_reason:
-            self.log.info("_on_video_tick: %s", detail)
-            self._animation_last_skip_reason = reason
-        else:
-            self.log.debug("_on_video_tick: %s", detail)
 
     # ── Overlay (C# ucXiTongXianShi1) ─────────────────────────────
 
-    def on_overlay_changed(self, element_data: dict | list) -> None:
-        """Forward overlay config change from settings panel.
+    def on_overlay_edit(self, edit: Callable[..., Command]) -> None:
+        """Dispatch one element edit from the editor, for this panel.
 
-        Accepts the next/ element LIST (the grid's current dispatch shape) or
-        the legacy keyed dict; the body normalizes both below.
+        *edit* is an Add/Update/DeleteOverlayElement waiting only for the
+        device key.  One element by id, never the whole grid: re-sending the
+        grid rewrote every other element in the grid's reduced shape and put
+        back whatever another UI had changed.
+
+        Editing an element implies wanting to see it, so an edit against a
+        switched-off overlay switches it on.  Deleting the LAST one implies
+        the opposite, so an edit that leaves nothing must not — that would
+        answer a "remove everything" by turning the overlay on.
         """
-        self.log.info("on_overlay_changed: %d elements",
-                      len(element_data) if element_data else 0)
-        if element_data is None:
-            self.log.warning("on_overlay_changed: no payload — nothing to do")
-            return
-        # An EMPTY list is a real edit: the user deleted the last element.
-        # This used to be dropped by a falsiness guard, so the deletion never
-        # reached the bus, the previous list stayed persisted, and the element
-        # came back — the second half of #276 ("whichever one I delete last
-        # still appears").  The sole dispatcher, ``_on_elements_changed``,
-        # always sends a real list, so the guard protected nothing.
-        #
-        # The same guard shape, one hop up in ``trcc_app``, had already caused
-        # exactly this bug once: gating on dict-only silently dropped every
-        # colour/drag edit.
-        # Apply overlay change via the Command bus.  EnableOverlay
-        # persists the toggle; SetOverlayConfig persists the element
-        # list.  next/ skips the legacy "is video playing" cache-update
-        # branch — the render service handles overlay refresh next tick.
-        # Editing an element implies wanting to see it, so an edit against a
-        # switched-off overlay switches it on.  Deleting the LAST one implies
-        # the opposite, so an empty payload must not — that would answer a
-        # "remove everything" by turning the overlay on.
-        if element_data and not self._pm.state.overlay_enabled:
+        command = edit(key=self._device_key)
+        self.log.info("on_overlay_edit: %s", command)
+        if not self._app.dispatch(command).ok:
+            return      # App.dispatch has logged the refusal at WARNING
+        if not self._pm.state.overlay_enabled and self._app.dispatch(
+                ResolveOverlay(key=self._device_key)).elements:
             self._app.dispatch(EnableOverlay(
                 key=self._device_key, enabled=True,
             ))
             self._pm.state.overlay_enabled = True
-        self._app.dispatch(SetOverlayConfig(
-            key=self._device_key,
-            elements=tuple(element_data.values())
-                if isinstance(element_data, dict) else tuple(element_data),
-        ))
-        self._render_and_send()
 
     def handle_frame(self, image: Any) -> None:
         """Receive the rendered frame from ``FrameSent`` — show it directly.
@@ -1021,9 +834,7 @@ class LCDHandler(BaseHandler):
             self.log.debug("handle_frame: None surface — skip")
             return
         if self._pm.ui_active:
-            self._w['preview'].set_image(
-                image, fast=self._animation_timer.isActive(),
-            )
+            self._w['preview'].set_image(image, fast=self._video_playing)
         else:
             self.log.debug(
                 "handle_frame: dropped (ui_active=False, %s)", self._device_key,
@@ -1060,7 +871,7 @@ class LCDHandler(BaseHandler):
         Idempotent.
         """
         if not self._pm.ui_active:
-            self.log.debug(
+            self.frame_log.debug(
                 "rebuild_preview: ui_active=False for %s — skip",
                 self._device_key,
             )
@@ -1068,17 +879,17 @@ class LCDHandler(BaseHandler):
         image = self._app.dispatch(CurrentFrame(key=self._device_key)).surface
         if image is None:
             # No frame rendered yet (pre-load) — build a one-off surface.
-            self.log.debug(
+            self.frame_log.debug(
                 "rebuild_preview: no cached frame for %s — building once",
                 self._device_key,
             )
             image = self._build_preview_surface()
         if image is None:
-            self.log.debug(
+            self.frame_log.debug(
                 "rebuild_preview: no surface built (theme/device pre-load?)",
             )
             return
-        self._w['preview'].set_image(image, fast=self._animation_timer.isActive())
+        self._w['preview'].set_image(image, fast=self._video_playing)
 
     def update_preview(self, image: Any) -> None:
         """Display a frame that was already rendered and sent to the device."""
@@ -1090,45 +901,19 @@ class LCDHandler(BaseHandler):
                 "update_preview: dropped (ui_active=False, %s)", self._device_key,
             )
 
-    def update_metrics(self, metrics: Any) -> None:
-        """Metrics tick: cache for video-overlay redraws on next frame."""
-        # Per-tick on every metrics broadcast; DEBUG only.
-        log.debug("update_metrics")
-        self._pm.state.last_metrics = metrics
+    def update_metrics(self, metrics: Any, temp_unit: str = "C") -> None:
+        """Metrics tick: the overlay grid's tiles show the live values (#301).
+
+        It only cached them, under a docstring promising video-overlay redraws
+        nothing ever read, so every tile showed its sub-metric name.  Only the
+        device on show paints the shared grid.
+        """
         readings = getattr(metrics, 'readings', None) or {}
-        self.log.debug(
+        if self._pm.ui_active:
+            self._w['theme_setting'].update_metrics(readings, temp_unit)
+        self.frame_log.debug(
             "update_metrics: %s readings=%d", self._device_key, len(readings),
         )
-
-    def flash_element(self, index: int) -> None:
-        """Flash/blink selected overlay element on preview."""
-        from ...core.commands import FlashOverlayElement, ResolveOverlay
-        # The overlay-element widgets are 1:1 (in order) with the EFFECTIVE
-        # layout on screen (user > mask > theme), so map the clicked index →
-        # that element's real id.  Every entry carries one: ResolveOverlay
-        # mints positional ids for a theme's own elements, which come from a
-        # DC parse and have none — the old bare-index fallback then named
-        # something FlashOverlayElement could never match (#150/#203).
-        elements = self._app.dispatch(
-            ResolveOverlay(key=self._device_key),
-        ).elements
-        # Out of range means the widget list and the layout have desynced —
-        # keep a name so the failure is one findable WARNING, not a crash.
-        element_id = (
-            elements[index].id if 0 <= index < len(elements) else str(index)
-        )
-        self.log.info("flash_element: index=%d → element_id=%s",
-                      index, element_id)
-        self._app.dispatch(FlashOverlayElement(
-            key=self._device_key, element_id=element_id, duration_ms=980,
-        ))
-        self._flash_timer.start(980)
-        self._render_and_send()
-
-    def _on_flash_timeout(self) -> None:
-        log.info("_on_flash_timeout")
-        self.log.debug("_on_flash_timeout: re-rendering")
-        self._render_and_send()
 
     # ── Display Settings ───────────────────────────────────────────
 
@@ -1158,6 +943,9 @@ class LCDHandler(BaseHandler):
         self._app.dispatch(SetOrientation(
             key=self._device_key, degrees=degrees,
         ))
+        # The re-root to the new orientation's catalog (#169 "not filling")
+        # already happened INSIDE that dispatch — see _adopt_reoriented_theme.
+        self._adopt_reoriented_theme()
         self._sync_rotation_state(degrees)
         ow, oh = self._pm.state.lcd_size
         self.log.info(
@@ -1165,123 +953,77 @@ class LCDHandler(BaseHandler):
             degrees, ow, oh, self._pm.state.is_rotated,
         )
         self._sync_preview_size()   # composed orientation, portrait-theme aware (#136)
-        # _update_theme_directories switches the browser catalog to the new
-        # orientation dims + re-lists it, and auto-loads the first theme ONLY on
-        # first install (nothing active yet).  When a theme IS already active it
-        # returns False and leaves the OLD-orientation theme rendering — so reload
-        # the active theme's oriented variant here, or the device keeps a
-        # landscape bg letterboxed into the portrait buffer (#169 "not filling").
-        if not self._update_theme_directories():
-            self._reload_theme_for_orientation()
+        # Switches the browser catalog to the new orientation dims + re-lists
+        # it, and auto-loads the first theme ONLY on first install.
+        self._update_theme_directories()
 
-    def _reload_theme_for_orientation(self) -> None:
-        """Reload the ACTIVE theme from the just-switched orientation catalog.
+    def _adopt_reoriented_theme(self) -> None:
+        """Catch this View up with the theme the CORE just re-rooted.
 
-        A rotation swaps the browser catalog (``theme1600720`` ↔ ``theme7201600``)
-        but not the rendered theme; the C# re-authors the theme per orientation,
-        so the portrait catalog ships a genuine portrait ``00.png`` that fills the
-        720×1600 buffer.  Reloading the same-name variant from the new catalog
-        gives the same result — a filled, upright frame (#169).
+        ``SetOrientation`` publishes ``OrientationChanged``, which
+        ``App._on_orientation_changed`` handles by reloading the active theme
+        — plus the cloud background and the mask — from the new orientation's
+        catalog, each through the device's own artwork library.  Publication is
+        synchronous, so it has already run by the time ``set_rotation``
+        continues; nothing tells the View, so the cached path would keep
+        pointing at the old catalog (``trcc_app`` reads it for save/export).
 
-        Falls back to keeping the current theme when the new catalog has no
-        same-name variant (a user's custom theme, or the #136 portrait-fallback
-        where the local dir resolves back to landscape); there the render pipeline
-        pixel-rotates the landscape art so it is at least correctly oriented.
+        This panel used to RE-DECIDE that instead, dispatching a second
+        ``LoadTheme`` of its own.  Two costs, both measured: the second load
+        took the default ``reset_overrides=True`` and so persist-cleared the
+        overlay edits the core had just deliberately preserved, and its
+        resolver preferred the user tree over the shipped one, silently
+        swapping a shipped theme for a same-named saved theme.  It existed
+        because July's ``oriented_theme_path`` looked only in the generic
+        ``theme{w}{h}``, missing the per-SKU libraries #169's cooler uses;
+        ``0709ad5f`` taught the core resolver those libraries on 2026-08-23
+        and the workaround has been redundant since.
+
+        ``_show_overlay_layout``, not ``_adopt_loaded_overlay``: a rotation
+        re-roots the SAME theme, so the persisted overlay toggle is the
+        authority and must be shown, never replaced (#276).
         """
-        active = self._pm.state.current_theme_path
-        if active is None:
-            return
-        answer = self._app.dispatch(
-            OrientedThemeTarget(key=self._device_key, active_theme=active))
-        if not answer.ok:
-            self.log.warning(
-                "_reload_theme_for_orientation: %s", answer.message)
-            return
-        if not answer.target:
-            self.log.info(
-                "_reload_theme_for_orientation: no oriented variant of '%s' in the "
-                "%dx%d catalog — keeping current theme (pixel-rotate fallback)",
-                active.name, *answer.catalog_size,
+        snap = self._app.dispatch(LcdSnapshot(key=self._device_key))
+        current = (
+            Path(snap.current_theme) if snap.ok and snap.current_theme else None
+        )
+        if current == self._pm.state.current_theme_path:
+            self.log.debug(
+                "_adopt_reoriented_theme: %s unchanged at %s",
+                self._device_key, current,
             )
             return
         self.log.info(
-            "_reload_theme_for_orientation: reloading '%s' from the %dx%d catalog "
-            "→ %s", active.name, *answer.catalog_size, answer.target,
+            "_adopt_reoriented_theme: core re-rooted %s → %s",
+            self._pm.state.current_theme_path, current,
         )
-        self._select_theme_from_path(
-            Path(answer.target), persist=True, overlay_config=True)
-
-    def set_split_mode(self, mode: int) -> None:
-        self.log.info("set_split_mode: %d -> %d device=%s",
-                      self._pm.split_mode, mode, self._device_key)
-        self._pm.split_mode = mode
-        self._app.dispatch(SetSplitMode(
-            key=self._device_key, mode=mode,
-        ))
+        self._pm.state.current_theme_path = current
+        if current is not None:
+            self._show_overlay_layout()
 
     # ── Background / Screencast Toggles ────────────────────────────
 
     def on_background_toggle(self, enabled: bool) -> None:
-        """Handle background display toggle.
+        """The background switch, as the C#'s: on draws one, off draws none.
 
-        Enabling "background" mode means "show the theme's static bg,
-        not the override video".  StopVideo handles the timer through
-        VideoStopped — no direct ``_animation_timer.stop()`` here.
+        On also closes the media player (the C#'s ``ClosePlayer``); the window
+        ends a cast before calling this.  A theme's or a user's background
+        VIDEO is the background and keeps playing -- this used to ``StopVideo``
+        it.  The switch itself shows what the App then holds (``follow_app``).
         """
-        self.log.info("on_background_toggle: enabled=%s device=%s",
-                      enabled, self._device_key)
-        self._pm.background_active = enabled
-        if enabled:
-            self._app.dispatch(StopVideo(key=self._device_key))
-            self._w['preview'].set_playing(False)
-            self._w['preview'].show_video_controls(False)
-        self._render_and_send()
-        kind = "video" if self._video_status().playing else "image"
-        self._w['preview'].set_status(
-            f"Background: {'On' if enabled else 'Off'} ({kind})",
-        )
-
-    def on_screencast_frame(self, image: Any) -> None:
-        """Handle a captured screencast frame — encode + send to the LCD.
-
-        Encoding to wire bytes runs through ``app.display.build_screencast_frame``
-        before the SendFrame dispatch.  Best-effort: if the device isn't
-        currently registered, drop silently — screencast outlives device
-        churn.
-        """
-        # Per-tick path; entry stays DEBUG.
-        #
-        # The preview is NOT painted here.  It used to be, straight from this
-        # raw grab — which is a DIFFERENT PICTURE from the one the panel gets:
-        # the wire frame carries the theme's mask and metric elements
-        # composited over the capture, and this image carries neither.  The
-        # panel showed them, the preview did not.
-        #
-        # ``SendScreencastFrame`` publishes ``FrameSent`` with the composited
-        # surface, exactly as ``RenderAndSend`` does, and the bus bridge hands
-        # it to ``handle_frame``.  One producer, one picture, and the preview
-        # agrees with the glass by construction rather than by two call sites
-        # being kept in step.
-        # The capture tick hands over a renderer SURFACE; the wire speaks
-        # ``RawFrame``.  Passing the surface straight through is what made
-        # every frame die on ``.data`` — the preview updated and the panel
-        # stayed blank.  The conversion is local toolkit work and stays here;
-        # everything after it (look up the device, encode for its panel, send)
-        # is one dispatch, which is also what makes it work in daemon mode.
-        # The conversion is local toolkit work — ``ui/gui`` IS the Qt adapter,
-        # and a module-level function keeps it out of ``app.renderer``, which
-        # an ``AppProxy`` does not have.  Reaching it there was the last thing
-        # in ``ui/`` that raised under TRCC_DAEMON=1: measured at 39
-        # AttributeErrors in ~7 seconds of a driven screencast, one per 150 ms
-        # tick.  Everything after it — look up the device, encode for its
-        # panel, send — is one dispatch, which is what makes it work remotely.
-        from ...adapters.render.qt import qimage_to_raw_rgb24
-        result = self._app.dispatch(SendScreencastFrame(
-            key=self._device_key,
-            frame=qimage_to_raw_rgb24(image),
-        ))
-        if not result.ok:
-            self.log.debug("on_screencast_frame: %s", result.message)
+        ds = self._lcd_settings()
+        self.log.info("on_background_toggle: enabled=%s device=%s source=%s mode=%s",
+                      enabled, self._device_key, ds.display_source,
+                      ds.background_mode)
+        if not enabled:
+            self._app.dispatch(SetBackgroundMode(key=self._device_key,
+                                                 mode="transparent"))
+            return
+        if ds.display_source == "media":
+            self._app.dispatch(SetMediaPlayer(key=self._device_key, uri=""))
+        if ds.background_mode == "transparent":
+            self._app.dispatch(SetBackgroundMode(key=self._device_key,
+                                                 mode="theme"))
 
     # ── Slideshow / Carousel ───────────────────────────────────────
 
@@ -1294,10 +1036,8 @@ class LCDHandler(BaseHandler):
             "_update_slideshow_state: enabled=%s themes=%d interval=%ss",
             enabled, len(themes), interval_s,
         )
-
-        # ConfigureSlideshow + SetSlideshow own persistence AND reset
-        # the SlideshowService cursor.  Dispatch BEFORE starting the
-        # Qt timer so the first tick reads a freshly-reset cursor.
+        # The panel's edit, saved; ``SetSlideshow`` is what rotates it -- the
+        # App's driver, not a timer in this window.
         from ...core.commands import ConfigureSlideshow, SetSlideshow
         self._app.dispatch(ConfigureSlideshow(
             key=self._device_key,
@@ -1308,110 +1048,47 @@ class LCDHandler(BaseHandler):
             key=self._device_key, enabled=enabled,
         ))
 
-        if enabled and themes:
-            self._slideshow_timer.start(interval_s * 1000)
-        else:
-            self._slideshow_timer.stop()
+    def on_game_mode_delegate(self, change: dict[str, Any]) -> None:
+        """The game-mode button or threshold box: send the half that changed.
+
+        The panel shows the result when the App's ``GameModeChanged`` comes
+        back (``follow_app``), never what this window sent.
+        """
+        from ...core.commands import SetGameMode
+
+        self.log.info("on_game_mode_delegate: device=%s %s",
+                      self._device_key, change)
+        self._app.dispatch(SetGameMode(
+            key=self._device_key, enabled=change.get("enabled"),
+            threshold=change.get("threshold")))
 
     def on_slideshow_delegate(self) -> None:
         """Handle slideshow toggle from local theme panel."""
         self.log.info("on_slideshow_delegate: device=%s", self._device_key)
         self._update_slideshow_state()
 
-    def _on_slideshow_tick(self) -> None:
-        """Auto-rotate to next theme — SlideshowService owns the cursor.
+    def on_slideshow_changed(self, event: Any) -> None:
+        """The saved slideshow changed — here, in another UI, or the App
+        switched it off because another source took the panel."""
+        self.log.info("on_slideshow_changed: %s enabled=%s active=%s",
+                      event.key, event.enabled, self._pm.ui_active)
+        if self._pm.ui_active:   # the local-theme widgets are shared
+            self._show_slideshow(event.themes, event.enabled, event.interval_s)
 
-        Pre-S1.1 this maintained a local ``self._slideshow_index``
-        counter that duplicated ``SlideshowService._state[key].cursor``
-        — two sources of truth for the same rotation position.  The
-        service cursor was reset by ConfigureSlideshow but never
-        advanced by anything, leaving daemon-mode / CLI / API rotation
-        broken: only the GUI's local counter moved.
+    def on_theme_loaded(self, event: Any) -> None:
+        """A theme was loaded on this device — by the slideshow, or any UI.
 
-        Post-S1.1 the GUI calls ``app.slideshow.advance(key, config)``
-        which returns the next theme NAME (or None when not yet due).
-        Single cursor across all surfaces.
+        Re-reads what the panel shows (``_restore_theme_and_preview``) so the
+        current theme and the overlay editor follow; the slideshow's rotations
+        used to update them from this window's own tick.
         """
-        local = self._w['theme_local']
-        themes = local.get_slideshow_themes()
-        if not themes:
-            self.log.warning(
-                "_on_slideshow_tick: themes list empty — stopping timer",
-            )
-            self._slideshow_timer.stop()
-            return
-        # The Command reads the PERSISTED config, which ``ConfigureSlideshow``
-        # / ``SetSlideshow`` already wrote from this same panel.  Rebuilding a
-        # SlideshowConfig here made the panel a second source for a fact
-        # settings owns — and put the only rotation driver inside this UI.
-        next_name = self._app.dispatch(
-            AdvanceSlideshow(key=self._device_key),
-        ).theme_name
-        if next_name is None:
-            # Within the interval window — the service decided not to
-            # rotate yet.  Qt timer will fire again at next interval.
-            return
-        # Resolve name → theme_info.  The slideshow stores names; the
-        # panel knows the path for each name.
-        theme_info = next(
-            (t for t in themes if t.name == next_name), None,
-        )
-        if theme_info is None:
-            self.log.warning(
-                "_on_slideshow_tick: service returned name %r but "
-                "the panel has no theme by that name — skipping",
-                next_name,
-            )
-            return
-        path = Path(theme_info.path)
-        self.log.info(
-            "_on_slideshow_tick: SlideshowService → %s (%s)",
-            next_name, path,
-        )
-        if path.exists():
-            self._app.dispatch(LoadTheme(
-                key=self._device_key, path=path,
-            ))
-            self._pm.state.current_theme_path = path
-            self._load_theme_overlay_config(path)
-        else:
-            self.log.warning(
-                "_on_slideshow_tick: theme path missing %s — skipping",
-                path,
-            )
+        self.log.info("on_theme_loaded: %s theme=%s active=%s",
+                      event.key, event.theme_name, self._pm.ui_active)
+        if self._pm.ui_active:
+            self._restore_theme_and_preview()
 
     # ── Rendering ──────────────────────────────────────────────────
 
-    def _render_and_send(self) -> None:
-        """Render overlay + send to LCD, update preview.
-
-        Skipped while video playback owns the wire (the animation timer
-        loop dispatches its own ``RenderAndSend``).  Preview refresh
-        happens via the ``FrameSent`` → ``rebuild_preview`` bridge.
-        """
-        from ...core.commands import RenderAndSend
-        if self._animation_timer.isActive():
-            self.log.debug(
-                "_render_and_send: skipped — animation timer owns the wire",
-            )
-            return
-        # One dispatch answers both questions.  The pre-check this replaces
-        # existed to avoid a raised DeviceNotConnectedError; the Command
-        # reports it now, so asking the device first is a second round-trip
-        # for an answer the first one carries.
-        result = self._app.dispatch(RenderAndSend(key=self._device_key))
-        if result.connected is False:
-            self.log.debug(
-                "_render_and_send: device %s not connected — skip",
-                self._device_key,
-            )
-            return
-        if not result.ok:
-            # Static-theme render failure is user-visible.  WARN, not DEBUG.
-            self.log.warning(
-                "_render_and_send: %s render failed — %s",
-                self._device_key, result.message,
-            )
 
     def render_and_preview(self) -> Any:
         """Render overlay and update preview (no send)."""
@@ -1488,11 +1165,8 @@ class LCDHandler(BaseHandler):
         delete) — re-dispatches ListThemes through the dir-resolution refresh."""
         self._update_theme_directories(force=True)
 
-    def _update_theme_directories(self, *, force: bool = False) -> bool:
+    def _update_theme_directories(self, *, force: bool = False) -> None:
         """Reload theme browser directories for the current resolution.
-
-        Returns True if a first-install auto-load happened (caller should
-        skip restore_last_theme to avoid a redundant double-load).
 
         Reads come from ``DeviceState`` (cached at connect / rotation),
         not the legacy ``self._device.X`` properties which next/'s
@@ -1516,11 +1190,8 @@ class LCDHandler(BaseHandler):
         dirs = self._app.dispatch(
             ResolveThemeDirectories(key=self._device_key))
         if not dirs.ok:
-            # False, not None: the return value means "a first-install
-            # auto-load happened", and an unresolvable device auto-loaded
-            # nothing.
             self.log.warning("_update_theme_directories: %s", dirs.message)
-            return False
+            return
         bw, bh = dirs.catalog_size
         theme_dir = Path(dirs.theme_dir)
         user_theme_dir = Path(dirs.user_theme_dir)
@@ -1543,7 +1214,7 @@ class LCDHandler(BaseHandler):
                 "active=%s) — skipping the browser rebuild",
                 self._device_key, bw, bh, self._pm.ui_active,
             )
-            return False
+            return
         self._dirs_signature = signature
 
         self.log.info(
@@ -1597,27 +1268,6 @@ class LCDHandler(BaseHandler):
                 "offer this device's %dx%d catalog to whichever panel IS "
                 "selected)", self._device_key, bw, bh)
 
-        # First-install auto-load: nothing rendered yet AND no saved theme →
-        # load the first listed theme (user-precedence already applied by
-        # ListThemes, so a user theme wins the auto-load too).
-        ds = self._lcd_settings()
-        if (self._pm.state.current_theme_path is None
-                and not ds.current_theme and themes):
-            first = themes[0]
-            self.log.info("Data ready: auto-loading first theme: %s", first.path)
-            self._select_theme_from_path(Path(first.path), persist=True,
-                                          overlay_config=True)
-            return True
-        return False
-
-    @property
-    def is_background_active(self) -> bool:
-        return self._pm.background_active
-
-    @is_background_active.setter
-    def is_background_active(self, value: bool) -> None:
-        self._pm.background_active = value
-
     @property
     def brightness_level(self) -> int:
         return self._pm.brightness_level
@@ -1633,52 +1283,28 @@ class LCDHandler(BaseHandler):
     # ── Lifecycle ──────────────────────────────────────────────────
 
     def cleanup(self) -> None:
-        """Stop timers and release device resources."""
+        """Release THIS window's timers and caches — never the panel.
+
+        It used to blank the panel too (``StopVideo`` + ``SleepDevice``).  As a
+        daemon client that put every panel to sleep for every other UI when one
+        window quit; and on a disconnect ``SleepDevice``, which connects its
+        device first, RECONNECTED the panel that had just gone -- measured.
+        Blanking belongs to whoever owns the panels: ``App.close()``.
+        """
+        self.log.info("cleanup: %s — timers and caches only", self._device_key)
         self.deactivate()
         self._pixmap_cache.clear()
         self._last_render_id = None
-        self._cleanup_device()
 
     def deactivate(self) -> None:
         """Full pause — stop all timers (called from cleanup)."""
-        self._animation_timer.stop()
-        self._slideshow_timer.stop()
-        self._flash_timer.stop()
+        self._set_video_playing(False, reason="deactivate")
 
     def set_inactive(self) -> None:
-        """Soft pause for sidebar switch — keep video playing in background.
+        """Sidebar switch: this handler stops writing the shared widgets.
 
-        Multi-display: dropping `_ui_active` stops shared-widget writes
-        without killing the per-device animation timer, so the LCD keeps
-        showing its theme while another device owns the GUI panel.
+        Only the gate drops (``_pm.ui_active``).  The panel keeps playing
+        because the App's VideoLoop drives it, not this window.
         """
         self._pm.ui_active = False
-        self._slideshow_timer.stop()
-        self._flash_timer.stop()
 
-    def _cleanup_device(self) -> None:
-        """Blank the panel and release LCD resources via Commands."""
-        self.log.info("_cleanup_device: device_key=%s", self._device_key)
-        # Teardown, not "stop": unload playback but keep the persisted
-        # background — clearing it here wiped the user's chosen video from
-        # trcc.json on every GUI close and every disconnect (#271).
-        self._app.dispatch(StopVideo(key=self._device_key, keep_override=True))
-        try:
-            # ``SleepDevice`` is the INTENT — "turn this screen off", the one
-            # Command ``App.close``, ``trcc display sleep`` and ``/sleep`` all
-            # dispatch — and it owns the not-connected guard this used to
-            # hand-roll in an ``except``.  ``SendColor`` is its MECHANISM, and
-            # dispatching it here made the gui the only surface reaching past
-            # the intent.  Wire output is unchanged: SleepDevice's LCD branch
-            # IS ``SendColor(0, 0, 0)``, verified byte-identical.
-            result = self._app.dispatch(SleepDevice(key=self._device_key))
-            if not result.ok:
-                self.log.debug("_cleanup_device: blank skipped — %s",
-                               result.message)
-        except (OSError, RuntimeError) as e:
-            # A raw USB error leaking from below the transport port.  A
-            # ``TransportError`` is already turned into a Result inside the
-            # Command, so this is the last resort only: teardown must not raise.
-            self.log.debug("_cleanup_device: blank failed: %s", e)
-        # App.detach is owned by app.close() in the window's closeEvent;
-        # individual handler cleanup just releases timers + state.

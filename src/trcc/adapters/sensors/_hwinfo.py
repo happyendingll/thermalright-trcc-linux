@@ -37,7 +37,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any, NamedTuple
 
-from ...core.logs import per_frame
+from ...core.logs import Blob, per_frame
 from ...core.ports import CpuSource, GpuSource
 
 log = logging.getLogger(__name__)
@@ -80,7 +80,7 @@ _SNAPSHOT_TTL_S = 0.1
 
 def _decode_cstr(blob: bytes) -> str:
     """Decode a fixed-length NUL-terminated C string (latin-1, lossless)."""
-    log.debug("_decode_cstr: blob=%s", blob)
+    log.debug("_decode_cstr: blob=%s", Blob(blob))
     return blob.split(b"\x00", 1)[0].decode("latin-1", errors="replace").strip()
 
 
@@ -100,7 +100,7 @@ class _Header(NamedTuple):
 
 def _parse_header(buf: bytes) -> _Header:
     """Decode the 44-byte header.  Raises ValueError on bad magic / short buffer."""
-    log.debug("_parse_header: buf=%s", buf)
+    log.debug("_parse_header: buf=%s", Blob(buf))
     if len(buf) < _HEADER_SIZE:
         raise ValueError(
             f"HWiNFO header too short: {len(buf)} < {_HEADER_SIZE}",
@@ -134,7 +134,7 @@ class _BytesMapping(_MappingPort):
     """Test seam — wraps a ``bytes`` buffer captured from a real MMF dump."""
 
     def __init__(self, data: bytes) -> None:
-        log.debug("__init__: data=%s", data)
+        log.debug("__init__: data=%s", Blob(data))
         self._data = data
 
     def read(self, offset: int, length: int) -> bytes:
@@ -143,6 +143,35 @@ class _BytesMapping(_MappingPort):
 
     def close(self) -> None:
         pass
+
+
+def _kernel32_prototyped(ctypes: Any) -> Any:
+    """A private kernel32 whose four calls carry their real C prototypes.
+
+    ctypes' default return type is a C ``int``: on 64-bit Windows the address
+    ``MapViewOfFile`` returns was truncated to 32 bits, and ``read`` copied
+    from wherever that pointed -- a crash, not an exception, for anyone whose
+    sensors come from HWiNFO.  Legacy set these; the rebuild dropped them.
+    Without ``argtypes`` a 64-bit address passed back in overflows a C int.
+
+    A private ``WinDLL`` (not the shared ``windll.kernel32``) keeps these
+    prototypes out of process-wide state, and ``use_last_error`` is what makes
+    ``ctypes.get_last_error()`` report this call's error, not a stale one.
+    """
+    log.debug("_kernel32_prototyped: building a private kernel32")
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenFileMappingW.restype = ctypes.c_void_p
+    k32.OpenFileMappingW.argtypes = [ctypes.c_uint32, ctypes.c_int,
+                                     ctypes.c_wchar_p]
+    k32.MapViewOfFile.restype = ctypes.c_void_p
+    k32.MapViewOfFile.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                                  ctypes.c_uint32, ctypes.c_uint32,
+                                  ctypes.c_size_t]
+    k32.UnmapViewOfFile.restype = ctypes.c_int
+    k32.UnmapViewOfFile.argtypes = [ctypes.c_void_p]
+    k32.CloseHandle.restype = ctypes.c_int
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    return k32
 
 
 class _HWiNFOMapping(_MappingPort):
@@ -164,7 +193,7 @@ class _HWiNFOMapping(_MappingPort):
         # on non-Windows boxes don't trip on missing kernel32 attributes.
         import ctypes
 
-        self._kernel32 = ctypes.windll.kernel32     # type: ignore[attr-defined]
+        self._kernel32 = _kernel32_prototyped(ctypes)
         self._handle = self._kernel32.OpenFileMappingW(
             _FILE_MAP_READ, False, _MMF_NAME,
         )
@@ -504,8 +533,10 @@ class HwinfoGpu(GpuSource):
         frame_log.debug("power")
         return self._find(TYPE_POWER, entry_name_contains="gpu power")
 
-    def fan(self) -> float | None:
-        frame_log.debug("fan")
+    def fan_rpm(self) -> float | None:
+        # TYPE_FAN is RPM.  No fan() here: which HWiNFO entry carries a GPU
+        # fan's duty percent is unverified, so none is claimed.
+        frame_log.debug("fan_rpm")
         return self._max(TYPE_FAN)
 
     def vram_used(self) -> float | None:
@@ -554,7 +585,7 @@ def discover_hwinfo_gpus(
 
 def _snapshot_from_bytes(data: bytes) -> _Snapshot:
     """Build a snapshot from a raw MMF byte buffer — used by tests."""
-    log.debug("_snapshot_from_bytes: data=%s", data)
+    log.debug("_snapshot_from_bytes: data=%s", Blob(data))
     return _Snapshot(_BytesMapping(data))
 
 

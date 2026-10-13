@@ -25,8 +25,9 @@ point them at these helpers).
 """
 from __future__ import annotations
 
+import errno
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from trcc.adapters.device import _f5
@@ -36,10 +37,22 @@ from trcc.adapters.device.hid_lcd import (
 )
 from trcc.adapters.device.led import _HID_REPORT_SIZE, _MAGIC
 from trcc.adapters.device.ly_lcd import _PID_LY
-from trcc.core.models import DeviceInfo, ProductInfo, Wire
+from trcc.adapters.rgb.asus_aura import AURA_VID, MAINBOARD_PIDS, REPORT_ID
+from trcc.adapters.rgb.corsair_dram import crc8
+from trcc.adapters.system._base import disambiguate
+from trcc.core.models import (
+    DeviceInfo,
+    ProductInfo,
+    RamAccessState,
+    RamAccessStatus,
+    Wire,
+)
 from trcc.core.ports import (
+    RamAccess,
     SensorEnumerator,
+    SmBus,
     Transport,
+    WriteBuffer,
 )
 from trcc.core.protocol import get_profile, pm_to_fbl
 from trcc.core.registry import find_product
@@ -323,26 +336,28 @@ class DeviceSpec:
 def scan_device_infos(specs: list[DeviceSpec]) -> list[DeviceInfo]:
     """One ``DeviceInfo`` per spec that resolves in the registry.
 
-    A fleet is keyed by ``(vid, pid)``, so two rows sharing one USB identity
-    cannot both exist: the second is shadowed in ``by_key`` and only the first
-    ever answers a handshake.  That is easy to hit by accident — the widescreen
-    families all live behind ``87ad:70db`` — and silently gives you a fleet
-    that is not the one you wrote, so say so.  (To exercise several variants of
-    one vid:pid, click them in the dev console's variant panel, which pins each
-    reply as you go, rather than listing them here.)
+    Each spec sits on its own simulated port (``1-<n>``) and the result goes
+    through the REAL :func:`disambiguate`, exactly as a real scan does, so two
+    IDENTICAL specs are two identical coolers under ``vid:pid@1-<n>`` (#287).
+    Until 2026-09-25 the mock had no port and could not show that case at all.
+
+    Two DIFFERENT specs under one vid:pid are still a mistake: the fleet
+    scripts replies by ``(vid, pid)``, so the second never answers its own
+    handshake — the widescreen families all live behind ``87ad:70db`` and it is
+    easy to list two by accident.  That is warned about.  (To exercise several
+    variants of one vid:pid, click them in the dev console's variant panel,
+    which pins each reply as you go, rather than listing them here.)
     """
-    seen: dict[tuple[int, int], str] = {}
-    for spec in specs:
-        first = seen.get(spec.key)
-        if first is not None:
-            log.warning(
-                "mock scan: %04x:%04x listed twice (%r shadows %r) — a fleet "
-                "holds ONE spec per vid:pid; use the variant panel to switch "
-                "between them", spec.vid, spec.pid, first, spec.name)
-        else:
-            seen[spec.key] = spec.name
+    first: dict[tuple[int, int], DeviceSpec] = {}
     out: list[DeviceInfo] = []
-    for spec in specs:
+    for port, spec in enumerate(specs, start=1):
+        seen = first.setdefault(spec.key, spec)
+        if seen is not spec and replace(spec, name=seen.name) != seen:
+            log.warning(
+                "mock scan: %04x:%04x listed twice with DIFFERENT specs (%r "
+                "shadows %r) — replies are scripted per vid:pid; use the "
+                "variant panel to switch between them",
+                spec.vid, spec.pid, seen.name, spec.name)
         product = find_product(spec.vid, spec.pid)
         if product is None:
             log.warning(
@@ -351,10 +366,11 @@ def scan_device_infos(specs: list[DeviceSpec]) -> list[DeviceInfo]:
                 spec.vid, spec.pid, spec.name,
             )
             continue
-        out.append(DeviceInfo(vid=spec.vid, pid=spec.pid, bcd_device=spec.bcd))
-        log.info("mock scan: + %s [%04x:%04x] wire=%s bcdDevice=0x%04x",
-                 spec.name, spec.vid, spec.pid, product.wire.value, spec.bcd)
-    return out
+        out.append(DeviceInfo(vid=spec.vid, pid=spec.pid, bcd_device=spec.bcd,
+                              path=f"1-{port}"))
+        log.info("mock scan: + %s [%04x:%04x] port=1-%d wire=%s bcdDevice=0x%04x",
+                 spec.name, spec.vid, spec.pid, port, product.wire.value, spec.bcd)
+    return disambiguate(out)
 
 
 # Exact (pm, sub, fbl) the dev console pins for a vid:pid — bypasses the
@@ -462,13 +478,23 @@ class MockPlatform(FakePlatform):
     a tmp dir for unit tests); it flows through ``FakePlatform`` → ``FakePaths``.
     """
 
-    def __init__(self, specs: list[dict], root: Path) -> None:
+    def __init__(self, specs: list[dict], root: Path, *,
+                 host_sensors: bool = False) -> None:
         super().__init__(root)
+        # FakePlatform's fixed sensors unless a caller asks for THIS computer's.
+        # Off by default because the host's are not the test's to read: CI's VM
+        # has no CPU temperature sensor (six qtgui tests failed there alone), and
+        # the memory clock runs ``pkexec dmidecode`` -- 263 times per suite run
+        # until 2026-10-07, as root, through the polkit rule this project
+        # installs.  A dev tool that wants real metrics passes True.
+        self._host_sensors = host_sensors
         self._specs: list[DeviceSpec] = [DeviceSpec.parse(s) for s in specs]
         self._by_key: dict[tuple[int, int], DeviceSpec] = {
             s.key: s for s in self._specs
         }
         self._reply_override: ReplyOverride = {}
+        #: The board's lighting controller: what an Aura follower writes to.
+        self.aura = ScriptedAuraController()
         log.info("MockPlatform: %d spec(s) loaded, root=%s",
                  len(self._specs), root)
 
@@ -484,7 +510,7 @@ class MockPlatform(FakePlatform):
                  vid, pid, pm, sub, fbl)
 
     def sensors(self) -> SensorEnumerator:
-        """REAL host sensors — the mock fakes ONLY the USB handshake.
+        """REAL host sensors when ``host_sensors=True`` — a dev tool's choice.
 
         The whole point of the multi-device mock is "a vid/pid + a scripted
         handshake stands in for the panel"; everything else is the live
@@ -493,6 +519,8 @@ class MockPlatform(FakePlatform):
         ``FakePlatform`` hands to unit tests.  Built the same way the real
         ``LinuxOS.sensors`` builds it (``build_linux_sensors``).
         """
+        if not self._host_sensors:
+            return super().sensors()
         if self._sensors is None:
             from trcc.adapters.sensors.aggregator import build_linux_sensors
             log.info("MockPlatform.sensors: REAL host sensors (dev box)")
@@ -505,10 +533,247 @@ class MockPlatform(FakePlatform):
         return scan_device_infos(self._specs)
 
     def open_transport(self, wire: Wire, vid: int, pid: int,
-                       serial: str | None = None) -> Transport:
-        """Hand back the scripted transport for *wire* (see Platform.open_transport)."""
+                       serial: str | None = None,
+                       unit: str = "", *,
+                       hid_reports: bool = False,
+                       report_id: int = 0x00) -> Transport:
+        """Hand back the scripted transport for *wire* (see Platform.open_transport).
+
+        *unit* is accepted and not used to pick a script: two units of one
+        model are the SAME model, so they replay the same handshake.  What
+        #287 needed from the mock was two Devices under two keys, which
+        ``App.attach`` now provides.  *hid_reports* (the firmware-override
+        transport) replays the same scripted bulk reply.
+        """
+        if hid_reports and is_aura(vid, pid):
+            return self.aura
         if wire is Wire.SCSI:
             return scripted_scsi_transport(
                 self._by_key, vid, pid, self._reply_override)
         return scripted_bulk_transport(
             self._by_key, vid, pid, self._reply_override)
+
+
+# ── Scripted Corsair RGB memory (the SMBus a stand-in platform hands out) ────
+
+#: The device info the maintainer's stick at 0x19 returned on 2026-10-08:
+#: Corsair (0x1B1C), Vengeance RGB DDR5 (0x0701), protocol 4; checksum 0xee.
+CORSAIR_STICK_INFO = bytes.fromhex(
+    "1c1b010708000600020109000dc00316" "0484cbafcef91964c61b00f504000000")
+
+
+class ScriptedCorsairStick:
+    """A Corsair lighting controller, register for register.
+
+    Reads: the id pair (0x43 / 0x44), the active buffer one byte at a time
+    (0x40), its checksum (0x42) and a ready status (0x30).  Writes: 0x61
+    selects the device info, 0x0B resets the write buffer, 0x21 rewinds,
+    0x20 appends a byte, 0x82 commits the buffer as the effect (1) or the
+    colours (2), and 0x31 / 0x32 take a direct colour packet.  Any other
+    read raises: a script that is asked something it never answered is a
+    protocol change, and should fail loudly.
+
+    After a commit it refuses the next *saving* accesses, as a real stick
+    is off the bus for ~118 ms while it saves (measured on Vengeance DDR5).
+    """
+
+    def __init__(self, info: bytes = CORSAIR_STICK_INFO,
+                 checksum: int | None = None,
+                 ids: tuple[int, int] = (0x1B, 0x04),
+                 saving: int = 3) -> None:
+        log.debug("ScriptedCorsairStick: ids %s", ids)
+        self.info, self.ids = info, ids
+        self.saving_for, self.saving = saving, 0
+        self.checksum = crc8(info) if checksum is None else checksum
+        self.at = 0
+        self.reading = True               # info selected; False: write buffer
+        self.buffer = bytearray()
+        self.blocks: list[tuple[int, bytes]] = []
+        self.effect = b""                 # the committed effect configuration
+        self.colors = b""                 # the committed colour data
+
+    def _off_the_bus_while_saving(self) -> None:
+        if self.saving:
+            log.debug("ScriptedCorsairStick: saving, %d refusal(s) left",
+                      self.saving)
+            self.saving -= 1
+            raise OSError(errno.ENXIO, "No such device or address")
+
+    def read(self, register: int) -> int:
+        log.debug("ScriptedCorsairStick.read: 0x%02x", register)
+        self._off_the_bus_while_saving()
+        match register:
+            case 0x43:
+                return self.ids[0]
+            case 0x44:
+                return self.ids[1]
+            case 0x40:
+                self.at += 1
+                return self.info[self.at - 1]
+            case 0x42:
+                return self.checksum if self.reading else crc8(self.buffer)
+            case 0x30:
+                return 0x00
+        raise AssertionError(f"unexpected read of 0x{register:02x}")
+
+    def write(self, register: int, value: int) -> None:
+        log.debug("ScriptedCorsairStick.write: 0x%02x = 0x%02x", register, value)
+        self._off_the_bus_while_saving()
+        match register:
+            case 0x61:
+                self.reading = True
+            case 0x21:
+                self.at = 0
+            case 0x0B:
+                self.reading, self.buffer = False, bytearray()
+            case 0x20:
+                self.buffer.append(value)
+            case 0x82 if value == 1:
+                self.effect, self.saving = bytes(self.buffer), self.saving_for
+            case 0x82 if value == 2:
+                self.colors, self.saving = bytes(self.buffer), self.saving_for
+            case _:
+                raise AssertionError(
+                    f"unexpected write of 0x{value:02x} to 0x{register:02x}")
+
+
+class ScriptedSmBus(SmBus):
+    """Scripted sticks by address; every access is recorded, an empty
+    address NACKs as real hardware does."""
+
+    def __init__(self, chips: dict[int, ScriptedCorsairStick],
+                 number: int = 3) -> None:
+        super().__init__(number)
+        log.debug("ScriptedSmBus: i2c-%d sticks at %s", number,
+                  [hex(a) for a in chips])
+        self.chips = chips
+        self.touched: list[tuple[str, int, int]] = []
+        self.closed = False
+
+    def _chip(self, address: int) -> ScriptedCorsairStick:
+        if address not in self.chips:
+            raise OSError(6, "No such device or address")
+        return self.chips[address]
+
+    def read_byte_data(self, address: int, register: int) -> int:
+        self.touched.append(("read", address, register))
+        return self._chip(address).read(register)
+
+    def write_byte_data(self, address: int, register: int, value: int) -> None:
+        self.touched.append(("write", address, register))
+        self._chip(address).write(register, value)
+
+    def write_block_data(self, address: int, register: int,
+                         data: bytes) -> None:
+        self.touched.append(("block", address, register))
+        assert len(data) <= 32
+        self._chip(address).blocks.append((register, bytes(data)))
+
+    def close(self) -> None:
+        log.debug("ScriptedSmBus.close: i2c-%d", self.number)
+        self.closed = True
+
+
+def scripted_ram() -> ScriptedSmBus:
+    """The maintainer's two Vengeance RGB DDR5 sticks, at 0x19 and 0x1B."""
+    log.info("scripted_ram: two Corsair sticks on a scripted i2c-3")
+    return ScriptedSmBus({0x19: ScriptedCorsairStick(),
+                          0x1B: ScriptedCorsairStick()})
+
+
+class ScriptedRamAccess(RamAccess):
+    """The RAM-lighting grant, in memory: switching it asks nobody for a
+    password and writes no udev rule -- a mock window's "Enable" must never
+    reach the host's polkit."""
+
+    def __init__(self, state: RamAccessState = RamAccessState.ON) -> None:
+        log.info("ScriptedRamAccess: starts %s", state.value)
+        self.state = state
+
+    def status(self) -> RamAccessStatus:
+        log.debug("ScriptedRamAccess.status: %s", self.state.value)
+        return RamAccessStatus(self.state,
+                               f"RAM lighting is {self.state.value} (scripted)")
+
+    def enable(self) -> RamAccessStatus:
+        log.info("ScriptedRamAccess.enable")
+        self.state = RamAccessState.ON
+        return self.status()
+
+    def disable(self) -> RamAccessStatus:
+        log.info("ScriptedRamAccess.disable")
+        self.state = RamAccessState.OFF
+        return self.status()
+
+
+# ── Scripted ASUS Aura motherboard controller (USB HID, report 0xEC) ────────
+
+def is_aura(vid: int, pid: int) -> bool:
+    """Whether *vid*:*pid* is an Aura motherboard controller."""
+    log.debug("is_aura: %04x:%04x", vid, pid)
+    return vid == AURA_VID and pid in MAINBOARD_PIDS
+
+
+#: The config table the maintainer's PRIME Z790-V AX (0b05:19af, firmware
+#: AULA3-AR32-0304) returned on 2026-10-10: 3 ARGB headers, 1 onboard LED,
+#: and a 12 V count of 2 -- more than the LEDs, so read as none.  The first
+#: 36 bytes as read (the log line showed no more); the rest zero, unread.
+AURA_BOARD_TABLE = bytes.fromhex(
+    "1e9f03010000783c00010000783c00010000783c000000000000000104020"
+    "1f400000000").ljust(60, b"\x00")
+
+
+class ScriptedAuraController(FakeBulkTransport):
+    """An Aura motherboard controller: answers the firmware (0x82) and config
+    table (0xB0) requests as the real one does -- report id first, then the
+    reply marker -- and records every report written, so a test reads back
+    exactly what reached the board.  A request it does not know is answered
+    with nothing, as a silent device would.
+
+    By default it is the maintainer's board, reply for reply; a test that
+    needs another shape passes the counts.
+    """
+
+    FIRMWARE = "AULA3-AR32-0304"
+
+    def __init__(self, argb_headers: int | None = None,
+                 onboard_leds: int | None = None,
+                 rgb_headers: int | None = None, *,
+                 piece: int = 0) -> None:
+        super().__init__()
+        #: Bytes per read: 0 for a whole 65-byte report (hidraw), 32 as
+        #: libusb delivered it on the maintainer's board -- 32, 32, 1.
+        self.piece = piece
+        self.table = bytearray(AURA_BOARD_TABLE)
+        for at, value in ((0x02, argb_headers), (0x1B, onboard_leds),
+                          (0x1D, rgb_headers)):
+            if value is not None:
+                self.table[at] = value
+        log.debug("ScriptedAuraController: %d ARGB, %d onboard, %d 12V",
+                  self.table[0x02], self.table[0x1B], self.table[0x1D])
+
+    def write(self, endpoint: int, data: WriteBuffer, timeout_ms: int = 100) -> int:
+        sent = super().write(endpoint, data, timeout_ms)
+        match bytes(data)[:1]:
+            case b"\x82":
+                self._answer(bytes([REPORT_ID, 0x02])
+                             + self.FIRMWARE.encode().ljust(63, b"\x00"))
+            case b"\xb0":
+                self._answer(bytes([REPORT_ID, 0x30, 0, 0]) + bytes(self.table)
+                             + b"\x00")
+        return sent
+
+    def _answer(self, report: bytes) -> None:
+        """Queue *report*, whole or in pieces."""
+        log.debug("ScriptedAuraController._answer: %d byte(s), piece %d",
+                  len(report), self.piece)
+        size = self.piece or len(report)
+        self.read_script.extend(report[i:i + size]
+                                for i in range(0, len(report), size))
+
+    def reports(self, opcode: int) -> list[bytes]:
+        """Every report written that starts with *opcode*."""
+        found = [data for _ep, data in self.writes if data[:1] == bytes([opcode])]
+        log.debug("ScriptedAuraController.reports: 0x%02x -> %d", opcode,
+                  len(found))
+        return found

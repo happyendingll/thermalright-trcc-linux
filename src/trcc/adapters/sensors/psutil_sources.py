@@ -176,14 +176,19 @@ class ComputedIo:
 #: step with ``hwmon._CPU_DRIVERS`` / ``_DISK_DRIVERS`` / ``_DRAM_DRIVERS`` and
 #: the GPU drivers beside them.
 _ROLE_OWNED_CHIPS = frozenset({
-    "coretemp", "k10temp", "zenpower",          # cpu
     "amdgpu", "nouveau", "i915", "xe",          # gpu
     "nvme", "drivetemp",                        # disk
     "spd5118", "jc42",                          # dram
 })
 
+#: CPU chips own only their FIRST input -- ``temp1``, the one ``HwmonCpu``
+#: reads as ``cpu:temp`` (Tctl on k10temp, "Package id 0" on coretemp).  They
+#: were claimed whole, so k10temp's Tccd* and coretemp's "Core N" were read by
+#: nothing at all (#301); the rest now reach the board family like any input.
+_CPU_CHIPS = frozenset({"coretemp", "k10temp", "zenpower"})
 
-def _slug(chip: str, label: str, index: int) -> str:
+
+def sensor_slug(chip: str, label: str, index: int) -> str:
     """A stable, readable key for one board input.
 
     The LABEL is the identity a user recognises -- they are looking for
@@ -191,7 +196,7 @@ def _slug(chip: str, label: str, index: int) -> str:
     the positional index only when the chip publishes no label, because a bare
     ``temp7`` tells the user nothing and two unlabelled chips would collide.
     """
-    log.debug("_slug: chip=%s label=%r index=%d", chip, label, index)
+    log.debug("sensor_slug: chip=%s label=%r index=%d", chip, label, index)
     base = label.strip() or f"temp{index}"
     cleaned = "".join(c if c.isalnum() else "_" for c in base).strip("_").lower()
     return f"{chip}_{cleaned}" if cleaned else f"{chip}_temp{index}"
@@ -293,7 +298,7 @@ class PsutilBoardTemp(BoardTempSource):
         self._chip = chip
         self._label = label
         self._index = index
-        self._key = _slug(chip, label, index)
+        self._key = sensor_slug(chip, label, index)
         # Own scan when constructed alone (tests, a single ad-hoc source);
         # discover_board_temps hands every source the SAME one.
         self._scan = scan if scan is not None else _TemperatureScan()
@@ -347,6 +352,10 @@ def discover_board_temps() -> list[BoardTempSource]:
         if chip in _ROLE_OWNED_CHIPS:
             continue
         for index, entry in enumerate(entries, start=1):
+            if chip in _CPU_CHIPS and index == 1:
+                log.debug("discover_board_temps: %s/%s is cpu:temp's", chip,
+                          entry.label or index)
+                continue
             if not entry.current:
                 log.debug("discover_board_temps: %s/%s reads 0 — unconnected "
                           "header, skipped", chip, entry.label or index)

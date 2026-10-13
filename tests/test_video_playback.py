@@ -21,36 +21,37 @@ from trcc.adapters.theme.filesystem import FileContentStore
 from trcc.app import App
 from trcc.core.commands import (
     ConnectDevice,
+    PauseVideo,
     PlayVideo,
     RenderAndSend,
+    SeekVideo,
     SetBackground,
     StopVideo,
     TickDisplay,
 )
 from trcc.core.errors import ThemeError
-from trcc.core.events import VideoStarted, VideoStopped
+from trcc.core.events import VideoAdvanced, VideoStarted, VideoStopped
 from trcc.core.models import (
     FitMode,
     Kind,
     ProductInfo,
-    RawFrame,
     Theme,
     Wire,
 )
 from trcc.core.ports import Renderer
 from trcc.core.protocol import get_profile
+from trcc.core.toolchain import present
 from trcc.services.background import BackgroundSlot
 from trcc.services.display import DisplayService
 from trcc.services.media import (
     MediaService,
     Playback,
     VideoDecoder,
-    _ffmpeg_available,
 )
 from trcc.services.overlay import OverlayService
 from trcc.services.settings import Settings
 
-from .conftest import FakePaths, FakePlatform
+from .conftest import FakePaths, FakePlatform, renderable_theme, show_a_theme
 
 
 def _encoded_frame(value: int, w: int = 320, h: int = 320) -> bytes:
@@ -99,7 +100,17 @@ def connected_app(app: App, monkeypatch: pytest.MonkeyPatch) -> App:
     platform.scsi.read_script.append(bytes(resp))   # type: ignore[attr-defined]
     result = app.dispatch(ConnectDevice(key=_KEY))
     assert result.ok, result.message
+    show_a_theme(app, _KEY)
     return app
+
+
+@pytest.fixture
+def ticking_app(connected_app: App) -> App:
+    """A connected panel with a theme AND a renderer -- a real tick renders."""
+    from trcc.adapters.render.qt import QtRenderer
+
+    connected_app.set_renderer(QtRenderer())
+    return connected_app
 
 
 @pytest.fixture
@@ -150,9 +161,44 @@ def test_play_video_loads_into_media_service(
     assert len(stub_media) == 1
     assert stub_media[0][0] == _KEY
     assert stub_media[0][1] == video_file
-    assert stub_media[0][2] == (320, 320)   # SCSI profile resolution
+    # A file picked from outside both trees is the USER's: native decode, so
+    # fit_mode has something to scale.  It decoded at canvas (320, 320) and
+    # played stretched with W/H inert until 2026-09-25 (#291).
+    assert stub_media[0][2] is None
     # Playback is now stored on the App
     assert connected_app.media.playback(_KEY) is not None
+
+
+def test_play_video_program_asset_keeps_canvas_size(
+    connected_app: App, stub_media: list,
+) -> None:
+    """Cloud/program videos under ``data_dir`` are pre-authored at the panel's
+    canvas, so they keep the canvas-size decode."""
+    cloud = connected_app.platform.paths().cloud_theme_dir(320, 320) / "a001.mp4"
+    cloud.parent.mkdir(parents=True, exist_ok=True)
+    cloud.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+
+    assert connected_app.dispatch(PlayVideo(key=_KEY, path=cloud)).ok
+    assert stub_media[0][2] == (320, 320)
+
+
+@pytest.mark.parametrize(("where", "is_user"), [
+    ("data_dir/theme320320/Theme1/00.png", False),   # stock theme
+    ("data_dir/web/320320/a001.mp4", False),          # cloud background
+    ("data_dir/web/zt320320/000a/01.png", False),     # cloud mask
+    ("user_content_dir/data/theme320320/Mine/00.png", True),
+    ("elsewhere/Downloads/clip.mp4", True),           # picked, never copied
+    ("elsewhere/Pictures/wide.png", True),
+])
+def test_only_program_data_is_program_content(
+    fake_platform, tmp_path: Path, where: str, is_user: bool,
+) -> None:
+    """The ONE decision behind the decode size and the background fit rule."""
+    paths = fake_platform.paths()
+    root, _, rest = where.partition("/")
+    base = {"data_dir": paths.data_dir(), "user_content_dir": paths.user_content_dir(),
+            "elsewhere": tmp_path}[root]
+    assert paths.is_user_content(base / rest) is is_user
 
 
 def test_play_video_user_uploaded_asset_decodes_at_native(
@@ -354,6 +400,50 @@ def test_stop_video_idempotent_on_unattached_device(app: App) -> None:
     assert result.ok is True
 
 
+def test_a_paused_seek_tells_every_ui_where_it_landed(
+    connected_app: App, stub_media: list, video_file: Path,
+) -> None:
+    """While paused no tick announces a position, so the seek must, or
+    every other UI's progress bar stays where it was.  This App has no
+    Renderer: the seek used to raise from ``app.display`` after moving the
+    cursor.
+
+    MUTATION CHECK -- MEASURED 2026-10-01: drop the publish → fails; call
+    ``app.display.invalidate`` directly → raises.
+    """
+    connected_app.dispatch(PlayVideo(key=_KEY, path=video_file))
+    connected_app.dispatch(PauseVideo(key=_KEY, paused=True))
+    seen: list[VideoAdvanced] = []
+    connected_app.events.subscribe(VideoAdvanced, seen.append)  # type: ignore[arg-type]
+
+    result = connected_app.dispatch(SeekVideo(key=_KEY, frame=2))
+
+    assert result.ok, result.message
+    assert [(e.key, e.cursor, e.frame_count, e.fps) for e in seen] == [
+        (_KEY, 2, 3, 15)]
+
+
+def test_a_pause_or_resume_is_announced_whoever_asked(
+    connected_app: App, stub_media: list, video_file: Path,
+) -> None:
+    """``PauseVideo`` -- and ``ToggleVideo``, which dispatches it -- tells
+    every UI; the playback stays loaded, so nothing else would.
+
+    MUTATION CHECK -- MEASURED 2026-10-02: drop the publish → fails.
+    """
+    from trcc.core.commands import ToggleVideo
+    from trcc.core.events import VideoPauseChanged
+
+    connected_app.dispatch(PlayVideo(key=_KEY, path=video_file))
+    seen: list[VideoPauseChanged] = []
+    connected_app.events.subscribe(VideoPauseChanged, seen.append)  # type: ignore[arg-type]
+
+    connected_app.dispatch(PauseVideo(key=_KEY, paused=True))
+    connected_app.dispatch(ToggleVideo(key=_KEY))
+
+    assert [(e.key, e.paused) for e in seen] == [(_KEY, True), (_KEY, False)]
+
+
 def test_stop_video_keep_override_unloads_but_keeps_the_persisted_path(
     connected_app: App, stub_media: list, video_file: Path,
 ) -> None:
@@ -415,9 +505,6 @@ class _RecordingRenderer(Renderer):
             return _Surface(surface.h, surface.w)
         return _Surface(surface.w, surface.h)
 
-    def flip_horizontal(self, surface: Any) -> Any:
-        return surface
-
     def apply_brightness(self, surface: Any, percent: int) -> Any:
         return surface
 
@@ -434,13 +521,6 @@ class _RecordingRenderer(Renderer):
     def from_raw_rgb24(self, frame: Any) -> Any:
         self._record("from_raw_rgb24", frame)
         return _Surface(frame.width, frame.height)
-
-    def to_raw_rgb24(self, surface):
-        # The inverse the port now requires.  Test doubles carry no pixels,
-        # so this reports the surface's DIMENSIONS with blank bytes — enough
-        # for a caller that only needs a correctly-sized RawFrame.
-        w, h = self.surface_size(surface)
-        return RawFrame(data=bytes(w * h * 3), width=w, height=h)
 
     def decode_image(self, data: bytes) -> Any:
         self._record("decode_image", data)
@@ -565,7 +645,7 @@ def test_video_decoder_rejects_zero_dimension(
     """
     clip = tmp_home / "clip.mp4"
     clip.write_bytes(b"\x00\x00\x00\x18ftypmp42")
-    monkeypatch.setattr("trcc.services.media._ffmpeg_available", lambda: True)
+    monkeypatch.setattr("trcc.core.toolchain.present", lambda tool: True)
     monkeypatch.setattr(
         "trcc.services.media.subprocess.run",
         lambda *a, **k: _FakeProc(b""),
@@ -586,7 +666,7 @@ def test_video_decoder_accepts_valid_dimension(
     clip = tmp_home / "clip.mp4"
     clip.write_bytes(b"\x00\x00\x00\x18ftypmp42")
     two = _encoded_frame(0xFF102030, 320, 480) + _encoded_frame(0xFF405060, 320, 480)
-    monkeypatch.setattr("trcc.services.media._ffmpeg_available", lambda: True)
+    monkeypatch.setattr("trcc.core.toolchain.present", lambda tool: True)
     monkeypatch.setattr(
         "trcc.services.media.subprocess.run",
         lambda *a, **k: _FakeProc(two),
@@ -858,6 +938,49 @@ def test_rendered_surface_exposes_sent_frame_for_preview(
     assert display.rendered_surface(_KEY) is None       # cleared with the scene
 
 
+def test_the_background_is_the_frame_without_its_overlay_text(
+    tmp_home: Path,
+) -> None:
+    """What the RGB follower samples: the video under a theme's white text.
+
+    A theme's clock and readings turned the maintainer's RAM white at the
+    top and bottom while it followed a red video (2026-10-10).
+    """
+    from trcc.adapters.render.qt import QtRenderer
+
+    renderer = QtRenderer()
+    media = MediaService()
+    media._playbacks[_KEY] = Playback(frames=[_encoded_frame(0xFF5A5A5A)],
+                                      fps=15)
+    display = DisplayService(
+        renderer=renderer, themes=FileContentStore(),
+        overlay=OverlayService(renderer),
+        settings=Settings(FakePaths(tmp_home)),
+        media=media, backgrounds=BackgroundSlot(), paths=FakePaths(tmp_home),
+    )
+    info = ProductInfo(
+        vid=0x0402, pid=0x3922, vendor="ALi Corp", product="LCD",
+        wire=Wire.SCSI, kind=Kind.LCD, device_type=1, fbl=100,
+        native_resolution=(320, 320), orientations=(0,),
+    )
+    theme = Theme(path=tmp_home / "theme", name="t", resolution=(320, 320),
+                  config={"elements": [
+                      {"id": "t", "type": "text", "text": "8888", "x": 160,
+                       "y": 160, "size": 80, "color": "#ffffff"}]})
+    assert display.background_surface(_KEY) is None    # nothing built yet
+    display.build_frame(info=info, theme=theme, sensors={},
+                        profile=get_profile(100))
+
+    def white(surface: object) -> int:
+        pixels, width, height, stride = renderer.raw_argb32(surface)
+        return sum(pixels[y * stride + 4 * x:y * stride + 4 * x + 3]
+                   == b"\xff\xff\xff"
+                   for y in range(0, height, 2) for x in range(0, width, 2))
+
+    assert white(display.rendered_surface(_KEY)) > 100     # the text is sent
+    assert white(display.background_surface(_KEY)) == 0    # and not followed
+
+
 # ── TickDisplay vs RenderAndSend — the two tick ROLES ─────────────────
 #
 # TickDisplay is the ANIMATION tick; RenderAndSend is the RE-RENDER tick.  They
@@ -875,17 +998,17 @@ def _playback_for(app: App, video_file: Path) -> Playback:
 
 
 def test_tick_display_advances_the_cursor(
-    connected_app: App, stub_media: Any, video_file: Path,
+    ticking_app: App, stub_media: Any, video_file: Path,
 ) -> None:
     """The animation tick moves the cursor — this is what makes video play.
 
     Before this Command the advance lived in three UIs (GUI timer, CLI play
     loop, REST tick route); qtgui had no copy and so showed frame 0 forever.
     """
-    playback = _playback_for(connected_app, video_file)
+    playback = _playback_for(ticking_app, video_file)
     start = playback.cursor
 
-    connected_app.dispatch(TickDisplay(key=_KEY))
+    ticking_app.dispatch(TickDisplay(key=_KEY))
 
     assert playback.cursor != start, "TickDisplay must advance the playback"
 
@@ -923,7 +1046,7 @@ def test_render_and_send_never_advances_the_cursor(
 
 
 def test_tick_display_reports_video_state_on_the_result(
-    connected_app: App, stub_media: Any, video_file: Path,
+    ticking_app: App, stub_media: Any, video_file: Path,
 ) -> None:
     """The Result carries cursor/frame_count/interval_ms.
 
@@ -931,9 +1054,9 @@ def test_tick_display_reports_video_state_on_the_result(
     WITHOUT reaching for ``app.media`` — which is an AttributeError under
     TRCC_DAEMON=1, where the UI holds an AppProxy (#249).
     """
-    playback = _playback_for(connected_app, video_file)
+    playback = _playback_for(ticking_app, video_file)
 
-    result = connected_app.dispatch(TickDisplay(key=_KEY))
+    result = ticking_app.dispatch(TickDisplay(key=_KEY))
 
     assert result.frame_count == 3
     assert result.cursor == playback.cursor
@@ -941,14 +1064,14 @@ def test_tick_display_reports_video_state_on_the_result(
 
 
 def test_tick_display_without_a_playback_reports_no_video(
-    connected_app: App,
+    ticking_app: App,
 ) -> None:
     """No playback → the video fields stay None, NOT zero.
 
     A UI needs to tell "this theme is not a video" from "frame 0 of a video":
     the gui stops its animation timer on exactly that transition.
     """
-    result = connected_app.dispatch(TickDisplay(key=_KEY))
+    result = ticking_app.dispatch(TickDisplay(key=_KEY))
 
     assert result.cursor is None
     assert result.frame_count is None
@@ -956,18 +1079,18 @@ def test_tick_display_without_a_playback_reports_no_video(
 
 
 def test_tick_display_honours_pause(
-    connected_app: App, stub_media: Any, video_file: Path,
+    ticking_app: App, stub_media: Any, video_file: Path,
 ) -> None:
     """Paused playback holds its cursor — the guard lives in Playback.advance.
 
     The three UI copies each hand-rolled a ``not playback.paused`` check; they
     lose it here rather than move it, because the playback already self-guards.
     """
-    playback = _playback_for(connected_app, video_file)
+    playback = _playback_for(ticking_app, video_file)
     playback.pause(True)
     start = playback.cursor
 
-    connected_app.dispatch(TickDisplay(key=_KEY))
+    ticking_app.dispatch(TickDisplay(key=_KEY))
 
     assert playback.cursor == start
 
@@ -1155,7 +1278,7 @@ def test_a_gif_background_routes_to_playback_not_rejection(
     assert connected_app.media.playback(_KEY) is not None
 
 
-@pytest.mark.skipif(not _ffmpeg_available(), reason="ffmpeg not installed")
+@pytest.mark.skipif(not present("ffmpeg"), reason="ffmpeg not installed")
 def test_a_real_gif_decodes_to_many_frames(tmp_home: Path) -> None:
     """The decode half — the capability was there before the table entry was.
 
@@ -1304,3 +1427,372 @@ def test_a_PAUSED_video_still_gets_the_reactive_render(
         "a paused video's overlay was not re-composited — nothing else is "
         "ticking this panel, so the metrics are frozen on the glass"
     )
+
+
+# ── VideoLoop: the one ticker, in the core (#249) ───────────────────────────
+#
+# A video advances one frame per TickDisplay.  The daemon had no ticker, so a
+# video loaded through it showed frame 0 forever; the GUIs each had their own,
+# and two on one device would play it at double speed.  These drive
+# ``VideoLoop.tick(now)`` with a scripted clock — no thread, no sleeping.
+
+
+class _LoopApp:
+    """What VideoLoop reads (the live playbacks, whether game mode holds a
+    panel) and does (dispatch)."""
+
+    def __init__(self, **playing: Any) -> None:
+        from types import SimpleNamespace
+
+        from trcc.core.results import RenderResult
+
+        self._playing = playing
+        self.media = SimpleNamespace(playing=lambda: dict(self._playing))
+        self.sent: list[str] = []
+        self.result = RenderResult(ok=True, cursor=1, frame_count=30)
+
+    def dispatch(self, cmd: Any) -> Any:
+        self.sent.append(cmd.key)
+        return self.result
+
+    def game_engaged(self, key: str) -> bool:
+        return False
+
+
+def _pb(fps: int = 10) -> Any:
+    from trcc.services.media import Playback
+    return Playback(frames=[b"f"] * 30, fps=fps)
+
+
+def _loop(app: Any) -> Any:
+    from trcc.services.video_loop import VideoLoop
+    return VideoLoop(app)                      # type: ignore[arg-type]
+
+
+def test_the_loop_ticks_every_playing_device_including_the_unfocused_one() -> None:
+    """Focus is a UI notion; a panel nobody is looking at must keep playing."""
+    app = _LoopApp(a=_pb(), b=_pb())
+    _loop(app).tick(now=0.0)
+    assert sorted(app.sent) == ["a", "b"]
+
+
+def test_the_loop_paces_each_video_at_its_own_rate() -> None:
+    app = _LoopApp(slow=_pb(fps=10), fast=_pb(fps=50))      # 100 ms / 20 ms
+    loop = _loop(app)
+    for step in range(11):                                   # 0 .. 100 ms
+        loop.tick(now=step * 0.01)
+    assert app.sent.count("fast") == 6                       # 0,20,40,60,80,100
+    assert app.sent.count("slow") == 2                       # 0,100
+
+
+def test_a_stall_does_not_fire_a_burst_of_frames() -> None:
+    app = _LoopApp(v=_pb(fps=10))
+    loop = _loop(app)
+    loop.tick(now=0.0)
+    loop.tick(now=5.0)                        # 50 frames late
+    loop.tick(now=5.0)
+    assert app.sent == ["v", "v"]             # one catch-up frame, not fifty
+
+
+def test_a_video_that_stops_playing_stops_being_ticked() -> None:
+    """Paused, stopped and detached all fall out of MediaService.playing()."""
+    app = _LoopApp(v=_pb())
+    loop = _loop(app)
+    loop.tick(now=0.0)
+    app._playing.clear()
+    loop.tick(now=1.0)
+    assert app.sent == ["v"]
+
+
+def test_media_playing_excludes_a_paused_or_empty_playback() -> None:
+    from trcc.services.media import MediaService, Playback
+
+    media = MediaService.__new__(MediaService)
+    paused = _pb()
+    paused.paused = True
+    media._playbacks = {"on": _pb(), "paused": paused,
+                        "empty": Playback(frames=[])}
+    assert sorted(media.playing()) == ["on"]
+
+
+def test_a_disconnected_panel_is_reported_once_not_per_frame(caplog) -> None:
+    from dataclasses import replace
+
+    app = _LoopApp(v=_pb(fps=50))
+    app.result = replace(app.result, connected=False)
+    loop = _loop(app)
+    with caplog.at_level(logging.WARNING, logger="trcc.services.video_loop"):
+        for step in range(5):
+            loop.tick(now=step * 0.02)
+    assert len(app.sent) == 5, "the cursor keeps moving while unplugged"
+    assert caplog.text.count("device not connected") == 1
+
+
+def test_the_real_tick_advances_and_announces_the_frame(fake_platform) -> None:
+    """End to end in a real App: the loop's TickDisplay moves the cursor and
+    publishes VideoAdvanced — the daemon case, with no UI anywhere."""
+    from trcc.core.events import VideoAdvanced
+
+    app = App(fake_platform)
+    seen: list[VideoAdvanced] = []
+    app.events.subscribe(VideoAdvanced, seen.append)
+    playback = _pb()
+    app.media._playbacks["0402:3922"] = playback
+
+    app.video_loop.tick(now=0.0)
+
+    assert playback.cursor == 1
+    assert [(e.key, e.cursor, e.frame_count, e.fps) for e in seen] == [
+        ("0402:3922", 1, 30, 10)]
+
+
+def test_the_session_starts_the_loop_and_close_stops_it(fake_platform) -> None:
+    app = App(fake_platform)
+    app.start_session()
+    try:
+        assert app.video_loop.is_running
+    finally:
+        app.close()
+    assert not app.video_loop.is_running
+
+
+# ── A background on a panel with no theme (P4c) ──────────────────────
+#
+# PlayVideo and SetBackground fill the background slot the ACTIVE THEME
+# composes.  With no theme -- after a push (``display color`` drops it), or on
+# a panel nothing loaded one on -- both reported success and the render refused
+# every frame: 0 frames sent, and after a push not even a warning.  Measured
+# first by driving a real 145-frame theme video on the mock (2026-09-29).
+
+
+def _wire(app: App) -> list[int]:
+    """Every frame's size, as the device's sender receives it."""
+    sent: list[int] = []
+    sender = app.senders[_KEY]
+    real = sender.submit
+    sender.submit = lambda data, *a, **k: (   # type: ignore[method-assign]
+        sent.append(len(data)), real(data, *a, **k))[1]
+    return sent
+
+
+@pytest.fixture
+def themeless(connected_app: App, stub_media: list, tmp_home: Path) -> App:
+    """A connected panel with a real renderer and NO active theme."""
+    from trcc.adapters.render.qt import QtRenderer
+
+    connected_app.set_renderer(QtRenderer())
+    connected_app.active_themes.pop(_KEY)
+    return connected_app
+
+
+def test_a_video_on_a_panel_with_no_theme_plays_over_its_saved_one(
+        themeless: App, stub_media: list, video_file: Path,
+        tmp_home: Path) -> None:
+    """MUTATION CHECK: drop ``_theme_under_background`` from PlayVideo."""
+    saved = renderable_theme(tmp_home / "themes", "Saved")
+    themeless.settings.set_current_theme(_KEY, str(saved.resolve()))
+    sent = _wire(themeless)
+
+    result = themeless.dispatch(PlayVideo(key=_KEY, path=video_file))
+    ticks = [themeless.dispatch(TickDisplay(key=_KEY)) for _ in range(3)]
+
+    assert result.ok, result.message
+    assert themeless.active_themes[_KEY].name == "Saved"
+    assert [t.ok for t in ticks] == [True, True, True]
+    assert sent, "no frame reached the wire"
+
+
+def test_after_a_push_a_video_takes_the_panel_back(
+        themeless: App, stub_media: list, video_file: Path,
+        tmp_home: Path) -> None:
+    """``display color`` drops the theme and HOLDS the panel; a video then said
+    "playing" while every tick skipped as held -- silently, 0 frames."""
+    from trcc.core.commands import LoadTheme, SendColor
+
+    saved = renderable_theme(tmp_home / "themes", "Saved")
+    assert themeless.dispatch(LoadTheme(key=_KEY, path=saved)).ok
+    assert themeless.dispatch(SendColor(key=_KEY, r=255, g=0, b=0)).ok
+    assert _KEY in themeless.held and _KEY not in themeless.active_themes
+    sent = _wire(themeless)
+
+    result = themeless.dispatch(PlayVideo(key=_KEY, path=video_file))
+    tick = themeless.dispatch(TickDisplay(key=_KEY))
+
+    assert result.ok, result.message
+    assert _KEY not in themeless.held
+    assert (tick.ok, tick.message.startswith("Rendered")) == (True, True)
+    assert sent, "no frame reached the wire"
+
+
+def test_an_image_background_on_a_panel_with_no_theme_is_shown(
+        themeless: App, tmp_home: Path) -> None:
+    """Still images never pass through PlayVideo -- a rule there alone left
+    ``SetBackground(image)`` answering "set" with nothing drawn.
+    MUTATION CHECK: drop ``_theme_under_background`` from SetBackground."""
+    saved = renderable_theme(tmp_home / "themes", "Saved")
+    themeless.settings.set_current_theme(_KEY, str(saved.resolve()))
+    image = renderable_theme(tmp_home / "bg", "Img") / "00.png"
+    sent = _wire(themeless)
+
+    result = themeless.dispatch(SetBackground(key=_KEY, path=image))
+    render = themeless.dispatch(RenderAndSend(key=_KEY))
+
+    assert result.ok, result.message
+    assert render.ok, render.message
+    assert sent, "no frame reached the wire"
+
+
+def test_the_saved_theme_comes_up_without_its_old_background(
+        themeless: App, stub_media: list, video_file: Path,
+        tmp_home: Path) -> None:
+    """Restoring through RestoreDeviceState would replay the OLD background
+    video just before the new one replaced it -- two decodes per play.
+    MUTATION CHECK: dispatch RestoreDeviceState in the rule instead."""
+    saved = renderable_theme(tmp_home / "themes", "Saved")
+    themeless.settings.set_current_theme(_KEY, str(saved.resolve()))
+    old = tmp_home / "old.mp4"
+    old.write_bytes(video_file.read_bytes())
+    themeless.settings.set_background_path(_KEY, str(old))
+
+    assert themeless.dispatch(PlayVideo(key=_KEY, path=video_file)).ok
+
+    assert [path for _key, path, _size in stub_media] == [video_file]
+
+
+def test_no_theme_installed_is_an_honest_failure(
+        themeless: App, stub_media: list, video_file: Path) -> None:
+    """Nothing saved and nothing installed (a fresh install, or 7z missing):
+    say so -- it used to answer "playing" and draw nothing."""
+    want = (f"{_KEY} has no theme to show a background on, and none is "
+            "installed — install themes, or use load-video / load-image to "
+            "show a file on its own")
+
+    video = themeless.dispatch(PlayVideo(key=_KEY, path=video_file))
+
+    assert (video.ok, video.message) == (False, want)
+    assert stub_media == []                     # nothing decoded for nothing
+
+
+# ── The media player's record (item 1a, 2026-09-30) ──────────────────
+#
+# ``SetMediaPlayer`` recorded its source and THEN dispatched ``PlayVideo``,
+# which writes the file as ``background_path`` -- and the display sources are
+# exclusive, so the record was erased the moment playback began.  Driven:
+# ``media_player_uri = None, background_path = clip`` after every local media
+# player.  The save, the restore and every UI's video switch read it wrong.
+
+
+def _source(app: App) -> str:
+    from trcc.core.commands import LcdSnapshot
+    return app.dispatch(LcdSnapshot(key=_KEY)).display_source
+
+
+def _video_theme(app: App, tmp_path: Path) -> Path:
+    """Make the active theme a video theme: a folder with its own Theme.mp4."""
+    from trcc.core.models import Theme
+    folder = tmp_path / "VideoTheme"
+    folder.mkdir()
+    (folder / "Theme.mp4").write_bytes(b"\x00\x00\x00\x18ftypmp42")
+    app.active_themes[_KEY] = Theme(path=folder, name="VideoTheme",
+                                     resolution=(320, 320))
+    return folder / "Theme.mp4"
+
+
+def test_a_local_media_player_is_recorded_as_one(
+    connected_app: App, stub_media: list, video_file: Path,
+) -> None:
+    from trcc.core.commands import SetMediaPlayer
+
+    assert connected_app.dispatch(SetMediaPlayer(key=_KEY, uri=str(video_file))).ok
+
+    s = connected_app.settings.for_device(_KEY)
+    assert (s.media_player_uri, s.background_path) == (str(video_file), None)
+    assert _source(connected_app) == "media"
+    assert connected_app.media.playback(_KEY) is not None
+
+
+def test_a_media_player_that_fails_to_play_records_nothing(
+    connected_app: App, video_file: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trcc.core.commands import SetMediaPlayer
+
+    def refuse(*_a: Any, **_k: Any) -> Any:
+        raise ThemeError("undecodable")
+    monkeypatch.setattr(MediaService, "load_video", refuse)
+
+    assert not connected_app.dispatch(SetMediaPlayer(key=_KEY, uri=str(video_file))).ok
+    assert connected_app.settings.for_device(_KEY).media_player_uri is None
+
+
+def test_stop_ends_the_media_player_and_teardown_keeps_it(
+    connected_app: App, stub_media: list, video_file: Path,
+) -> None:
+    from trcc.core.commands import SetMediaPlayer
+
+    connected_app.dispatch(SetMediaPlayer(key=_KEY, uri=str(video_file)))
+    connected_app.dispatch(StopVideo(key=_KEY, keep_override=True))
+    assert connected_app.settings.for_device(_KEY).media_player_uri == str(video_file)
+
+    connected_app.dispatch(StopVideo(key=_KEY))
+    assert connected_app.settings.for_device(_KEY).media_player_uri is None
+    assert _source(connected_app) == "background"
+
+
+def test_clearing_the_media_player_brings_back_the_theme_s_own_video(
+    connected_app: App, stub_media: list, video_file: Path, tmp_path: Path,
+) -> None:
+    """As the C#'s ClosePlayer -- and the App decides, not a UI reload."""
+    from trcc.core.commands import SetMediaPlayer
+    from trcc.core.events import BackgroundChanged
+
+    theme_video = _video_theme(connected_app, tmp_path)
+    connected_app.dispatch(SetMediaPlayer(key=_KEY, uri=str(video_file)))
+    heard: list[str] = []
+    connected_app.events.subscribe(BackgroundChanged, lambda e: heard.append(e.key))
+
+    assert connected_app.dispatch(SetMediaPlayer(key=_KEY, uri="")).ok
+
+    s = connected_app.settings.for_device(_KEY)
+    assert s.media_player_uri is None
+    assert [c[1] for c in stub_media][-1] == theme_video, "the theme's video did not resume"
+    assert _source(connected_app) == "background"
+    assert heard == [_KEY], "clearing was not announced"
+
+
+def test_clearing_with_no_media_player_leaves_a_background_video_alone(
+    connected_app: App, stub_media: list, video_file: Path,
+) -> None:
+    from trcc.core.commands import SetMediaPlayer
+
+    connected_app.dispatch(PlayVideo(key=_KEY, path=video_file))
+    connected_app.dispatch(SetMediaPlayer(key=_KEY, uri=""))
+
+    assert connected_app.media.playback(_KEY) is not None
+    assert connected_app.settings.for_device(_KEY).background_path == str(video_file)
+
+
+def test_restore_resumes_the_media_player(
+    connected_app: App, stub_media: list, video_file: Path,
+) -> None:
+    """A restart must bring the media player back AS one, not as a background."""
+    from trcc.core.commands import RestoreDeviceState, SetMediaPlayer
+
+    connected_app.dispatch(SetMediaPlayer(key=_KEY, uri=str(video_file)))
+    connected_app.media.unload(_KEY)              # what a restart leaves
+
+    assert connected_app.dispatch(RestoreDeviceState(key=_KEY)).ok
+
+    assert connected_app.media.playback(_KEY) is not None
+    assert connected_app.settings.for_device(_KEY).media_player_uri == str(video_file)
+
+
+def test_a_web_source_is_announced(connected_app: App) -> None:
+    from trcc.core.commands import SetMediaPlayer
+    from trcc.core.events import BackgroundChanged
+
+    heard: list[str] = []
+    connected_app.events.subscribe(BackgroundChanged, lambda e: heard.append(e.key))
+    assert connected_app.dispatch(SetMediaPlayer(key=_KEY, uri="https://x.test/s")).ok
+
+    assert heard == [_KEY]
+    assert _source(connected_app) == "media"

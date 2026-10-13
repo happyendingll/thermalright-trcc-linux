@@ -5,7 +5,7 @@
      Regenerate: PYTHONPATH=src python3 dev/gen_cli_reference.py
      A command's text here IS its docstring; edit that. -->
 
-TRCC — Thermalright LCD/LED cooler control (clean-slate build).
+TRCC — Thermalright LCD/LED cooler control.
 
 Commands that act on a device take its **`KEY`** — the USB `VID:PID` shown by `trcc detect`, e.g. `0402:3922` — as the first argument.
 
@@ -27,7 +27,6 @@ trcc [OPTIONS] COMMAND [ARGS]...
 - [`trcc daemon-status`](#trcc-daemon-status)
 - [`trcc detect`](#trcc-detect)
 - [`trcc doctor`](#trcc-doctor)
-- [`trcc ensure-daemon`](#trcc-ensure-daemon)
 - [`trcc gui`](#trcc-gui)
 - [`trcc kill`](#trcc-kill)
 - [`trcc qtgui`](#trcc-qtgui)
@@ -62,10 +61,13 @@ trcc api [OPTIONS]
 | `--port`, `-p` `PORT` | Bind port |
 | `--token`, `-t` `TOKEN` | Persistent API token. When set, every request must carry `X-API-Token: <token>`. When omitted with --host 127.0.0.1, the API is unauth'd (loopback dev mode). Omitting it with any other --host is REJECTED — refusing to bind a public interface without auth. Use --token random:<n> to generate. |
 | `--pair` | Show a one-time 6-char pairing code in the terminal. Remote devices POST it to /pair to exchange for the API token. Requires --token. |
+| `--tls` | Serve HTTPS with a self-signed certificate, made once and kept in the config directory. Its SHA-256 fingerprint is printed so a client can pin it. |
+| `--tls-cert` `TLS_CERT` | Your own certificate (PEM). Needs --tls-key; implies --tls. |
+| `--tls-key` `TLS_KEY` | Your own private key (PEM). Needs --tls-cert; implies --tls. |
 
 ### `trcc daemon`
 
-Run the background daemon that owns USB + serves CLI/API clients. One process per user. Binds a Unix socket at `$XDG_RUNTIME_DIR/trcc.sock` and serves Commands until SIGTERM / SIGINT or a remote `trcc kill`. Sets `TRCC_DAEMON=1` to route clients through this daemon.
+Run the background daemon that owns USB + serves CLI/API clients. One process per user. Binds a Unix socket at `$XDG_RUNTIME_DIR/trcc.sock` (`~/.cache/trcc.sock` where that is unset, e.g. macOS) and serves Commands until SIGTERM / SIGINT or a remote `trcc kill`. This is the shared App: every other trcc command and window finds it and uses it, and the first one to need it starts it when none is running.
 
 ```bash
 trcc daemon
@@ -95,21 +97,9 @@ Alias for `trcc system doctor` — health checks.
 trcc doctor
 ```
 
-### `trcc ensure-daemon`
-
-Start the background daemon if it is not already running. *Is the daemon up? No — create it. Yes — nothing to do.* Idempotent, so a script can run it unconditionally before dispatching rather than probing first and racing between the probe and the spawn. Worth doing before a batch of commands: the daemon owns USB, the sensor poll and the render loop, so every client that talks to it does that work zero times instead of once each.
-
-```bash
-trcc ensure-daemon [OPTIONS]
-```
-
-| Option | Description |
-|---|---|
-| `--timeout` `TIMEOUT` | Seconds to wait for a spawned daemon. |
-
 ### `trcc gui`
 
-Launch the legacy Windows-style GUI (port in progress). Today's shell hosts the device sidebar + a diagnostic content area — enough to prove the legacy-on-next/-bus pattern end to end on real hardware. Real feature panels (LCD handler, theme settings, mask, video, LED) land in subsequent passes. `--resume` starts hidden in the tray (XDG autostart-on-login); bare `trcc gui` shows the window. `--decorated` asks the window manager for a normal frame. The default shell is frameless and drags by its top strip, which some window managers will not move at all — leaving the window pinned where it opened with no way to shift it (#231). The capability already existed and two guides already documented the flag; only the flag itself was missing (#247).
+Launch the Windows-style GUI. `--resume` starts hidden in the tray (XDG autostart-on-login); bare `trcc gui` shows the window. `--decorated` asks the window manager for a normal frame. The default shell is frameless and drags by its top strip, which some window managers will not move at all — leaving the window pinned where it opened with no way to shift it (#231). The capability already existed and two guides already documented the flag; only the flag itself was missing (#247).
 
 ```bash
 trcc gui [OPTIONS]
@@ -130,7 +120,7 @@ trcc kill
 
 ### `trcc qtgui`
 
-Launch the Qt-native GUI (clean-slate, layout-driven). This is the rebuild's GUI — built up over G1–G5 and used during development. See `gui` for the legacy Windows-style port. `--resume` starts hidden in the tray, the same as `gui`. Without it qtgui could not be autostarted sanely: it would pop a window on every login where the gui skin comes up quietly.
+Launch the Qt-native GUI (layout-driven). See `gui` for the Windows-style one. `--resume` starts hidden in the tray, the same as `gui`. Without it qtgui could not be autostarted sanely: it would pop a window on every login where the gui skin comes up quietly.
 
 ```bash
 trcc qtgui [OPTIONS]
@@ -187,6 +177,9 @@ trcc serve [OPTIONS]
 | `--port`, `-p` `PORT` | Bind port |
 | `--token`, `-t` `TOKEN` | Same semantics as `trcc api --token` — see `trcc api --help`. |
 | `--pair` | Same semantics as `trcc api --pair` — see `trcc api --help`. |
+| `--tls` | Serve HTTPS with a self-signed certificate, made once and kept in the config directory. Its SHA-256 fingerprint is printed so a client can pin it. |
+| `--tls-cert` `TLS_CERT` | Your own certificate (PEM). Needs --tls-key; implies --tls. |
+| `--tls-key` `TLS_KEY` | Your own private key (PEM). Needs --tls-cert; implies --tls. |
 
 ### `trcc setup`
 
@@ -235,7 +228,7 @@ App-global preferences: temp unit, language, GPU, refresh interval.
 
 ### `trcc config date-format`
 
-Set the global LCD overlay date format.
+Set every LCD date element's pattern, on every device.
 
 ```bash
 trcc config date-format FMT
@@ -307,7 +300,7 @@ trcc config temp-unit UNIT
 
 ### `trcc config time-format`
 
-Set the global LCD overlay clock format.
+Set every LCD clock element to 12h or 24h, on every device.
 
 ```bash
 trcc config time-format FMT
@@ -387,7 +380,7 @@ trcc device reset KEY
 
 ### `trcc device state`
 
-Show what a device IS — identity, connection, handshake geometry. `native_resolution` is what the product registry claims; `resolution` is what the panel answered at handshake. When they differ, the handshake wins and the difference is usually the thing worth reporting.
+Show what a device IS — identity, connection, handshake geometry. `catalog_*` is what the product registry claims for the USB id; `product` and `resolution` are the cooler the handshake identified. When they differ, the handshake wins and the difference is usually the thing worth reporting.
 
 ```bash
 trcc device state KEY
@@ -489,7 +482,7 @@ trcc display configure-slideshow [OPTIONS] KEY THEMES
 
 ### `trcc display export-video`
 
-Encode a clip into a loose `Theme.zt` sized for the device's panel. Distinct from `load-video`, which stages a whole theme directory and applies it. This gives you the `.zt` file itself — to set as a background, to keep, or to hand to `set-background`. The encode runs in the background and reports on the event bus, so `--wait` follows it and `--no-wait` returns immediately with the token. Under `TRCC_DAEMON=1` the work happens in the daemon and this terminal is simply watching it, which is why the progress can be followed from a process that is not doing the encoding.
+Encode a clip into a loose `Theme.zt` sized for the device's panel. Distinct from `load-video`, which stages a whole theme directory and applies it. This gives you the `.zt` file itself — to set as a background, to keep, or to hand to `set-background`. The encode runs in the background and reports on the event bus, so `--wait` follows it and `--no-wait` returns immediately with the token. The work happens in the shared App and this terminal only watches it, which is why the progress can be followed from a process that is not doing the encoding.
 
 ```bash
 trcc display export-video [OPTIONS] KEY PATH
@@ -506,7 +499,25 @@ trcc display export-video [OPTIONS] KEY PATH
 | `--end`, `-e` `END_MS` | Clip end in milliseconds (default: the whole clip). |
 | `--rotation`, `-r` `ROTATION` | Rotation in degrees: 0 / 90 / 180 / 270. |
 | `--fit`, `-f` `FIT` | Fit the clip to the panel: 'width' / 'height' pin that axis and crop the overflow, 'stretch' fills both. Omit for the auto fit -- scale inside the panel, never crop. A .zt is encoded AT canvas size, so this is baked in. |
+| `--fps` `FPS` | Frames per second: 15 (default, as the Windows app) or 24. |
 | `--wait` | Follow progress until the encode finishes (default), or print the token and return. |
+
+### `trcc display game`
+
+Game mode: while CPU usage stays above the threshold for 11 seconds, the panel shows only its overlay, on black, until it falls back.
+
+```bash
+trcc display game [OPTIONS] KEY [STATE]
+```
+
+| Argument | Description |
+|---|---|
+| `KEY` | Device key, e.g. 0402:3922 |
+| `STATE` | 'on' / 'off'; omit to change only the threshold *(optional)* |
+
+| Option | Description |
+|---|---|
+| `--threshold` `THRESHOLD` | CPU usage % above which game mode takes the panel (0-99) |
 
 ### `trcc display keepalive`
 
@@ -570,7 +581,7 @@ trcc display load-theme KEY PATH
 
 ### `trcc display load-video`
 
-Play a video on the LCD as a single-video theme. Transcodes the source to a `Theme.zt` matching the device's native resolution (.zt inputs are copied as-is), stages a one-file theme, then dispatches LoadTheme. Device must be attached so we know the target resolution.
+Play a video on the LCD as a single-video theme. The file plays as it is, with the device's fit (`display set-fit-mode`) applied live. Any of --start / --end / --rotation cuts it instead: that clip is baked into a `Theme.zt` at the panel's size and the current fit, as the Windows trimmer does (.zt inputs always go in as they are). Device must be attached so we know the panel's size.
 
 ```bash
 trcc display load-video [OPTIONS] KEY PATH
@@ -583,8 +594,8 @@ trcc display load-video [OPTIONS] KEY PATH
 
 | Option | Description |
 |---|---|
-| `--start`, `-s` `START_MS` | Clip start in milliseconds (default: 0). |
-| `--end`, `-e` `END_MS` | Clip end in milliseconds (default: probe duration, fallback 10s). |
+| `--start`, `-s` `START_MS` | Cut from here, in milliseconds (default: 0). |
+| `--end`, `-e` `END_MS` | Cut to here, in milliseconds (default: the file's end). |
 | `--rotation`, `-r` `ROTATION` | Rotation in degrees: 0 / 90 / 180 / 270. |
 
 ### `trcc display loop-video`
@@ -629,7 +640,7 @@ trcc display mask-visible KEY STATE
 
 ### `trcc display media-player`
 
-Set the media-player source — a local file or a web URL/stream. Wraps `SetMediaPlayer`: a local file plays through the video pipeline; a web URL is referenced (persisted so `theme save` captures it). An empty URI clears the source.
+Set the media-player source — a local file or a web URL/stream. Wraps `SetMediaPlayer`: a local file plays through the video pipeline; a web URL (http, https, rtsp) plays as a live stream. An empty URI clears the source.
 
 ```bash
 trcc display media-player KEY [URI]
@@ -708,22 +719,17 @@ trcc display overlay-delete KEY ELEMENT_ID
 | `KEY` | -- |
 | `ELEMENT_ID` | ID returned by overlay-add |
 
-### `trcc display overlay-flash`
+### `trcc display overlay-list`
 
-Briefly highlight an overlay element in the GUI.
+Show what is currently drawn on the device's screen. The read half of overlay. `overlay-update` / `overlay-delete` / `overlay-flash` all take an element id, and until this existed the only source of one was the line `overlay-add` printed when you created it — so the ids were unrecoverable the moment the terminal scrolled.
 
 ```bash
-trcc display overlay-flash [OPTIONS] KEY ELEMENT_ID
+trcc display overlay-list KEY
 ```
 
 | Argument | Description |
 |---|---|
-| `KEY` | -- |
-| `ELEMENT_ID` | -- |
-
-| Option | Description |
-|---|---|
-| `--duration`, `-d` `DURATION_MS` | Flash duration in milliseconds |
+| `KEY` | Device key, e.g. 0402:3922 |
 
 ### `trcc display overlay-render`
 
@@ -819,7 +825,7 @@ trcc display play-video [OPTIONS] KEY PATH
 
 ### `trcc display restore-theme`
 
-Reload the device's persisted theme — convenience after restart.
+Restore the device's saved display (theme + background; Theme1 if none).
 
 ```bash
 trcc display restore-theme KEY
@@ -843,23 +849,43 @@ trcc display resume [OPTIONS]
 
 ### `trcc display screencast`
 
-Stream a screen region to the LCD until interrupted. Wraps `StartScreencast` — the GUI `ScreencastHandler` subscriber drives the per-frame Qt capture timer. Ctrl-C calls `StopScreencast` for clean teardown.
+Stream a screen region to the LCD until interrupted. Wraps `StartScreencast`, which starts capturing. Ctrl-C calls `StopScreencast` for clean teardown. Without a region it casts the device's stored one (`screencast-region`, or the loaded theme's); a given region is stored as the device's.
 
 ```bash
-trcc display screencast [OPTIONS] KEY X Y W H
+trcc display screencast [OPTIONS] KEY [X] [Y] [W] [H]
 ```
 
 | Argument | Description |
 |---|---|
 | `KEY` | Device key, e.g. 0402:3922 |
-| `X` | Top-left X coordinate of capture region (px) |
-| `Y` | Top-left Y coordinate of capture region (px) |
-| `W` | Capture region width (px) |
-| `H` | Capture region height (px) |
+| `X` | Top-left X of the capture region (px) *(optional)* |
+| `Y` | Top-left Y of the capture region (px) *(optional)* |
+| `W` | Capture region width (px); 0 0 0 0 casts the stored region *(optional)* |
+| `H` | Capture region height (px) *(optional)* |
 
 | Option | Description |
 |---|---|
 | `--audio` | Pipe system audio alongside the video feed (Linux: PipeWire) |
+
+### `trcc display screencast-region`
+
+Set the device's screen-cast region; a running cast follows it.
+
+```bash
+trcc display screencast-region [OPTIONS] KEY X Y W H
+```
+
+| Argument | Description |
+|---|---|
+| `KEY` | Device key, e.g. 0402:3922 |
+| `X` | Top-left X on screen (px) |
+| `Y` | Top-left Y on screen (px) |
+| `W` | Region width (px) |
+| `H` | Region height (px) |
+
+| Option | Description |
+|---|---|
+| `--hide-border` | Hide the on-screen border around the region (default: unchanged) |
 
 ### `trcc display seek-video`
 
@@ -950,39 +976,6 @@ trcc display slideshow KEY STATE
 |---|---|
 | `KEY` | Device key, e.g. 0402:3922 |
 | `STATE` | 'on' / 'off' |
-
-### `trcc display slideshow-drive`
-
-Actually rotate the configured slideshow, until stopped. `slideshow on` and `configure-slideshow` only PERSIST the slideshow. Nothing advanced it outside the gui — the gui runs its own timer, so a slideshow set up here was saved, reported back correctly, and never switched a theme. This registers the driver that rotates it. Unlike `slideshow-run` (a foreground demo loop over a directory), this uses the persisted config and returns immediately; the rotation continues in the background for as long as the app or daemon is alive.
-
-```bash
-trcc display slideshow-drive [OPTIONS] KEY
-```
-
-| Argument | Description |
-|---|---|
-| `KEY` | Device key, e.g. 0402:3922 |
-
-| Option | Description |
-|---|---|
-| `--stop` | Stop driving instead of starting |
-
-### `trcc display slideshow-run`
-
-Foreground slideshow over a directory of themes. Different from `slideshow` / `configure-slideshow` (which persist state). This is a one-shot loop: blocks until Ctrl-C, swaps to the next theme each tick. Useful for demos + smoke tests; the persisted flow is what production users want.
-
-```bash
-trcc display slideshow-run [OPTIONS] KEY THEMES_DIR
-```
-
-| Argument | Description |
-|---|---|
-| `KEY` | Device key, e.g. 0402:3922 |
-| `THEMES_DIR` | Directory containing theme subdirectories |
-
-| Option | Description |
-|---|---|
-| `--interval`, `-i` `INTERVAL` | Seconds between theme switches (default: 30.0) |
 
 ### `trcc display snapshot`
 
@@ -1263,7 +1256,7 @@ trcc led render [OPTIONS] KEY
 
 ### `trcc led select-zone`
 
-Set the currently-selected zone (UI state).
+Select exactly this zone: the page a page-style cooler shows, or the one zone a PA120/LF10 edit reaches.
 
 ```bash
 trcc led select-zone KEY ZONE
@@ -1362,20 +1355,6 @@ trcc led toggle [OPTIONS] KEY STATE
 | Option | Description |
 |---|---|
 | `--zone`, `-z` `ZONE` | Toggle a single zone (omit for global toggle) |
-
-### `trcc led toggle-segment`
-
-Flip one segment on/off (segment-display devices).
-
-```bash
-trcc led toggle-segment KEY INDEX STATE
-```
-
-| Argument | Description |
-|---|---|
-| `KEY` | LED device key |
-| `INDEX` | Segment index |
-| `STATE` | 'on' or 'off' |
 
 ### `trcc led week-start`
 
@@ -1526,6 +1505,57 @@ trcc system dashboard [OPTIONS]
 |---|---|
 | `--save-auto-map` | Persist the auto-mapped bindings instead of only showing them. |
 
+### `trcc system dashboard-add`
+
+Add an empty custom panel to the sensor dashboard. Four unbound rows, ready for `dashboard-bind`. What a new panel IS lives on the model, so this, the GUI and qtgui all add the same thing.
+
+```bash
+trcc system dashboard-add [OPTIONS]
+```
+
+| Option | Description |
+|---|---|
+| `--name` `NAME` | Panel name. |
+
+### `trcc system dashboard-bind`
+
+Bind one dashboard row to a sensor. The sensor must exist on this machine — the GUIs bind by picking from a list and cannot name one that does not, so neither can this. The unit comes from the sensor rather than the caller, for the same reason.
+
+```bash
+trcc system dashboard-bind INDEX ROW SENSOR_ID
+```
+
+| Argument | Description |
+|---|---|
+| `INDEX` | Panel index from `dashboard`. |
+| `ROW` | Row within the panel (0-based). |
+| `SENSOR_ID` | Sensor id from `list-sensors`. |
+
+### `trcc system dashboard-delete`
+
+Delete a panel from the sensor dashboard. Deleting the only panel is refused — an empty layout would make the next read fall back to defaults, a wipe dressed up as a write.
+
+```bash
+trcc system dashboard-delete INDEX
+```
+
+| Argument | Description |
+|---|---|
+| `INDEX` | Panel index from `dashboard`. |
+
+### `trcc system dashboard-rename`
+
+Rename a sensor-dashboard panel.
+
+```bash
+trcc system dashboard-rename INDEX NAME
+```
+
+| Argument | Description |
+|---|---|
+| `INDEX` | Panel index from `dashboard`. |
+| `NAME` | The new panel name. |
+
 ### `trcc system debug-report`
 
 Generate a debug report bundle for GitHub issues.
@@ -1567,6 +1597,27 @@ Show whether trcc has been set up on this machine yet.
 ```bash
 trcc system first-run-status
 ```
+
+### `trcc system follow`
+
+Make other RGB follow the LED cooler's colours -- or an LCD's picture (#160). 'openrgb': TRCC connects to OpenRGB's SDK server -- start it in OpenRGB's SDK Server tab -- and sends the cooler's colours to every OpenRGB device, in OpenRGB's direct mode. 'ram': TRCC sends them to Corsair RGB memory itself, with no OpenRGB -- close OpenRGB first, so the two never drive the same sticks. 'off' stops.
+
+```bash
+trcc system follow [OPTIONS] [MODE]
+```
+
+| Argument | Description |
+|---|---|
+| `MODE` | 'off', 'openrgb', 'ram' or 'status' *(optional)* |
+
+| Option | Description |
+|---|---|
+| `--host` `HOST` | OpenRGB's SDK server (default: the saved one, 127.0.0.1 at first). |
+| `--port` `PORT` | Its port (default: the saved one, 6742 at first). |
+| `--source` `SOURCE` | The device that leads: an LCD's key (e.g. 0402:3922) to follow its picture, or '' for the first LED cooler. Default: the saved one. |
+| `--mapping` `MAPPING` | An LCD's picture on the followers: 'halves' (left to the first, right to the second) or 'single' (one colour each). Default: the saved one. |
+| `--colors` `COLORS` | How a region of an LCD's picture becomes a light's colour: 'vivid' (its brightest pixels -- small bright details show) or 'smooth' (its average -- steadier). Default: the saved one, vivid at first. |
+| `--target` `TARGET` | A light that follows (a stick's 'i2c-3/0x19', an OpenRGB device's name); repeat for more. '--target all' for every one. Default: the saved ones. |
 
 ### `trcc system hdd-enabled`
 
@@ -1654,7 +1705,7 @@ trcc system list-disks
 
 ### `trcc system list-endpoints`
 
-Enumerate every HTTP route the REST API exposes. Builds the FastAPI app (no uvicorn) and walks its router so the output reflects what `trcc api` / `trcc serve` would serve.
+Enumerate every HTTP route the REST API exposes. Builds the FastAPI app (no uvicorn) and walks its router so the output reflects what `trcc api` / `trcc serve` would serve. Routes only, no App: `build_app()` bare found or STARTED the shared App -- USB and all -- to print a list.
 
 ```bash
 trcc system list-endpoints
@@ -1737,6 +1788,53 @@ Show platform info (distro, install method, config dir, permissions).
 trcc system platform-info
 ```
 
+### `trcc system ram-effect`
+
+Save one of the memory's own effects on the sticks. The stick keeps it after TRCC closes and through a reboot. If the RAM was following a device, following turns off first.
+
+```bash
+trcc system ram-effect [OPTIONS] EFFECT
+```
+
+| Argument | Description |
+|---|---|
+| `EFFECT` | The effect to save on the RAM. |
+
+| Option | Description |
+|---|---|
+| `--stick` `STICK` | A stick by ref (see `trcc system rgb`); repeat for more. Default: every stick. |
+| `--speed` `SPEED` | -- |
+| `--direction` `DIRECTION` | -- |
+| `--color` `COLOR` | R,G,B; repeat for a second colour. |
+| `--random` | Let the stick pick the colours. |
+| `--brightness` `BRIGHTNESS` | -- |
+
+### `trcc system ram-lighting`
+
+Let TRCC reach RGB memory's lighting -- opt-in, asks for a password. RGB memory's lighting chips sit on the motherboard's SMBus, beside the chips that hold the memory's own settings. Linux can only open the whole bus, so enabling lets programs you run reach all of it, not just TRCC. Only the person logged in at this computer gets access, and only that bus. 'disable' removes it completely. It lasts across reboots. Your desktop asks for the password; the answer comes when you type it or close the prompt.
+
+```bash
+trcc system ram-lighting [ACTION]
+```
+
+| Argument | Description |
+|---|---|
+| `ACTION` | 'enable', 'disable' or 'status' *(optional)* |
+
+### `trcc system rgb`
+
+The RGB lights TRCC can drive or hand colours to.
+
+```bash
+trcc system rgb [OPTIONS]
+```
+
+| Option | Description |
+|---|---|
+| `--scan` | Look for the lights first: RGB memory on the SMBus, and OpenRGB's devices. |
+| `--host` `HOST` | With --scan: look for OpenRGB here, and save it (default: the saved one, 127.0.0.1 at first). |
+| `--port` `PORT` | With --scan: OpenRGB's port (default: the saved one, 6742 at first). |
+
 ### `trcc system sensors`
 
 Print current sensor readings.
@@ -1772,7 +1870,7 @@ trcc system snapshot [OPTIONS]
 
 ### `trcc system upgrade`
 
-Upgrade trcc-linux via the detected package manager.
+Print the command that upgrades this TRCC install.
 
 ```bash
 trcc system upgrade [OPTIONS]
@@ -1780,8 +1878,8 @@ trcc system upgrade [OPTIONS]
 
 | Option | Description |
 |---|---|
-| `--yes`, `-y` | Skip confirmation and run the upgrade subprocess. |
-| `--dry-run` | Print the command that would run, don't execute it. |
+| `--yes`, `-y` | Accepted for older scripts; nothing is run. |
+| `--dry-run` | Accepted for older scripts; nothing is run. |
 
 ## `trcc theme`
 
@@ -1889,18 +1987,18 @@ trcc theme export KEY THEME_NAME ARCHIVE_PATH
 | `THEME_NAME` | Theme name (directory under user_theme_dir(w, h)) |
 | `ARCHIVE_PATH` | Destination archive path (e.g. theme.tr) |
 
-### `trcc theme export-config`
+### `trcc theme export-current`
 
-Snapshot one device's settings to a JSON file. Captures everything in `DeviceSettings`: active theme path, brightness, orientation, overlay edits, mask choice, format prefs. Pair with `trcc theme import-config` to restore on another host or after a wipe.
+Export what the panel shows, saved or not -- the Windows app's export.
 
 ```bash
-trcc theme export-config KEY OUTPUT_PATH
+trcc theme export-current KEY ARCHIVE_PATH
 ```
 
 | Argument | Description |
 |---|---|
-| `KEY` | Device key, e.g. 0402:3922 |
-| `OUTPUT_PATH` | Destination JSON path (e.g. mydevice.json) |
+| `KEY` | Device key (e.g. 0402:3922) |
+| `ARCHIVE_PATH` | Destination: .tr (the Windows app's format) or .zip |
 
 ### `trcc theme export-dc`
 
@@ -1943,19 +2041,6 @@ trcc theme import KEY ARCHIVE_PATH [NAME]
 | `KEY` | Device key (e.g. 0402:3922) whose resolution scopes the target |
 | `ARCHIVE_PATH` | Archive to unpack |
 | `NAME` | Theme name (defaults to archive filename stem) *(optional)* |
-
-### `trcc theme import-config`
-
-Restore one device's settings from an export-config JSON file.
-
-```bash
-trcc theme import-config KEY INPUT_PATH
-```
-
-| Argument | Description |
-|---|---|
-| `KEY` | Device key, e.g. 0402:3922 |
-| `INPUT_PATH` | Source JSON written by `trcc theme export-config` |
 
 ### `trcc theme list`
 

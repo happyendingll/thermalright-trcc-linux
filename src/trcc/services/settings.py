@@ -14,25 +14,47 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import asdict, dataclass, field
+from collections.abc import Callable
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 from threading import RLock
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypeVar, cast
 
 from ..core._safe import load_json_or_default
 from ..core.errors import ConfigError
-from ..core.led_models import LedDeviceSettings, LEDMode, LedZoneSettings
+from ..core.led_models import LedDeviceSettings, LEDMode, LedZoneSettings, one_hot
 from ..core.logs import per_frame
 from ..core.models import (
+    DATE_FORMATS,
     DEFAULT_REFRESH_INTERVAL_S,
     MAX_REFRESH_INTERVAL_S,
     MIN_REFRESH_INTERVAL_S,
+    RECENT_COLOR_DEFAULT,
+    RECENT_COLOR_SLOTS,
+    TIME_FORMATS,
     DeviceSettings,
+    EffectDirection,
+    EffectSpeed,
     FitMode,
+    FollowColors,
+    FollowMapping,
+    OrientationState,
     OverlayElement,
+    RamEffect,
+    RamEffectSettings,
+    RgbFollowMode,
     TempUnit,
+    parse_device_key,
 )
 from ..core.ports import Paths
+
+#: What a panel keeps per theme folder (``OrientationState``), by field name --
+#: derived, so a field added there is swapped without being listed again.
+_PER_FOLDER = tuple(f.name for f in fields(OrientationState))
+
+#: What entering a folder found: already there, its saved state, or none yet.
+FolderVisit = Literal["same", "restored", "first"]
 
 log = logging.getLogger(__name__)
 frame_log = per_frame(__name__)
@@ -60,15 +82,6 @@ class AppSettings:
     # unit across all devices. Per-device override still possible via the
     # per-device set_temp_unit() (used by tests / non-GUI consumers).
     temp_unit: TempUnit = "C"
-    # Global default clock formats — same cross-cutting pattern as
-    # ``temp_unit``.  Multi-LCD users expect ONE "24h" toggle that
-    # applies everywhere; ``Settings.set_global_time_format`` /
-    # ``set_global_date_format`` write here and fan out to every
-    # existing DeviceSettings.  ``Settings.for_device`` seeds new
-    # DeviceSettings instances from these globals.  Per-device
-    # override remains available via the per-device setters.
-    time_format: Literal["12h", "24h"] = "24h"
-    date_format: str = "yyyy/MM/dd"
     # User-selected primary GPU (e.g. 'nvidia:0', 'amd:0', or 'intel:igpu').
     # None = let SensorEnumerator.primary_gpu() pick automatically.
     active_gpu: str | None = None
@@ -82,6 +95,28 @@ class AppSettings:
     # this per LED form; we cannot without changing the model, and say so
     # rather than pretend the divergence is not there.
     active_disk: str | None = None
+
+    # What follows the cooler (#160): an ``RgbFollowMode`` value.  "openrgb"
+    # sends the LED cooler's colours to the devices of the OpenRGB SDK server
+    # at host:port; "ram" to Corsair RGB memory directly.  Off until the user
+    # picks one -- either takes over those devices' lighting.
+    rgb_follow: str = RgbFollowMode.OFF.value
+    openrgb_host: str = "127.0.0.1"
+    openrgb_port: int = 6742
+    # The device that leads: empty for the first LED cooler, as before; an
+    # LCD's key to follow its picture, mapped by ``rgb_follow_mapping`` (a
+    # ``FollowMapping`` value).
+    rgb_follow_source: str = ""
+    rgb_follow_mapping: str = FollowMapping.HALVES.value
+    # How a region of that picture becomes a light's colour (a
+    # ``FollowColors`` value): its brightest pixels, or its average.
+    rgb_follow_colors: str = FollowColors.VIVID.value
+    # Refs of the lights that follow (a stick's "i2c-3/0x19", an OpenRGB
+    # device's name); empty for every one.
+    rgb_follow_targets: list[str] = field(default_factory=list)
+    # The effect TRCC last saved on each RAM stick, by ref -- what it set,
+    # not read back.  Plain JSON; ``ram_effect`` validates it on the way out.
+    ram_effects: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 # =========================================================================
@@ -108,12 +143,46 @@ _PRE_CUTOVER_CONFIG_FILE = "trcc-next.json"
 #                         back to the theme's.
 #   2                     it means "the layout is EMPTY — draw nothing".  The
 #                         no-layout state is now ``None``.
+#   3                     a multi-zone LED (PA120/LF10) is driven by its zones
+#                         alone; up to 2 the global brightness and on/off were
+#                         applied on top.  ``_migrate_led`` folds them in.
+#   4                     an LED's selected zone/page is the first in its mask
+#                         (``zone_sync_zones``); ``selected_zone`` was a second,
+#                         stored field.  ``_migrate_led`` writes it into the mask.
+#   5                     a clock's time/date format is its element's own, as
+#                         the C#'s myModeSub; up to 4 a device ``time_format``
+#                         / ``date_format`` drew over it.  ``_migrate_device``
+#                         writes a deliberate choice into the elements.
 #
 # Every config written before the bump carries ``[]`` for the majority of
 # users who never edited an overlay, so reading one at face value under v2
 # would blank their overlay.  ``_migrate`` reinterprets those as ``None``,
 # which is the state ``LoadTheme``'s restore branch then seeds from the theme.
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 5
+
+_S = TypeVar("_S")
+
+
+def _inherited(store: dict[str, _S], key: str) -> _S | None:
+    """A copy of the plain-key settings a twin's ``@port`` *key* starts from.
+
+    A second identical cooler makes BOTH units' keys grow a port suffix
+    (``87ad:70db`` -> ``87ad:70db@1-13``, #287), and everything the user had
+    configured lives under the plain key.  ``None`` when *key* is already
+    plain or nothing was stored under its plain form.
+
+    A DEEP copy, not an alias and not ``dataclasses.replace``: both settings
+    dataclasses carry lists (overlay elements, slideshow themes, LED zones),
+    and ``replace`` is shallow, so the twins would share them — editing one
+    unit would silently edit the other.  ``deepcopy`` also cannot drift when
+    another list field is added.
+    """
+    base = key.split("@", 1)[0]
+    if base == key or (ancestor := store.get(base)) is None:
+        log.debug("_inherited: %s has no plain-key ancestor", key)
+        return None
+    log.info("_inherited: %s inherits the settings of %s", key, base)
+    return deepcopy(ancestor)
 
 
 class Settings:
@@ -186,40 +255,6 @@ class Settings:
             self._save()
             return tuple(self._devices)
 
-    def set_global_time_format(
-        self, fmt: Literal["12h", "24h"],
-    ) -> tuple[str, ...]:
-        """Set the global default clock format and propagate to every device.
-
-        Same lockstep shape as :meth:`set_global_temp_unit` — write
-        ``app.time_format`` then fan out to every existing
-        ``DeviceSettings.time_format``.  Returns the tuple of device
-        keys touched so the calling Command can publish per-device
-        events.
-        """
-        log.info("set_global_time_format: fmt=%s", fmt)
-        with self._lock:
-            self._app.time_format = fmt
-            for device_settings in self._devices.values():
-                device_settings.time_format = fmt
-            self._save()
-            return tuple(self._devices)
-
-    def set_global_date_format(self, fmt: str) -> tuple[str, ...]:
-        """Set the global default date pattern and propagate to every device.
-
-        Companion to :meth:`set_global_time_format`.  ``fmt`` is the
-        ICU-ish pattern (``yyyy/MM/dd``, ``dd/MM/yyyy``, etc.) that
-        ``DisplayService.compute_clock`` reads per render.
-        """
-        log.info("set_global_date_format: fmt=%s", fmt)
-        with self._lock:
-            self._app.date_format = fmt
-            for device_settings in self._devices.values():
-                device_settings.date_format = fmt
-            self._save()
-            return tuple(self._devices)
-
     def set_active_gpu(self, gpu_key: str | None) -> None:
         """Set the user-selected primary GPU. None = auto-pick."""
         log.info("set_active_gpu: gpu_key=%s", gpu_key)
@@ -234,27 +269,55 @@ class Settings:
             self._app.active_disk = disk_key
             self._save()
 
+    def mark_autostart_configured(self) -> None:
+        """Record that autostart has been chosen, on or off.  One-way.
+
+        The gui enables autostart on first launch only while this is False.
+        Nothing set it after the cutover, so a user who turned autostart off
+        had it turned back on at every gui launch.
+        """
+        log.info("mark_autostart_configured: was=%s",
+                 self._app.autostart_configured)
+        with self._lock:
+            if not self._app.autostart_configured:
+                self._app.autostart_configured = True
+                self._save()
+
     # ── DeviceSettings surface ────────────────────────────────────────
 
     def for_device(self, key: str) -> DeviceSettings:
         """Return the DeviceSettings for *key*, creating defaults if absent.
 
-        A freshly-minted ``DeviceSettings`` inherits the global format
-        prefs (``app.time_format`` / ``app.date_format`` / ``app.temp_unit``)
-        so a newly-attached LCD picks up the user's chosen formats
-        instead of falling back to the dataclass's compile-time
-        defaults.  Existing devices keep whatever was persisted —
-        only first-touch is seeded.
+        A freshly-minted ``DeviceSettings`` inherits the global temperature
+        unit (``app.temp_unit``) so a newly-attached LCD shows the user's
+        unit.  Existing devices keep whatever was persisted — only
+        first-touch is seeded.
         """
         frame_log.debug("for_device: key=%s", key)
         with self._lock:
             if key not in self._devices:
-                self._devices[key] = DeviceSettings(
-                    time_format=self._app.time_format,
-                    date_format=self._app.date_format,
-                    temp_unit=self._app.temp_unit,
-                )
+                self._devices[key] = self._seed_for(key)
             return self._devices[key]
+
+    def _seed_for(self, key: str) -> DeviceSettings:
+        """First-touch defaults for *key*, inheriting a plain-key ancestor.
+
+        Without the plain-key ancestor (``_inherited``) both units of a new
+        pair would come up factory-fresh the moment the second one was
+        plugged in — the upgrade path, and the reason the suffix is safe to
+        introduce at all.
+
+        It runs in the other direction too: unplug one of a pair and the
+        survivor returns to the plain key, so what it wrote while
+        disambiguated stops matching.  That degrades to "inherits the shared
+        settings" rather than "loses them", which is the honest trade for
+        keeping the plain key stable for everyone who has one device.
+        """
+        if (inherited := _inherited(self._devices, key)) is not None:
+            return inherited
+        log.info("_seed_for: %s is new — seeding the global temperature unit",
+                 key)
+        return DeviceSettings(temp_unit=self._app.temp_unit)
 
     def seed_mount_orientation(self, key: str, portrait_mounted: bool) -> int:
         """First-boot only: start a portrait-MOUNTED panel at 90 degrees.
@@ -289,8 +352,6 @@ class Settings:
             degrees = 90 if portrait_mounted else 0
             self._devices[key] = DeviceSettings(
                 orientation=degrees,
-                time_format=self._app.time_format,
-                date_format=self._app.date_format,
                 temp_unit=self._app.temp_unit,
             )
             if degrees:
@@ -304,6 +365,55 @@ class Settings:
         log.info("set_orientation: key=%s degrees=%d", key, degrees)
         with self._lock:
             self.for_device(key).orientation = degrees
+            self._save()
+
+    def enter_catalog(self, key: str, catalog: str) -> FolderVisit:
+        """Make *catalog* the folder *key*'s per-folder values belong to.
+
+        The C# keeps theme, brightness, split mode, slideshow and game mode in
+        each folder's ``Theme.dc`` and reads the new folder's on a rotation
+        (``UpDateUCComboBox1`` -> ``ReadFileThemeSub``).  Here the live fields
+        are the active folder's; the one being left is stashed, and the one
+        entered is restored -- ``"restored"`` -- or, never visited, keeps the
+        values it arrived with, as the C#'s read of an empty file does --
+        ``"first"``.  With no folder recorded yet (a new panel, or a config
+        from before this existed) the live values belong to the one entered.
+        """
+        with self._lock:
+            s = self.for_device(key)
+            fresh = s.active_catalog is None and s.current_theme is None
+            current = s.active_catalog or catalog
+            log.info("enter_catalog: key=%s %s -> %s", key, current, catalog)
+            if current == catalog:
+                visit: FolderVisit = "first" if fresh else "same"
+            else:
+                live = _snapshot(s)
+                if s.entered_with is None or live != s.entered_with:
+                    s.orientation_slots[current] = live
+                else:                   # untouched: an unwritten Theme.dc
+                    s.orientation_slots.pop(current, None)
+                saved = s.orientation_slots.pop(catalog, None)
+                visit = "first" if saved is None else "restored"
+                if saved is not None:
+                    for name in _PER_FOLDER:
+                        setattr(s, name, _copied(getattr(saved, name)))
+            if visit == "restored":
+                s.entered_with = None
+            elif visit == "first":
+                s.entered_with = _snapshot(s)
+            s.active_catalog = catalog
+            self._save()
+        log.info("enter_catalog: %s %s (%d other folder(s) kept)",
+                 key, visit, len(s.orientation_slots))
+        return visit
+
+    def mark_entered(self, key: str) -> None:
+        """Record what a folder entered with nothing saved shows, once its
+        theme is on -- the baseline ``enter_catalog`` compares on leaving."""
+        log.info("mark_entered: key=%s", key)
+        with self._lock:
+            s = self.for_device(key)
+            s.entered_with = _snapshot(s)
             self._save()
 
     def set_brightness(self, key: str, percent: int) -> None:
@@ -324,17 +434,29 @@ class Settings:
             self.for_device(key).temp_unit = unit
             self._save()
 
-    def set_time_format(self, key: str, fmt: Literal["12h", "24h"]) -> None:
-        log.info("set_time_format: key=%s fmt=%s", key, fmt)
-        with self._lock:
-            self.for_device(key).time_format = fmt
-            self._save()
+    def set_clock_format(
+        self, key: str | None, source: str, pattern: str,
+    ) -> dict[str, int]:
+        """Give every *source* clock element *pattern* — on *key*, or on every
+        device when *key* is None.  Returns the elements changed, per device.
 
-    def set_date_format(self, key: str, fmt: str) -> None:
-        log.info("set_date_format: key=%s fmt=%s", key, fmt)
+        The format belongs to each element, as the C#'s myModeSub does; this
+        is the one "all of this device's time elements" edit the CLI and API
+        offer.  A device with no layout of its own yet is skipped: its theme's
+        layout is adopted on the next load and carries the theme's formats.
+        """
         with self._lock:
-            self.for_device(key).date_format = fmt
+            touched: dict[str, int] = {}
+            for k in ([key] if key else list(self._devices)):
+                clocks = [e for e in self.for_device(k).user_overlay_elements or ()
+                          if e.type == "clock" and e.source == source]
+                for element in clocks:
+                    element.format = pattern
+                touched[k] = len(clocks)
             self._save()
+        log.info("set_clock_format: key=%s %s -> %r on %s",
+                 key, source, pattern, touched)
+        return touched
 
     def set_overlay_enabled(self, key: str, enabled: bool) -> None:
         log.info("set_overlay_enabled: key=%s enabled=%s", key, enabled)
@@ -405,6 +527,22 @@ class Settings:
                 dev.media_player_uri = None
             self._save()
 
+    def set_screencast_rect(self, key: str, rect: tuple[int, int, int, int],
+                            hide_border: bool) -> None:
+        """Store the device's screencast region (DC axes) and hide-border flag.
+
+        A stored PREFERENCE, not a display source: unlike
+        ``set_screencast_region`` it clears nothing, so seeding it from a theme
+        or editing it leaves the background and the media player alone.
+        """
+        log.info("set_screencast_rect: key=%s rect=%s hide_border=%s",
+                 key, rect, hide_border)
+        with self._lock:
+            dev = self.for_device(key)
+            dev.screencast_rect = rect
+            dev.screencast_hide_border = hide_border
+            self._save()
+
     def set_media_player_uri(self, key: str, uri: str | None) -> None:
         """Set (or clear with ``None``) the device's media-player source URI.
 
@@ -435,14 +573,36 @@ class Settings:
             self.for_device(key).split_mode = mode
             self._save()
 
+    def set_game_mode(
+        self, key: str, *, enabled: bool | None = None,
+        threshold: int | None = None,
+    ) -> None:
+        """Switch game mode and/or set its CPU threshold (0-99, the C#'s
+        two-digit box); ``None`` leaves that half as it is."""
+        log.info("set_game_mode: key=%s enabled=%s threshold=%s",
+                 key, enabled, threshold)
+        with self._lock:
+            s = self.for_device(key)
+            if enabled is not None:
+                s.game_enabled = enabled
+            if threshold is not None:
+                s.game_threshold = max(0, min(99, threshold))
+            self._save()
+
     # ── LED-device settings ───────────────────────────────────────────
 
     def for_led(self, key: str) -> LedDeviceSettings:
-        """Return the LedDeviceSettings for *key*, defaulting on first touch."""
+        """Return the LedDeviceSettings for *key*, defaulting on first touch.
+
+        A twin cooler's ``@port`` key inherits the plain key, exactly as an
+        LCD's does in ``_seed_for`` — plugging in the second of a pair must
+        not reset both to factory colours.
+        """
         frame_log.debug("for_led: key=%s", key)
         with self._lock:
             if key not in self._led_devices:
-                self._led_devices[key] = LedDeviceSettings()
+                self._led_devices[key] = (_inherited(self._led_devices, key)
+                                          or LedDeviceSettings())
             return self._led_devices[key]
 
     def set_led_mode(self, key: str, mode: LEDMode) -> None:
@@ -507,9 +667,17 @@ class Settings:
             log.info("set_led_zone_count: key=%s count=%d (was %d)",
                      key, count, current)
             if count > current:
+                # New zones take the device's mode, as FormLED's first run
+                # copies ``myLedMode`` into every zone (:1966 → :2578).
                 settings.zones.extend(
-                    LedZoneSettings() for _ in range(count - current)
+                    LedZoneSettings(mode=settings.mode)
+                    for _ in range(count - current)
                 )
+            if current == 0:
+                # A device's first zones start with select-all on, as FormLED's
+                # first run does (FormLED.cs:1966), so an edit reaches every zone
+                # rather than the first alone.
+                settings.zone_sync = True
             else:
                 settings.zones = settings.zones[:count]
             self._save()
@@ -572,30 +740,6 @@ class Settings:
             self.for_led(key).zone_sync_zones = list(zones)
             self._save()
 
-    def set_led_selected_zone(self, key: str, zone: int) -> None:
-        """Pick the active zone — UIs use this when the user clicks a fan/strip."""
-        log.info("set_led_selected_zone: key=%s zone=%d", key, zone)
-        with self._lock:
-            settings = self.for_led(key)
-            if zone < 0:
-                raise ValueError(f"selected_zone must be >= 0, got {zone}")
-            settings.selected_zone = zone
-            self._save()
-
-    def set_led_segment_on(self, key: str, index: int, on: bool) -> None:
-        """Flip one segment on/off (segment-display devices only)."""
-        log.info("set_led_segment_on: key=%s index=%d on=%s", key, index, on)
-        with self._lock:
-            settings = self.for_led(key)
-            if index < 0:
-                raise IndexError(f"segment index must be >= 0, got {index}")
-            # Grow segment_on lazily so callers don't need to know the
-            # segment count up front (style discovery may not have run yet).
-            while len(settings.segment_on) <= index:
-                settings.segment_on.append(True)
-            settings.segment_on[index] = on
-            self._save()
-
     def set_led_clock_24h(self, key: str, is_24h: bool) -> None:
         """Set the 12h/24h clock display format for LC2-style devices."""
         log.info("set_led_clock_24h: key=%s is_24h=%s", key, is_24h)
@@ -618,6 +762,116 @@ class Settings:
                  key, ratio, clamped)
         with self._lock:
             self.for_led(key).memory_ratio = clamped
+            self._save()
+
+    def rgb_follow_mode(self) -> RgbFollowMode:
+        """What follows the cooler; a value this build does not know is OFF."""
+        value = self._app.rgb_follow
+        log.debug("rgb_follow_mode: %r", value)
+        try:
+            return RgbFollowMode(value)
+        except ValueError:
+            log.warning("rgb_follow_mode: unknown %r in the settings -- off",
+                        value)
+            return RgbFollowMode.OFF
+
+    def rgb_follow_mapping(self) -> FollowMapping:
+        """How an LCD's picture maps onto the followers; unknown is halves."""
+        value = self._app.rgb_follow_mapping
+        log.debug("rgb_follow_mapping: %r", value)
+        try:
+            return FollowMapping(value)
+        except ValueError:
+            log.warning("rgb_follow_mapping: unknown %r in the settings -- "
+                        "halves", value)
+            return FollowMapping.HALVES
+
+    def rgb_follow_colors(self) -> FollowColors:
+        """How a region of an LCD's picture becomes a light's colour; unknown
+        is vivid."""
+        value = self._app.rgb_follow_colors
+        log.debug("rgb_follow_colors: %r", value)
+        try:
+            return FollowColors(value)
+        except ValueError:
+            log.warning("rgb_follow_colors: unknown %r in the settings -- "
+                        "vivid", value)
+            return FollowColors.VIVID
+
+    def ram_effect(self, ref: str) -> RamEffectSettings | None:
+        """The effect TRCC last saved on stick *ref*, or None -- a damaged
+        record is None too, never a guess."""
+        record = (self._app.ram_effects.get(ref)
+                  if isinstance(self._app.ram_effects, dict) else None)
+        log.debug("ram_effect: %s -> %r", ref, record)
+        if not isinstance(record, dict):
+            return None
+        colors = _rgb_list(record.get("colors", []))
+        try:
+            return RamEffectSettings(
+                effect=RamEffect(record["effect"]),
+                speed=EffectSpeed(record.get("speed", EffectSpeed.MEDIUM.value)),
+                direction=(EffectDirection(record["direction"])
+                           if record.get("direction") else None),
+                colors=tuple(colors) if isinstance(colors, list) else (),
+                random_colors=bool(record.get("random_colors", False)),
+                brightness=int(record.get("brightness", 255)))
+        except (KeyError, ValueError, TypeError) as e:
+            log.warning("ram_effect: %s's saved effect is unreadable (%s) -- "
+                        "shown as unknown", ref, e)
+            return None
+
+    def set_ram_effect(self, ref: str, effect: RamEffectSettings) -> None:
+        """Remember the effect TRCC saved on stick *ref*."""
+        log.info("set_ram_effect: %s %s", ref, effect.effect.value)
+        record = {"effect": effect.effect.value, "speed": effect.speed.value,
+                  "direction": (effect.direction.value if effect.direction
+                                else None),
+                  "colors": [list(c) for c in effect.colors],
+                  "random_colors": effect.random_colors,
+                  "brightness": effect.brightness}
+        with self._lock:
+            if not isinstance(self._app.ram_effects, dict):
+                self._app.ram_effects = {}
+            self._app.ram_effects[ref] = record
+            self._save()
+
+    def rgb_follow_targets(self) -> tuple[str, ...]:
+        """The lights that follow (refs); anything not a list of text is all.
+
+        Settings load JSON as it is, so a hand-edited string here would
+        otherwise become one target per character."""
+        value = self._app.rgb_follow_targets
+        log.debug("rgb_follow_targets: %r", value)
+        if not isinstance(value, list) or not all(isinstance(t, str)
+                                                  for t in value):
+            log.warning("rgb_follow_targets: %r is not a list of names -- "
+                        "every light follows", value)
+            return ()
+        return tuple(value)
+
+    def set_rgb_follow(self, mode: RgbFollowMode, host: str, port: int,
+                       source: str, mapping: FollowMapping,
+                       targets: tuple[str, ...], *,
+                       colors: FollowColors) -> None:
+        """Pick what follows, OpenRGB's *host*:*port*, and the device that
+        leads (#160): empty *source* for the first LED cooler, else a key.
+        *colors* is required by name, so no caller drops the saved one."""
+        log.info("set_rgb_follow: %s %s:%d source=%r %s %s targets=%s",
+                 mode.value, host, port, source, mapping.value, colors.value,
+                 list(targets) or "all")
+        if not 0 < port < 65536:
+            raise ValueError(f"port out of range (1-65535): {port}")
+        if source:
+            parse_device_key(source)       # ValueError for a malformed key
+        with self._lock:
+            self._app.rgb_follow = mode.value
+            self._app.openrgb_host = host
+            self._app.openrgb_port = port
+            self._app.rgb_follow_source = source
+            self._app.rgb_follow_mapping = mapping.value
+            self._app.rgb_follow_colors = colors.value
+            self._app.rgb_follow_targets = list(targets)
             self._save()
 
     def set_hdd_enabled(self, enabled: bool) -> None:
@@ -654,6 +908,31 @@ class Settings:
                 )
         with self._lock:
             self.for_device(key).overlay_background = color
+            self._save()
+
+    def recent_colors(self, key: str) -> list[tuple[int, int, int]]:
+        """The colour editor's recent row for *key*: newest first, padded to
+        RECENT_COLOR_SLOTS with the C#'s Silver."""
+        with self._lock:
+            kept = list(self.for_device(key).recent_colors)
+        frame_log.debug("recent_colors: key=%s kept=%d", key, len(kept))
+        padding = [RECENT_COLOR_DEFAULT] * RECENT_COLOR_SLOTS
+        return (kept + padding)[:RECENT_COLOR_SLOTS]
+
+    def remember_color(self, key: str, color: tuple[int, int, int]) -> None:
+        """Push *color* onto the front of *key*'s recent row, dropping the
+        oldest -- ``UCXiTongXianShiBackupColorSave``'s shift register.  A
+        repeat is kept, as the C# keeps it."""
+        log.info("remember_color: key=%s color=%s", key, color)
+        for label, value in zip("rgb", color, strict=False):
+            if not 0 <= value <= 255:
+                raise ValueError(
+                    f"{label} channel out of range (0-255): {value}",
+                )
+        with self._lock:
+            device = self.for_device(key)
+            device.recent_colors = [tuple(color), *device.recent_colors][
+                :RECENT_COLOR_SLOTS]
             self._save()
 
     # ── User overlay elements ─────────────────────────────────────────
@@ -718,37 +997,27 @@ class Settings:
 
     def set_user_overlay_elements(
         self, key: str, elements: list[OverlayElement],
+        catalog: str | None = None,
     ) -> None:
-        """Replace the user-overlay list wholesale (bulk SetOverlayConfig)."""
-        log.info("set_user_overlay_elements: key=%s count=%d",
-                 key, len(elements))
+        """Replace the user-overlay list wholesale.
+
+        *catalog* is the theme folder the layout belongs to, given when a
+        source's layout is adopted; an edit leaves the recorded one as it is.
+        """
+        log.info("set_user_overlay_elements: key=%s count=%d catalog=%s",
+                 key, len(elements), catalog)
         with self._lock:
-            self.for_device(key).user_overlay_elements = list(elements)
+            dev = self.for_device(key)
+            dev.user_overlay_elements = list(elements)
+            if catalog is not None:
+                dev.user_overlay_catalog = catalog
             self._save()
 
-    # ── Atomic snapshot / restore (used by ExportConfig/ImportConfig) ─
-
-    def snapshot_device(self, key: str) -> dict[str, Any]:
-        """Return a JSON-ready snapshot of one device's DeviceSettings.
-
-        Same shape used internally by ``_save`` — tuples already coerced
-        to lists by ``_json_default`` is applied at JSON write time.
-        Caller passes the dict to ``json.dump`` with that same default.
-        """
-        log.info("snapshot_device: key=%s", key)
+    def set_user_overlay_catalog(self, key: str, catalog: str) -> None:
+        """Record which theme folder the working layer belongs to."""
+        log.info("set_user_overlay_catalog: key=%s catalog=%s", key, catalog)
         with self._lock:
-            return asdict(self.for_device(key))
-
-    def restore_device(self, key: str, snapshot: dict[str, Any]) -> None:
-        """Replace a device's entire DeviceSettings atomically from a dict.
-
-        Inverse of :meth:`snapshot_device`.  Tolerant of older snapshots
-        (unknown fields ignored; missing fields fall back to dataclass
-        defaults) so JSON exports survive schema evolution.
-        """
-        log.info("restore_device: key=%s fields=%d", key, len(snapshot))
-        with self._lock:
-            self._devices[key] = _device_settings_from_dict(snapshot)
+            self.for_device(key).user_overlay_catalog = catalog
             self._save()
 
     # ── Slideshow ─────────────────────────────────────────────────────
@@ -817,7 +1086,9 @@ class Settings:
                     _migrate_device(data, schema, key),
                 )
             for key, data in raw.get("led_devices", {}).items():
-                self._led_devices[key] = _led_settings_from_dict(data)
+                self._led_devices[key] = _led_settings_from_dict(
+                    _migrate_led(data, schema, key),
+                )
 
     def _save(self) -> None:
         """Atomic write: tmp file → fsync → rename."""
@@ -922,56 +1193,219 @@ def _migrate_device(
     next save records it under v2.  A NON-empty list is already an established
     layout and is carried through untouched.
 
-    Returns the dict unchanged when it is already current, so a v2 config
-    costs one integer comparison.
+    Returns the dict unchanged when it is already current, so a current
+    config costs one integer comparison.
+
+    Each step is gated on the version that introduced it, NOT on "older than
+    current".  The v1 step was gated on ``schema < _SCHEMA_VERSION``, so the
+    LED bumps to 3 and 4 made it rewrite every released (v2) config too: an
+    overlay the user had emptied read as "no layout" and the theme's elements
+    came back on upgrade -- #276 again.
     """
     if schema >= _SCHEMA_VERSION:
         return data
     out = dict(data)
-    if out.get("user_overlay_elements") == []:
+    if schema < 2 and out.get("user_overlay_elements") == []:
         out["user_overlay_elements"] = None
         log.info(
             "_migrate_device: %s schema %d→%d — empty overlay layer read as "
             "'no layout of its own' (v1 meaning); it will be seeded from the "
             "theme on the next restore", key, schema, _SCHEMA_VERSION,
         )
+    if schema < 5:
+        _fold_clock_formats(out, key)
     return out
+
+
+def _fold_clock_formats(data: dict[str, Any], key: str) -> None:
+    """v4 -> v5: a device's time/date format moves onto its clock elements.
+
+    Up to v4 the render drew EVERY time element in the device's
+    ``time_format`` and every date element with no pattern of its own, or
+    the default one, in its ``date_format``.  Only a DELIBERATE choice is
+    written in, so the panel looks the same after the upgrade: a device
+    left at the defaults keeps each element's own format, which is what the
+    C# draws.  A ``%I:%M`` a gui click saved before 12h meant ``hh:mm tt``
+    gets its AM/PM.
+    """
+    from ._clock import _translate_date_pattern
+
+    time_fmt = data.pop("time_format", "24h")
+    date_pattern = _translate_date_pattern(data.pop("date_format", "yyyy/MM/dd"))
+    elements = data.get("user_overlay_elements")
+    if not isinstance(elements, list):
+        return
+    changed = 0
+    for e in elements:
+        if not isinstance(e, dict) or e.get("type") != "clock":
+            continue
+        fmt = str(e.get("format", ""))
+        new = fmt
+        if e.get("source") == "time" and (time_fmt == "12h" or fmt == "%I:%M"):
+            new = TIME_FORMATS[1]
+        elif (e.get("source") == "date" and date_pattern != DATE_FORMATS[0]
+                and ("%" not in fmt or fmt == DATE_FORMATS[0])):
+            new = date_pattern
+        changed += new != fmt
+        e["format"] = new
+    log.info("_fold_clock_formats: %s time=%s date=%r -> %d clock element(s) "
+             "rewritten", key, time_fmt, date_pattern, changed)
+
+
+def _migrate_led(data: dict[str, Any], schema: int, key: str) -> dict[str, Any]:
+    """Bring one persisted LED device dict up to :data:`_SCHEMA_VERSION`.
+
+    **v3 → v4 — the selection is the mask alone.**  A page-style cooler with
+    the carousel off showed its stored ``selected_zone``; the mask becomes that
+    page, so it shows the same page.  With the carousel on the mask is already
+    what rotates, and a multi-zone cooler never read ``selected_zone``.
+
+    **v2 → v3 — a multi-zone device is driven by its zones alone.**  Up to v2
+    the render multiplied a PA120/LF10's zones by the global brightness and
+    switched them all off with the global switch; from v3 it uses the zones
+    only, as FormLED does.  Folding the global values into each zone keeps the
+    device showing what it showed: brightness is a whole percent, so a colour
+    can move by up to 2 of 255 (measured over every pair; truncating instead
+    of rounding reached 3).  A device without zones is not multi-zone, and
+    unchanged.
+    """
+    zones: list[Any] = data["zones"] if isinstance(data.get("zones"), list) else []
+    zoned = bool(zones)
+    out = dict(data)
+    if schema < 3 and zoned:
+        brightness = data.get("brightness", 65)
+        on = data.get("global_on", True)
+        out["zones"] = [
+            {**z, "brightness": round(z.get("brightness", 65) * brightness / 100),
+             "on": bool(z.get("on", True) and on)}
+            for z in zones if isinstance(z, dict)
+        ]
+        log.info("_migrate_led: %s schema %d→3 — folded global brightness %s%% "
+                 "and switch %s into %d zone(s)", key, schema, brightness,
+                 "on" if on else "off", len(out["zones"]))
+    if schema < 4 and not zoned and not data.get("zone_sync"):
+        page = data.get("selected_zone", 0)
+        mask = data.get("zone_sync_zones") or []
+        out["zone_sync_zones"] = one_hot(page, max(len(mask), page + 1))
+        log.info("_migrate_led: %s schema %d→4 — page %d is now the mask %s",
+                 key, schema, page, out["zone_sync_zones"])
+    return out
+
+
+def _snapshot(s: DeviceSettings) -> OrientationState:
+    """The active folder's values, as a slot keeps them."""
+    log.debug("_snapshot: theme=%s brightness=%s", s.current_theme, s.brightness)
+    return OrientationState(
+        **{name: _copied(getattr(s, name)) for name in _PER_FOLDER})
+
+
+def _copied(value: Any) -> Any:
+    """A list is copied, so a folder's slot never aliases the live field."""
+    log.debug("_copied: %s", type(value).__name__)
+    return list(value) if isinstance(value, list) else value
+
+
+def _orientation_state_from_dict(data: dict[str, Any]) -> OrientationState:
+    """One saved folder's values, tolerant of extras (a later release's)."""
+    log.debug("_orientation_state_from_dict: data=%s", data)
+    known = {k: v for k, v in data.items() if k in _PER_FOLDER}
+    return replace(OrientationState(), **known)
+
+
+# ── Fields JSON cannot round-trip, converted back by name ──────────────────
+
+#: A converter's answer for a value that cannot stand: drop it, so the field
+#: takes its default.
+_DROP = object()
+
+
+def _tuple_of(size: int,
+              item: Callable[[Any], Any] | None = None) -> Callable[[Any], Any]:
+    """JSON gives a list where the field holds a tuple of *size*."""
+    def convert(value: Any) -> Any:
+        log.debug("_tuple_of(%d): %r", size, value)
+        if isinstance(value, list) and len(value) == size:
+            return tuple(item(v) for v in value) if item else tuple(value)
+        return value
+    return convert
+
+
+def _rgb_list(value: Any) -> Any:
+    """``[[r, g, b], ...]`` -> a list of tuples; a malformed row is dropped."""
+    log.debug("_rgb_list: %r", value)
+    if not isinstance(value, list):
+        return _DROP
+    return [tuple(int(c) for c in row) for row in value
+            if isinstance(row, list) and len(row) == 3
+            and all(isinstance(c, int) and 0 <= c <= 255 for c in row)]
+
+
+def _fit_mode(value: Any) -> Any:
+    """The enum from its string; an unknown one falls back to the default."""
+    log.debug("_fit_mode: %r", value)
+    if not isinstance(value, str):
+        return value
+    try:
+        return FitMode(value)
+    except ValueError:
+        return _DROP
+
+
+def _screencast_region(value: Any) -> Any:
+    """``[x, y, w, h, audio]`` -> ``(x, y, w, h, bool(audio))``."""
+    log.debug("_screencast_region: %r", value)
+    if isinstance(value, list) and len(value) == 5:
+        return (*value[:4], bool(value[4]))
+    return value
+
+
+def _overlay_elements(value: Any) -> Any:
+    log.debug("_overlay_elements: %d", len(value) if isinstance(value, list) else -1)
+    if not isinstance(value, list):
+        return value
+    return [OverlayElement.from_dict(d) if isinstance(d, dict) else d
+            for d in value]
+
+
+def _orientation_state(value: Any) -> Any:
+    log.debug("_orientation_state: %s", type(value).__name__)
+    return _orientation_state_from_dict(value) if isinstance(value, dict) else value
+
+
+def _orientation_slots(value: Any) -> Any:
+    log.debug("_orientation_slots: %s", type(value).__name__)
+    if not isinstance(value, dict):
+        return value
+    return {str(folder): _orientation_state_from_dict(state)
+            for folder, state in value.items() if isinstance(state, dict)}
+
+
+#: How each such field comes back -- by name, one row each, so a new tuple,
+#: enum or dataclass field is a row here.  A tuple field with no row stays a
+#: list and compares unequal to the tuple a Command writes.
+_FROM_JSON: dict[str, Callable[[Any], Any]] = {
+    "mask_position": _tuple_of(2),
+    "fit_mode": _fit_mode,
+    "overlay_background": _tuple_of(3),
+    "recent_colors": _rgb_list,
+    "screencast_region": _screencast_region,
+    "screencast_rect": _tuple_of(4, int),
+    "user_overlay_elements": _overlay_elements,
+    "entered_with": _orientation_state,
+    "orientation_slots": _orientation_slots,
+}
 
 
 def _device_settings_from_dict(data: dict[str, Any]) -> DeviceSettings:
     """Build DeviceSettings from a parsed JSON dict, tolerant of extras."""
     log.debug("_device_settings_from_dict: data=%s", data)
     kwargs: dict[str, Any] = {}
-    valid_fields = {f for f in DeviceSettings.__dataclass_fields__}
-    for field_name, value in data.items():
-        if field_name in valid_fields:
-            kwargs[field_name] = value
-    # Mask position: JSON loads tuples as lists → restore tuple
-    pos = kwargs.get("mask_position")
-    if isinstance(pos, list) and len(pos) == 2:
-        kwargs["mask_position"] = (pos[0], pos[1])
-    # FitMode enum from its string value
-    fm = kwargs.get("fit_mode")
-    if isinstance(fm, str):
-        try:
-            kwargs["fit_mode"] = FitMode(fm)
-        except ValueError:
-            kwargs.pop("fit_mode")
-    # overlay_background: list[3] → tuple[r,g,b]
-    bg = kwargs.get("overlay_background")
-    if isinstance(bg, list) and len(bg) == 3:
-        kwargs["overlay_background"] = (bg[0], bg[1], bg[2])
-    # screencast_region: list[5] → tuple[x, y, w, h, audio]
-    sc = kwargs.get("screencast_region")
-    if isinstance(sc, list) and len(sc) == 5:
-        kwargs["screencast_region"] = (sc[0], sc[1], sc[2], sc[3], bool(sc[4]))
-    # user_overlay_elements: list[dict] → list[OverlayElement]
-    raw_elements = kwargs.get("user_overlay_elements")
-    if isinstance(raw_elements, list):
-        kwargs["user_overlay_elements"] = [
-            OverlayElement.from_dict(d) if isinstance(d, dict) else d
-            for d in raw_elements
-        ]
+    for name, value in data.items():
+        if name not in DeviceSettings.__dataclass_fields__:
+            continue
+        convert = _FROM_JSON.get(name)
+        if (value := convert(value) if convert else value) is not _DROP:
+            kwargs[name] = value
     return DeviceSettings(**kwargs)
 
 

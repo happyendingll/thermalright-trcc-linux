@@ -14,9 +14,11 @@ from PySide6.QtWidgets import QFrame, QLabel, QPushButton, QSlider, QVBoxLayout
 
 from ...core.logs import per_frame
 from ..presentation.lcd_panel import lcd_panel_for
+from ..presentation.video_clock import playback_clock
 from .assets import Assets
 from .base import BasePanel, ImageLabel, set_background_pixmap
 from .constants import Colors, Layout, Sizes, Styles
+from .preview_popup import PreviewPopOut
 
 log = logging.getLogger(__name__)
 frame_log = per_frame(__name__)
@@ -55,9 +57,15 @@ class UCPreview(BasePanel):
 
         self._lcd_width = width
         self._lcd_height = height
-        self._offset_info = lcd_panel_for((width, height)).offset_info
+        model = lcd_panel_for((width, height))
+        self._offset_info = model.offset_info
 
         self._setup_ui()
+        #: Where the one preview label lives -- the bezel, or the widescreen
+        #: pop-out window (C# ``FormScreenImage``).
+        self.popout = PreviewPopOut(self.preview_label, self.frame_container)
+        left, top, w, h, _ = self._offset_info
+        self.popout.follow(model.popup, (left, top, w, h))
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -117,16 +125,24 @@ class UCPreview(BasePanel):
             "Width fit (letterbox/crop)", self._on_width_fit)
 
         # Time label
-        self.time_label = QLabel("00:00 / 00:00", self.progress_container)
+        self.time_label = QLabel(playback_clock(0, 0, 0), self.progress_container)
         self.time_label.setGeometry(*Layout.TIME_LABEL)
         self.time_label.setStyleSheet(Styles.STATUS_LABEL_OVER_IMAGE)
 
-        # Progress slider
+        # Progress slider -- in FRAMES, as qtgui's is.  A drag only moves the
+        # label; the seek goes on release, as the C#'s MouseUp does.
         self.progress_slider = QSlider(Qt.Orientation.Horizontal, self.progress_container)
         self.progress_slider.setGeometry(*Layout.PROGRESS_SLIDER)
-        self.progress_slider.setRange(0, 100)
+        self.progress_slider.setRange(0, 0)
         self.progress_slider.setStyleSheet(Styles.SLIDER)
-        self.progress_slider.sliderMoved.connect(self._on_seek)
+        self.progress_slider.sliderMoved.connect(self._on_seek_moved)
+        self.progress_slider.sliderReleased.connect(self._on_seek_released)
+        # A groove click or an arrow/page key moves the value without a
+        # press on the handle, so neither signal above fires -- it seeked
+        # nothing, and the next tick snapped the slider back.
+        self.progress_slider.valueChanged.connect(self._on_seek_stepped)
+        #: ``(frame_count, fps)`` of the video shown, for the drag label.
+        self._clock_basis = (0, 0)
 
         layout.addWidget(self.progress_container)
 
@@ -148,8 +164,12 @@ class UCPreview(BasePanel):
         return btn
 
     def _widget_to_lcd(self, wx: int, wy: int) -> tuple[int, int]:
-        """Translate preview widget coordinates to LCD coordinates."""
-        _, _, pw, ph, _ = self._offset_info
+        """Translate preview widget coordinates to LCD coordinates.
+
+        Against the label's CURRENT size: docked it is the bezel's LCD area,
+        popped it is the pop-out's, and a drag must land on the same pixel.
+        """
+        pw, ph = self.preview_label._width, self.preview_label._height
         if pw <= 0 or ph <= 0:
             return (0, 0)
         lx = int(wx * self._lcd_width / pw)
@@ -169,7 +189,7 @@ class UCPreview(BasePanel):
     def _on_nudge(self, dx: int, dy: int):
         """Forward keyboard nudge as LCD-scaled delta."""
         log.debug("_on_nudge: dx=%s dy=%s", dx, dy)
-        _, _, pw, ph, _ = self._offset_info
+        pw, ph = self.preview_label._width, self.preview_label._height
         if pw <= 0 or ph <= 0:
             return
         lcd_dx = int(dx * self._lcd_width / pw) if dx else 0
@@ -197,9 +217,23 @@ class UCPreview(BasePanel):
         log.debug("_on_width_fit")
         self.invoke_delegate(self.CMD_VIDEO_FIT_WIDTH)
 
-    def _on_seek(self, value):
-        log.debug("_on_seek: value=%s", value)
-        self.invoke_delegate(self.CMD_VIDEO_SEEK, value)
+    def _on_seek_moved(self, frame: int) -> None:
+        """Dragging: show where the release will land, seek nothing yet."""
+        frame_log.debug("_on_seek_moved: frame=%d", frame)
+        self.time_label.setText(playback_clock(frame, *self._clock_basis))
+
+    def _on_seek_released(self) -> None:
+        frame = self.progress_slider.value()
+        log.info("_on_seek_released: frame=%d of %d", frame, self._clock_basis[0])
+        self.invoke_delegate(self.CMD_VIDEO_SEEK, frame)
+
+    def _on_seek_stepped(self, frame: int) -> None:
+        """A groove click or a key step -- seek now.  A drag seeks once, on
+        release; playback updates block signals, so they never land here."""
+        if self.progress_slider.isSliderDown():
+            return
+        log.info("_on_seek_stepped: frame=%d of %d", frame, self._clock_basis[0])
+        self.invoke_delegate(self.CMD_VIDEO_SEEK, frame)
 
     def set_image(self, image, fast: bool = False):
         """Set preview image (QImage)."""
@@ -224,11 +258,20 @@ class UCPreview(BasePanel):
         else:
             self.play_btn.setText("⏸" if playing else "▶")
 
-    def set_progress(self, percent, current_time, total_time):
+    def set_progress(self, cursor: int, frame_count: int, fps: int) -> None:
+        """Show frame *cursor* of *frame_count* -- left alone while held, or
+        the thumb would be torn out of the user's hand every frame."""
+        if self.progress_slider.isSliderDown():
+            frame_log.debug("set_progress: %d/%d skipped, slider held",
+                            cursor, frame_count)
+            return
+        frame_log.debug("set_progress: %d/%d @ %d fps", cursor, frame_count, fps)
+        self._clock_basis = (frame_count, fps)
         self.progress_slider.blockSignals(True)
-        self.progress_slider.setValue(int(percent))
+        self.progress_slider.setRange(0, max(0, frame_count - 1))
+        self.progress_slider.setValue(cursor)
         self.progress_slider.blockSignals(False)
-        self.time_label.setText(f"{current_time} / {total_time}")
+        self.time_label.setText(playback_clock(cursor, frame_count, fps))
 
     def set_frame_image(self, pixmap_or_path):
         if isinstance(pixmap_or_path, str):
@@ -238,23 +281,23 @@ class UCPreview(BasePanel):
             set_background_pixmap(self.frame_container, pixmap_or_path)
 
     def set_resolution(self, width, height):
+        """The one funnel for the preview's geometry -- connect, rotation,
+        device switch.  A popped preview follows it (``PreviewPopOut.follow``):
+        still widescreen, the pop-out re-lays with the art for the new shape;
+        anything else docks it first."""
         self._lcd_width = width
         self._lcd_height = height
-        self._offset_info = lcd_panel_for((width, height)).offset_info
+        model = lcd_panel_for((width, height))
+        self._offset_info = model.offset_info
 
         left, top, w, h, frame_name = self._offset_info
-        # On-change (not per-frame) — INFO so the chosen bezel + LCD-area
-        # placement is visible at the default level: this is the preview that
-        # must match the device orientation.
         log.debug(
-            "preview.set_resolution: lcd=%dx%d → bezel=%s area=%dx%d@(%d,%d)",
-            width, height, frame_name, w, h, left, top,
+            "preview.set_resolution: lcd=%dx%d → bezel=%s area=%dx%d@(%d,%d) "
+            "popup=%s",
+            width, height, frame_name, w, h, left, top, model.popup,
         )
-        self.preview_label.setFixedSize(w, h)
-        self.preview_label._width = w
-        self.preview_label._height = h
-        self.preview_label.move(left, top)
         self.set_frame_image(frame_name)
+        self.popout.follow(model.popup, (left, top, w, h))
 
     def get_lcd_size(self):
         return (self._lcd_width, self._lcd_height)

@@ -10,13 +10,12 @@ import typer
 from ...core.commands import (
     AddOverlayElement,
     DeleteTheme,
-    DeviceState,
+    DeviceCanvas,
     DownloadCloudTheme,
-    ExportConfig,
+    ExportCurrentTheme,
     ExportDcTheme,
     ExportOverlay,
     ExportTheme,
-    ImportConfig,
     ImportTheme,
     ListCloudThemes,
     ListThemes,
@@ -26,7 +25,7 @@ from ...core.commands import (
     SaveTheme,
     UploadCustomMask,
 )
-from ._ctx import ensure_connected, get_app, resolution_for
+from ._ctx import get_app, resolution_for
 
 log = logging.getLogger(__name__)
 
@@ -157,10 +156,8 @@ def create(
         key, name, background, mask, metric,
     )
     app_obj = get_app()
-    # This CLI process holds no attached devices; LoadImage → LoadTheme renders
-    # on the wire, so attach first or it fails "not connected".  Idempotent when
-    # a daemon/GUI already owns the device.  (#150)
-    ensure_connected(app_obj, key)
+    # This CLI process holds no attached devices: ``LoadImage`` declares
+    # USES_DEVICE, so App.dispatch connects it first (#150).
 
     bg_result = app_obj.dispatch(LoadImage(key=key, path=background))
     if not bg_result.ok:
@@ -213,6 +210,24 @@ def export(
     )
     result = get_app().dispatch(
         ExportTheme(key=key, theme_name=theme_name, archive_path=archive_path),
+    )
+    typer.echo(result.message)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("export-current")
+def export_current(
+    key: str = typer.Argument(..., help="Device key (e.g. 0402:3922)"),
+    archive_path: Path = typer.Argument(
+        ..., help="Destination: .tr (the Windows app's format) or .zip",
+    ),
+) -> None:
+    """Export what the panel shows, saved or not -- the Windows app's export."""
+    log.info("cli theme export-current: key=%s archive_path=%s",
+             key, archive_path)
+    result = get_app().dispatch(
+        ExportCurrentTheme(key=key, archive_path=archive_path),
     )
     typer.echo(result.message)
     if not result.ok:
@@ -351,17 +366,16 @@ def cloud_downloaded(
                 f"--resolution must look like 320x320, got {resolution!r}",
             ) from None
     else:
-        # Only a handshake knows a device's canvas; DiscoverDevices reports
-        # vid/pid/path and nothing about the panel.
-        state = app_obj.dispatch(DeviceState(key=key))
-        canvas = state.resolution or state.native_resolution
-        if not canvas or canvas == (0, 0):
+        # The one ladder: the handshake, the scanned size, the registry.
+        found = app_obj.dispatch(DeviceCanvas(key=key))
+        if not found.ok:
             typer.echo(
-                f"No canvas known for {key} — connect it first, or pass "
-                "--resolution WxH to list a library without the hardware.",
+                f"{found.message}.  Or pass --resolution WxH to list a "
+                "library without the hardware.",
                 err=True,
             )
             raise typer.Exit(code=1)
+        canvas = (found.width, found.height)
     w, h = canvas
     result = app_obj.dispatch(ListWebThemes(width=w, height=h, key=key))
     typer.echo(result.message)
@@ -421,55 +435,10 @@ def cloud_load(
     # LoadCloudTheme dispatches PlayVideo on the wire; this stateless CLI
     # process must attach the device first or it fails "Not attached".
     # Idempotent when a daemon/GUI already holds it.  (#150)
-    ensure_connected(app_obj, key)
     result = app_obj.dispatch(LoadCloudTheme(key=key, theme_id=theme_id))
     typer.echo(result.message)
     if result.theme_path:
         typer.echo(f"  staged at: {result.theme_path}")
-    if not result.ok:
-        raise typer.Exit(code=1)
-
-
-@app.command("export-config")
-def export_config(
-    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
-    output_path: Path = typer.Argument(
-        ..., help="Destination JSON path (e.g. mydevice.json)",
-    ),
-) -> None:
-    """Snapshot one device's settings to a JSON file.
-
-    Captures everything in ``DeviceSettings``: active theme path,
-    brightness, orientation, overlay edits, mask choice, format prefs.
-    Pair with :command:`trcc theme import-config` to restore on
-    another host or after a wipe.
-    """
-    log.info(
-        "cli theme export-config: key=%s output_path=%s", key, output_path,
-    )
-    result = get_app().dispatch(
-        ExportConfig(key=key, output_path=output_path),
-    )
-    typer.echo(result.message)
-    if not result.ok:
-        raise typer.Exit(code=1)
-
-
-@app.command("import-config")
-def import_config(
-    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
-    input_path: Path = typer.Argument(
-        ..., help="Source JSON written by `trcc theme export-config`",
-    ),
-) -> None:
-    """Restore one device's settings from an export-config JSON file."""
-    log.info(
-        "cli theme import-config: key=%s input_path=%s", key, input_path,
-    )
-    result = get_app().dispatch(
-        ImportConfig(key=key, input_path=input_path),
-    )
-    typer.echo(result.message)
     if not result.ok:
         raise typer.Exit(code=1)
 

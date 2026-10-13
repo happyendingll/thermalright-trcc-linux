@@ -14,8 +14,9 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
-from ...core.logs import per_frame
+from ...core.logs import per_frame, recurring_failure
 from ...core.ports import GpuSource
+from .gpu_detect import nvidia_gpu_present
 
 log = logging.getLogger(__name__)
 frame_log = per_frame(__name__)
@@ -69,6 +70,11 @@ def _nvml_fix_hint(e: Exception, module: Any) -> str:
     return "Check the NVIDIA driver is installed and matches the running kernel"
 
 
+def _cannot_tell() -> None:
+    """The presence answer of a runtime given no probe: unknown."""
+    log.debug("_cannot_tell: no NVIDIA presence probe given")
+
+
 class _NvmlRuntime:
     """One lazy ``nvmlInit``, and the state that attempt leaves behind.
 
@@ -82,12 +88,19 @@ class _NvmlRuntime:
     one machine turned into a failing unit test about an unrelated code path.
 
     ``module`` is the pynvml module (or ``None`` when it would not import);
-    ``import_error`` is why, for the one-time warning.
+    ``import_error`` is why, for the one-time warning.  ``nvidia_present``
+    answers whether the host has an NVIDIA GPU at all (``None``: cannot tell),
+    asked only when something failed: on an AMD-only box a missing reader or
+    a missing driver library is the normal state, not a fault to warn about
+    (#231, #224 -- every such user was told "NVIDIA GPU present").
     """
 
-    def __init__(self, module: Any, import_error: str | None) -> None:
+    def __init__(self, module: Any, import_error: str | None,
+                 nvidia_present: Callable[[], bool | None] | None = None,
+                 ) -> None:
         self._pynvml = module
         self._import_error = import_error
+        self._nvidia_present = nvidia_present or _cannot_tell
         self._lock = threading.Lock()
         self._initialized = False
         self._error: str | None = None
@@ -106,11 +119,17 @@ class _NvmlRuntime:
             # it's visible at the default log level instead of a silent gpu:[].
             if not self._warned_unavailable:
                 self._warned_unavailable = True
-                log.warning(
-                    "pynvml not importable in this interpreter (%s) — NVIDIA "
-                    "GPU sensors unavailable; install nvidia-ml-py into trcc's "
-                    "environment", self._import_error or "ImportError",
-                )
+                if self._nvidia_present() is False:
+                    log.debug("pynvml not importable (%s) — no NVIDIA GPU on "
+                              "this host, nothing to read",
+                              self._import_error or "ImportError")
+                else:
+                    log.warning(
+                        "pynvml not importable in this interpreter (%s) — "
+                        "NVIDIA GPU sensors unavailable; install nvidia-ml-py "
+                        "into trcc's environment",
+                        self._import_error or "ImportError",
+                    )
             else:
                 log.debug("ensure_init: pynvml unavailable (already warned)")
             return False
@@ -134,11 +153,22 @@ class _NvmlRuntime:
                     log.debug("NVML not ready (transient): %s", e)
                 elif not self._warned_init_failure:
                     self._warned_init_failure = True
-                    log.warning(
-                        "NVIDIA GPU present but NVML init failed: %s — %s",
-                        e, _nvml_fix_hint(e, self._pynvml),
-                    )
+                    self._warn_init_failure(e)
                 return False
+
+    def _warn_init_failure(self, e: Exception) -> None:
+        """Say why NVML would not start -- as a fault only where a card is."""
+        present = self._nvidia_present()
+        log.debug("_warn_init_failure: nvidia_present=%s", present)
+        if present is False:
+            log.debug("NVML init failed (%s) — no NVIDIA GPU on this host, "
+                      "nothing to read", e)
+        elif present:
+            log.warning("NVIDIA GPU present but NVML init failed: %s — %s",
+                        e, _nvml_fix_hint(e, self._pynvml))
+        else:
+            log.warning("NVML init failed: %s — if this machine has an NVIDIA "
+                        "GPU: %s", e, _nvml_fix_hint(e, self._pynvml))
 
     def state(self) -> tuple[bool, bool, str | None]:
         """``(reader_available, initialized, last_error)`` for this runtime.
@@ -157,7 +187,7 @@ class _NvmlRuntime:
 #: The process's NVML runtime.  ``nvmlInit`` really is per-process, so one is
 #: correct — the point of the class is that it is no longer the *only* one
 #: constructible.
-_runtime = _NvmlRuntime(pynvml, _import_error)
+_runtime = _NvmlRuntime(pynvml, _import_error, nvidia_gpu_present)
 
 
 #: The shape of :func:`nvml_init_state` — ``(reader_available, initialized,
@@ -242,7 +272,7 @@ class NvidiaGpu(GpuSource):
             return float(pynvml.nvmlDeviceGetTemperature(
                 self._handle, pynvml.NVML_TEMPERATURE_GPU))
         except Exception:
-            log.debug("nvmlDeviceGetTemperature(%d) failed", self._index, exc_info=True)
+            recurring_failure(log, "nvmlDeviceGetTemperature(%d) failed", self._index)
             return None
 
     def usage(self) -> float | None:
@@ -252,7 +282,7 @@ class NvidiaGpu(GpuSource):
         try:
             return float(pynvml.nvmlDeviceGetUtilizationRates(self._handle).gpu)
         except Exception:
-            log.debug("nvmlDeviceGetUtilizationRates(%d) failed", self._index, exc_info=True)
+            recurring_failure(log, "nvmlDeviceGetUtilizationRates(%d) failed", self._index)
             return None
 
     def clock(self) -> float | None:
@@ -263,7 +293,7 @@ class NvidiaGpu(GpuSource):
             return float(pynvml.nvmlDeviceGetClockInfo(
                 self._handle, pynvml.NVML_CLOCK_GRAPHICS))
         except Exception:
-            log.debug("nvmlDeviceGetClockInfo(%d) failed", self._index, exc_info=True)
+            recurring_failure(log, "nvmlDeviceGetClockInfo(%d) failed", self._index)
             return None
 
     def power(self) -> float | None:
@@ -273,7 +303,7 @@ class NvidiaGpu(GpuSource):
         try:
             return pynvml.nvmlDeviceGetPowerUsage(self._handle) / 1000.0
         except Exception:
-            log.debug("nvmlDeviceGetPowerUsage(%d) failed", self._index, exc_info=True)
+            recurring_failure(log, "nvmlDeviceGetPowerUsage(%d) failed", self._index)
             return None
 
     def fan(self) -> float | None:
@@ -283,7 +313,19 @@ class NvidiaGpu(GpuSource):
         try:
             return float(pynvml.nvmlDeviceGetFanSpeed(self._handle))
         except Exception:
-            log.debug("nvmlDeviceGetFanSpeed(%d) failed", self._index, exc_info=True)
+            recurring_failure(log, "nvmlDeviceGetFanSpeed(%d) failed", self._index)
+            return None
+
+    def fan_rpm(self) -> float | None:
+        # Only recent drivers export nvmlDeviceGetFanSpeedRPM; older ones raise
+        # FunctionNotFound, and GPUFAN then falls back to the duty percent.
+        frame_log.debug("fan_rpm: idx=%d", self._index)
+        if pynvml is None:
+            return None
+        try:
+            return float(pynvml.nvmlDeviceGetFanSpeedRPM(self._handle))
+        except Exception:
+            recurring_failure(log, "nvmlDeviceGetFanSpeedRPM(%d) failed", self._index)
             return None
 
     def vram_used(self) -> float | None:
@@ -293,7 +335,7 @@ class NvidiaGpu(GpuSource):
         try:
             return float(pynvml.nvmlDeviceGetMemoryInfo(self._handle).used) / (1024 * 1024)
         except Exception:
-            log.debug("nvmlDeviceGetMemoryInfo.used(%d) failed", self._index, exc_info=True)
+            recurring_failure(log, "nvmlDeviceGetMemoryInfo.used(%d) failed", self._index)
             return None
 
     def vram_total(self) -> float | None:
@@ -303,5 +345,5 @@ class NvidiaGpu(GpuSource):
         try:
             return float(pynvml.nvmlDeviceGetMemoryInfo(self._handle).total) / (1024 * 1024)
         except Exception:
-            log.debug("nvmlDeviceGetMemoryInfo.total(%d) failed", self._index, exc_info=True)
+            recurring_failure(log, "nvmlDeviceGetMemoryInfo.total(%d) failed", self._index)
             return None

@@ -32,9 +32,10 @@ from ...core.logs import per_frame
 from ..presentation.lcd_panel import lcd_panel_for
 from ..qt_periodic import PeriodicUpdater
 from .assets import Assets
+from .base import TicksWhileShown
 
 if TYPE_CHECKING:
-    from ...app import App
+    from ...core.ports import CommandBus
     from ..bus_bridge import BusBridge
     from .device_selection import DeviceSelection
 
@@ -53,7 +54,7 @@ PREVIEW_MAX = 480
 FRAME_EDGE = 500
 
 
-class PreviewSurface(QWidget):
+class PreviewSurface(TicksWhileShown, QWidget):
     """Live render of the selected device, always on screen."""
 
     #: (width, height) of the render that just landed — the DEVICE's canvas,
@@ -68,7 +69,7 @@ class PreviewSurface(QWidget):
 
     def __init__(
         self,
-        app: App,
+        app: CommandBus,
         bus: BusBridge,
         selection: DeviceSelection,
         parent: QWidget | None = None,
@@ -99,7 +100,7 @@ class PreviewSurface(QWidget):
         self.set_placeholder("Pick a device on the left to see its output.")
 
         selection.changed.connect(self._on_device_changed)
-        self._updates.start(REFRESH_MS, self.refresh)
+        self._start_updates(REFRESH_MS, self.refresh)
         # A frame on the wire means state changed somewhere -- another UI, the
         # API, a driver -- so re-render rather than wait for the next tick.
         self._bus.frame_sent.connect(
@@ -142,8 +143,24 @@ class PreviewSurface(QWidget):
         # read for.
         mine = getattr(event, "key", None) == self._selection.key
         frame_log.debug("PreviewSurface._on_frame_sent: mine=%s", mine)
-        if mine:
+        if not mine:
+            return
+        # The frame that went to the panel IS the preview: show it.  Across
+        # the daemon socket the BusBridge has already turned the App's JPEG
+        # into this surface, so every window reads one shape.  Only a send
+        # with no picture (a colour, raw bytes) renders one.
+        surface = getattr(event, "surface", None)
+        if not isinstance(surface, QImage) or surface.isNull():
             self.refresh()
+            return
+        pixmap = surface_to_pixmap(surface, self._label.width(),
+                                   self._label.height())
+        if pixmap is None:
+            self.refresh()
+            return
+        self._label.setPixmap(pixmap)
+        self._label.setText("")
+        self.rendered.emit(surface.width(), surface.height())
 
     # ── Render ─────────────────────────────────────────────────────────
 

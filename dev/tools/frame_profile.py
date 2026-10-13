@@ -40,11 +40,20 @@ import argparse
 import cProfile
 import logging
 import pstats
+import os
 import sys
 from pathlib import Path
 
+# In-process on purpose: this measures the App's work in THIS process, and the
+# production default would hand it a proxy to a daemon doing the work elsewhere.
+# In-process measurement, whatever the shell exports: through the shared App
+# this would time a different process.  ``main`` refuses while one runs.
+os.environ["TRCC_DAEMON"] = "0"
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # dev/
+from _refuse import refuse_while_trcc_runs
 
 from _gui_drive import WARMUP, drive_gui
 from trcc._boot import trcc
@@ -157,6 +166,7 @@ def main() -> int:
     if args.gui and args.video is not None:
         raise SystemExit("--gui drives whatever the GUI has loaded; "
                          "--video is for the headless arm")
+    refuse_while_trcc_runs("frame_profile")
     rows = profile_gui(args.frames) if args.gui else profile(args.frames,
                                                              args.video)
     picked = {k: v for k, v in rows.items() if not args.hot or v >= 0.5}

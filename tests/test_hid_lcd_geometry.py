@@ -96,6 +96,9 @@ def _make_type3(transport: FakeBulkTransport,
     (10, (960, 540), 224),
     # PM=5 → FBL=50 (override) → (320, 240).
     (5,  (320, 240),  50),
+    # PM=49 → FBL=49 (identity) → (320, 240): the C#'s no-flag fallback.  It
+    # had no row and resolved to the 320x320 default.
+    (49, (320, 240),  49),
 ])
 def test_type2_handshake_derives_resolution_from_pm(
     fake_bulk: FakeBulkTransport,
@@ -138,6 +141,23 @@ def test_type2_pm_sub_compound_uses_correct_fbl(
 
 
 # ── Type 3: FBL byte derives resolution + profile ─────────────────────
+
+
+def test_a_pm_49_panel_is_fbl_50_big_endian(fake_bulk: FakeBulkTransport) -> None:
+    """PM 49 is a Frozen Warframe on the type-2 list (UCDevice.cs:463); the
+    C# shares every path with FBL 50 except SPIMode=2 (FormCZTV.cs:1069),
+    ImageTo565's big-endian branch.  Rotation and size are FBL 50's."""
+    fake_bulk.read_script.append(_type2_response(49))
+    device = _make_type2(fake_bulk)
+
+    device.connect()
+
+    fifty = get_profile(50)
+    assert device._profile is not None
+    assert (device._profile.resolution, device._profile.rotate) == (
+        fifty.resolution, fifty.rotate)
+    assert device._profile.big_endian is True and fifty.big_endian is False
+    assert device._profile.jpeg is False
 
 
 @pytest.mark.parametrize("indicator,expected_fbl,expected_resolution", [
@@ -339,6 +359,51 @@ def test_type2_serial_extracted_when_marker_set(
     result = device.connect()
 
     assert result.serial == "DEADBEEFCAFEBABE0102030405060708"
+
+
+def test_type2_serial_kept_on_a_36_byte_reply(
+    fake_bulk: FakeBulkTransport,
+) -> None:
+    """A reply that ENDS with the serial still carries it.
+
+    This panel answers with exactly 36 bytes — magic, PM/SUB, the 0x10 marker
+    and the 16 serial bytes at resp[20:36] — so ``len(resp) > 36`` was false
+    for the only reply that matters and the serial came back empty.
+    """
+    serial_bytes = bytes.fromhex("415035333030300C007AB95B03004F78")
+    resp = bytearray(36)
+    resp[0:4] = _TYPE2_MAGIC
+    resp[4] = 2        # SUB
+    resp[5] = 128      # PM
+    resp[12] = 0x01    # required by the validator
+    resp[16] = 0x10    # serial marker
+    resp[20:36] = serial_bytes
+    fake_bulk.read_script.append(bytes(resp))
+    device = _make_type2(fake_bulk)
+
+    result = device.connect()
+
+    assert result.serial == serial_bytes.hex().upper()
+
+
+def test_type2_serial_blank_on_a_35_byte_reply(
+    fake_bulk: FakeBulkTransport,
+) -> None:
+    """One byte short of the serial is no serial: the 16 bytes at resp[20:36]
+    are not all there, and a 15-byte slice must not pass for one."""
+    resp = bytearray(35)
+    resp[0:4] = _TYPE2_MAGIC
+    resp[4] = 2        # SUB
+    resp[5] = 128      # PM
+    resp[12] = 0x01    # required by the validator
+    resp[16] = 0x10    # serial marker
+    resp[20:35] = bytes(range(1, 16))
+    fake_bulk.read_script.append(bytes(resp))
+    device = _make_type2(fake_bulk)
+
+    result = device.connect()
+
+    assert result.serial == ""
 
 
 def test_type2_serial_blank_without_marker(

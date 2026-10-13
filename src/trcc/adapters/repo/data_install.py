@@ -26,6 +26,7 @@ empty, but the app keeps running).
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import shutil
@@ -35,7 +36,7 @@ from typing import Protocol
 
 from ...core import toolchain
 from ...core._safe import is_safe_zip_member
-from ...core.errors import HttpFetchError, TrccError
+from ...core.errors import HttpFetchError
 from ...core.ports import DataInstaller, HttpFetcher
 
 log = logging.getLogger(__name__)
@@ -89,7 +90,7 @@ class SevenZipExtractor:
         target.mkdir(parents=True, exist_ok=True)
         try:
             listing = subprocess.run(
-                [toolchain.resolve("7z") or "7z", "l", "-slt",
+                [toolchain.executable("7z"), "l", "-slt",
                  str(archive)],
                 capture_output=True, text=True, timeout=30,
                 creationflags=_NO_WINDOW,
@@ -121,7 +122,7 @@ class SevenZipExtractor:
                 return False
         try:
             result = subprocess.run(
-                [toolchain.resolve("7z") or "7z", "x", str(archive),
+                [toolchain.executable("7z"), "x", str(archive),
                  f"-o{target}", "-y"],
                 capture_output=True, timeout=120,
                 creationflags=_NO_WINDOW,
@@ -203,17 +204,30 @@ class HttpDataInstaller(DataInstaller):
                         archive_tmp, type(e).__name__, e)
             return False
 
+        # Extract beside the target and swap it in whole.  Straight into
+        # ``target_dir``, a failed or interrupted extract left files behind,
+        # and ``_is_populated`` then called the half-install ready forever.
+        staging = target_dir.with_name(f"{target_dir.name}.partial")
+        shutil.rmtree(staging, ignore_errors=True)   # a run that died mid-way
         try:
-            ok = self._extractor.extract(archive_tmp, target_dir)
+            ok = self._extractor.extract(archive_tmp, staging)
+            if ok:
+                _unwrap_nested_dir(staging)
+                if target_dir.is_dir():
+                    target_dir.rmdir()   # empty: _is_populated said so above
+                staging.rename(target_dir)
+                log.info("install: %s ready at %s", archive_name, target_dir)
+            else:
+                log.warning("install: %s extract failed — nothing kept",
+                            archive_name)
+        except OSError as e:
+            log.warning("install: cannot place %s at %s: %s: %s",
+                        archive_name, target_dir, type(e).__name__, e)
+            ok = False
         finally:
-            try:
+            with contextlib.suppress(OSError):
                 archive_tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
-
-        if ok:
-            _unwrap_nested_dir(target_dir)
-            log.info("install: %s ready at %s", archive_name, target_dir)
+            shutil.rmtree(staging, ignore_errors=True)
         return ok
 
 
@@ -249,7 +263,3 @@ def _unwrap_nested_dir(target_dir: Path) -> None:
         nested.rmdir()
     except OSError as e:
         log.warning("unwrap: cannot remove %s: %s", nested, e)
-
-
-class DataInstallError(TrccError):
-    """Raised when no archive can be obtained AND no local data exists."""

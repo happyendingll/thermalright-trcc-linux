@@ -31,7 +31,7 @@ def list_devices() -> None:
         typer.echo("No supported devices found.")
         raise typer.Exit(code=1)
     typer.echo(f"{len(result.products)} device(s) found:")
-    for product in result.products:
+    for key, product in result.units():
         # ``DiscoverDevices`` never handshakes (``test_it_does_not_scan_the_bus``
         # pins that), so this figure is the CATALOG's, not the panel's.  One USB
         # id covers panels from 240x320 to 1280x480, and printing bare digits
@@ -42,9 +42,12 @@ def list_devices() -> None:
         w, h = product.native_resolution
         size = f"{w}×{h} (catalog)" if (w, h) != (0, 0) else "unknown"
         typer.echo(
-            f"  {product.key}  {product.vendor} {product.product}  "
+            f"  {key}  {product.vendor} {product.product}  "
             f"(wire={product.wire.value}, resolution={size})"
         )
+        if key in result.several_coolers:
+            typer.echo(f"      this USB id covers several coolers — "
+                       f"'trcc device connect {key}' names yours")
     typer.echo(
         "Resolutions above come from the catalog, not the panel.  "
         "Run 'trcc device connect <key>' to read the panel's own."
@@ -61,6 +64,10 @@ def connect(key: str = typer.Argument(..., help="Device key, e.g. 0402:3922")) -
         for hint in result.hints:
             typer.echo(f"  hint: {hint}")
         raise typer.Exit(code=1)
+    if result.product:
+        catalog = (f"  (catalog: {result.catalog_product})"
+                   if result.catalog_product not in ("", result.product) else "")
+        typer.echo(f"  device:     {result.product}{catalog}")
     if result.handshake:
         h = result.handshake
         typer.echo(f"  resolution: {h.resolution[0]}×{h.resolution[1]}")
@@ -96,8 +103,8 @@ def state(
 ) -> None:
     """Show what a device IS — identity, connection, handshake geometry.
 
-    ``native_resolution`` is what the product registry claims; ``resolution``
-    is what the panel answered at handshake.  When they differ, the handshake
+    ``catalog_*`` is what the product registry claims for the USB id;
+    ``product`` and ``resolution`` are the cooler the handshake identified.  When they differ, the handshake
     wins and the difference is usually the thing worth reporting.
     """
     log.info("cli device state: key=%s", key)
@@ -106,7 +113,8 @@ def state(
         typer.echo(result.message)
         raise typer.Exit(code=1)
     for field in (
-        "vendor", "product", "wire", "kind", "model", "native_resolution",
+        "vendor", "product", "catalog_product", "wire", "kind", "model",
+        "catalog_resolution",
         "connected", "is_led", "resolution", "pm_byte", "sub_byte", "fbl",
         "jpeg", "rotate", "widescreen", "led_style",
     ):

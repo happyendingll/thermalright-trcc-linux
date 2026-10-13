@@ -92,12 +92,13 @@ ALL_DEVICES: dict[tuple[int, int], ProductInfo] = {
         # whatever this field says.  On a 1280x480 Trofeo Vision it fetched
         # theme240320 and the browser then pointed there -- "locked at
         # 240x320" -- two minutes AFTER the handshake had correctly reported
-        # (1280, 480).  Five reporters: #244, #257, #267, #268, #300.
+        # (1280, 480).  Six reporters: #240, #244, #257, #267, #268, #300.
         #
         # Nothing downstream needs the guess.  `DiscoverDevices` skips a
-        # (0, 0) row, `_resolve_resolution` returns None for it, the qtgui
-        # browsers guard it, and `ConnectDevice` installs for the HANDSHAKE
-        # resolution -- so a device that connects still gets its data.  The
+        # (0, 0) row, `_resolve_resolution` returns None for it,
+        # `DeviceCanvas` refuses it (so no browser authors for 0x0), and
+        # `ConnectDevice` installs for the HANDSHAKE resolution -- so a
+        # device that connects still gets its data.  The
         # cost is that a device which NEVER connects shows empty grids
         # instead of wrong-sized ones, which is the better failure: empty
         # self-heals on connect (DataInstalled -> notify_data_ready), wrong
@@ -200,9 +201,3 @@ def products_by_wire(wire: Wire) -> list[ProductInfo]:
     """Return all products using a given wire protocol."""
     log.debug("products_by_wire: wire=%s", wire)
     return [p for p in ALL_DEVICES.values() if p.wire is wire]
-
-
-def products_by_kind(kind: Kind) -> list[ProductInfo]:
-    """Return all products of a given kind (LCD or LED)."""
-    log.debug("products_by_kind: kind=%s", kind)
-    return [p for p in ALL_DEVICES.values() if p.kind is kind]

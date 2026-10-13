@@ -4,8 +4,8 @@ qtgui shows ONE panel at a time in a ``QStackedWidget`` (``app.py:102``), but
 its panels poll on plain ``QTimer``s that nothing ever stops:
 ``stop_periodic_updates`` had **zero callers** and there were no
 ``showEvent`` / ``hideEvent`` hooks anywhere in the skin.  ``ui/gui`` gates its
-work on visibility (``trcc_app.py:342`` — ``isVisible() and not
-minimized_to_taskbar``); qtgui did not gate at all.
+work on visibility (``TRCCApp.isVisible()``, passed to each handler as
+``is_visible_fn``); qtgui did not gate at all.
 
 **Measured 2026-09-19 on the mock fleet, switching only which panel is shown:**
 
@@ -55,7 +55,7 @@ class _Ticking(BasePanel):
 
 def _stacked(qtbot, tmp_path: Path) -> tuple[App, QStackedWidget, list[_Ticking]]:
     """Two panels in a real stack — the widget qtgui actually uses."""
-    app = App(MockPlatform(_SPECS, tmp_path))
+    app = App(MockPlatform(_SPECS, tmp_path, host_sensors=False))
     bus = BusBridge(app.events)
     stack = QStackedWidget()
     panels = [_Ticking(app, bus), _Ticking(app, bus)]
@@ -163,7 +163,7 @@ def test_the_sensor_picker_stops_working_when_hidden(qtbot, tmp_path: Path) -> N
     from trcc.core.events import SensorsUpdated
     from trcc.ui.qtgui.sensor_picker import SensorPickerWidget
 
-    app = App(MockPlatform(_SPECS, tmp_path))
+    app = App(MockPlatform(_SPECS, tmp_path, host_sensors=False))
     try:
         bus = BusBridge(app.events)
         host = QWidget()

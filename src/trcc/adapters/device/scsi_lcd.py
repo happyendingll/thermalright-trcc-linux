@@ -7,16 +7,17 @@ knows the SCSI CDB vocabulary the device expects.
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 import struct
 import time
 import zlib
 
 from ...core.errors import TransportError
-from ...core.logs import per_frame
+from ...core.logs import Blob, per_frame
 from ...core.models import HandshakeResult, Wire
 from ...core.ports import ScsiTransport
-from ...core.protocol import get_profile
+from ...core.protocol import DeviceProfile, get_profile
 from ._base import BaseDevice
 
 log = logging.getLogger(__name__)
@@ -71,6 +72,26 @@ _BOOT_ANIM_RESOLUTIONS: frozenset[tuple[int, int]] = frozenset({
 # =========================================================================
 
 
+#: Poll bytes whose RGB565 is big-endian on the SCSI wire ONLY.  FormCZTVInit
+#: sets SPI mode 2 for mode 1 + FBL 51 (FormCZTV.cs:1065), and USBLCD.exe
+#: copies the frame to the panel unswapped (its '3' class, USBLCD.exe.c).  NOT
+#: in FBL_PROFILES[51]: the HID wire's FBL 51 is little-endian on real glass
+#: (#65, #67).  On a SCSI FBL 51 panel big-endian IS the glass: @PourrezJ's
+#: 0402:3922 (320x240, SUB 0) showed a green theme pink until he swapped it
+#: to big-endian, the same change, made independently (#313).
+_SCSI_BIG_ENDIAN_FBLS: frozenset[int] = frozenset({51})
+
+
+def scsi_profile(fbl: int) -> DeviceProfile:
+    """The SCSI panel's profile for its poll byte -- ``get_profile`` plus the
+    SCSI-only byte order."""
+    profile = get_profile(fbl, fbl)
+    if fbl in _SCSI_BIG_ENDIAN_FBLS and not profile.big_endian:
+        profile = dataclasses.replace(profile, big_endian=True)
+    log.debug("scsi_profile: FBL %d -> %dx%d big_endian=%s", fbl,
+              *profile.resolution, profile.big_endian)
+    return profile
+
 class ScsiLcd(BaseDevice[ScsiTransport], wire=Wire.SCSI):
     """SCSI LCD device.
 
@@ -105,6 +126,14 @@ class ScsiLcd(BaseDevice[ScsiTransport], wire=Wire.SCSI):
 
         self._trace_reply(response)
         fbl = response[0] if response else (self.info.fbl or 100)
+        if not response:
+            # USBLCD.exe classifies no panel from an empty byte; we must draw
+            # something, so say what was assumed -- a 240x320 or 240x240 panel
+            # is driven at the wrong size by this guess (v9.10.6, #301).
+            log.warning("ScsiLcd %s: the poll returned no identity byte — "
+                        "assuming FBL %d; if the panel shows the picture at "
+                        "the wrong size, attach `trcc report`",
+                        self.info.key, fbl)
         log.debug("SCSI poll byte[0] = %d (FBL)", fbl)
 
         # Step 2: Init (data-out, 0xE100 zeros)
@@ -120,7 +149,7 @@ class ScsiLcd(BaseDevice[ScsiTransport], wire=Wire.SCSI):
         # Geometry comes from the FBL byte via get_profile — a device that
         # reports e.g. FBL=102 surfaces its resolution from the profile,
         # not the registry's static native_resolution. SCSI uses PM=FBL.
-        self._profile = get_profile(fbl, fbl)
+        self._profile = scsi_profile(fbl)
         return HandshakeResult(
             resolution=self._profile.resolution,
             model_id=fbl,
@@ -132,7 +161,8 @@ class ScsiLcd(BaseDevice[ScsiTransport], wire=Wire.SCSI):
 
     def _handshake_detail(self, result: HandshakeResult) -> str:
         """SCSI reports one byte — call it FBL, since PM *is* FBL here."""
-        log.debug("_handshake_detail: result=%s", result)
+        log.debug("_handshake_detail: result=%s raw=%s",
+                  result, Blob(result.raw_response))
         return f" (FBL {result.fbl})"
 
     def _frame_size(self) -> tuple[int, int]:

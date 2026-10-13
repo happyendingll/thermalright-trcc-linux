@@ -8,8 +8,6 @@ Every panel:
 * holds the ``BusBridge`` (so it can subscribe to typed Qt signals
   forwarded from the EventBus);
 * implements ``_setup_ui()`` to build its widget tree;
-* may override ``apply_language(code)`` to re-render localized strings
-  (default no-op);
 * may override ``get_state()`` / ``set_state(dict)`` for save / restore.
 
 Why a metaclass-style enforcement: legacy hit ``TypeError`` when QFrame
@@ -35,8 +33,8 @@ from ..qt_periodic import PeriodicUpdater
 from .device_selection import DeviceSelection
 
 if TYPE_CHECKING:
-    from ...app import App
     from ...core.commands import Command
+    from ...core.ports import CommandBus
     from ..bus_bridge import BusBridge
 
 log = logging.getLogger(__name__)
@@ -45,7 +43,48 @@ log = logging.getLogger(__name__)
 R = TypeVar("R", bound=Result)
 
 
-class BasePanel(QFrame):
+class TicksWhileShown:
+    """Periodic updates that run only while the widget is on screen.
+
+    qtgui stacks its panels (``app.py:102``), so all but one are hidden at
+    any moment, and the window itself hides to the tray on close.  A timer
+    that kept going there dispatched a full ``BuildPreview`` every second for
+    nobody: measured 2026-09-30 on the preview, 3 renders in 3 s after the
+    window closed, the same as while shown.
+
+    This lives on the WIDGET, not on ``PeriodicUpdater``, which the gui skin
+    shares without show/hide hooks.  No window-owned updater drives the
+    device (the core's loops do, #249), so pausing one never freezes a panel.
+    A widget that is not on screen when it starts waits for its first show.
+    """
+
+    _updates: PeriodicUpdater
+
+    if TYPE_CHECKING:
+        # Declared for the type checker only: defined for real it would come
+        # FIRST in the MRO and shadow the QWidget's own isVisible.
+        def isVisible(self) -> bool: ...
+
+    def _start_updates(self, interval_ms: int,
+                       callback: Callable[[], None]) -> None:
+        self._updates.start(interval_ms, callback)
+        if not self.isVisible():
+            log.debug("_start_updates: %s not on screen yet — waiting",
+                      type(self).__name__)
+            self._updates.suspend()
+
+    def showEvent(self, event: object) -> None:
+        log.debug("showEvent: %s back on screen", type(self).__name__)
+        super().showEvent(event)      # type: ignore[misc]
+        self._updates.resume()
+
+    def hideEvent(self, event: object) -> None:
+        log.debug("hideEvent: %s left the screen", type(self).__name__)
+        super().hideEvent(event)      # type: ignore[misc]
+        self._updates.suspend()
+
+
+class BasePanel(TicksWhileShown, QFrame):
     """Common QFrame substrate for every TRCC GUI panel.
 
     Subclasses receive ``app`` + ``bus`` via __init__, build their UI in
@@ -60,7 +99,7 @@ class BasePanel(QFrame):
 
     def __init__(
         self,
-        app: App,
+        app: CommandBus,
         bus: BusBridge,
         parent: QWidget | None = None,
         *,
@@ -77,31 +116,6 @@ class BasePanel(QFrame):
         self._selection = selection or DeviceSelection(self)
         self._updates = PeriodicUpdater(self)
         self._setup_ui()
-
-    # ── Visibility ────────────────────────────────────────────────────
-    #
-    # qtgui stacks its panels (``app.py:102``), so all but one are hidden at
-    # any moment — and nothing stopped them.  ``stop_periodic_updates`` had
-    # ZERO callers and there were no show/hide hooks in the skin, while
-    # ``ui/gui`` has gated on visibility all along (``trcc_app.py:342``).
-    #
-    # This lives on the PANEL, not on ``PeriodicUpdater``, although the
-    # updater looks like the DRYer home: ``app.py:181`` holds
-    # ``self._video: dict[str, PeriodicUpdater]`` and video playback drives
-    # the PHYSICAL DEVICE.  Gating the updater itself would freeze a playing
-    # panel whenever the window is hidden — worse than the waste it fixes.
-    # Those updaters are owned by the window, so a panel-level hook cannot
-    # reach them by construction.
-
-    def showEvent(self, event: object) -> None:
-        log.debug("showEvent: %s back on screen", type(self).__name__)
-        super().showEvent(event)      # type: ignore[arg-type]
-        self._updates.resume()
-
-    def hideEvent(self, event: object) -> None:
-        log.debug("hideEvent: %s left the screen", type(self).__name__)
-        super().hideEvent(event)      # type: ignore[arg-type]
-        self._updates.suspend()
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         """Reject concrete subclasses that forget to implement _setup_ui."""
@@ -129,11 +143,6 @@ class BasePanel(QFrame):
         raise NotImplementedError(
             f"{type(self).__name__} must implement _setup_ui()"
         )
-
-    def apply_language(self, lang: str) -> None:
-        """Re-render localized strings.  Default no-op."""
-        log.debug("apply_language: lang=%s", lang)
-        del lang
 
     def get_state(self) -> dict:
         """Serialize panel state for save / restore.  Default empty."""
@@ -170,7 +179,7 @@ class BasePanel(QFrame):
         return self._selection
 
     @property
-    def app(self) -> App:
+    def app(self) -> CommandBus:
         log.debug("app")
         return self._app
 
@@ -186,9 +195,4 @@ class BasePanel(QFrame):
     ) -> None:
         """Run *callback* every *interval_ms* on the Qt main thread."""
         log.debug("start_periodic_updates: interval_ms=%s callback=%s", interval_ms, callback)
-        self._updates.start(interval_ms, callback)
-
-    def stop_periodic_updates(self) -> None:
-        """Stop the periodic update timer if running."""
-        log.debug("stop_periodic_updates")
-        self._updates.stop()
+        self._start_updates(interval_ms, callback)

@@ -7,72 +7,87 @@ Holds one Platform (the OS), one dict of live Devices keyed by their
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
+from functools import partial
 from pathlib import Path
 from typing import Any, TypeVar
 
 from .adapters.device import DEVICES
 from .adapters.repo.github_releases import GitHubReleases
-from .adapters.repo.http import UrllibHttpFetcher
+from .adapters.rgb import make_mirror
 from .adapters.theme.cloud import CzhordeCatalog
 from .adapters.theme.filesystem import FileContentStore
 from .core.commands import Command
-from .core.errors import DeviceDisconnectedError, DeviceNotFoundError
+from .core.errors import DeviceNotFoundError, TransportError
 from .core.events import (
     BackgroundChanged,
     BrightnessChanged,
-    DateFormatChanged,
+    DataInstalled,
     DeviceAttached,
+    DeviceConnected,
     DeviceDetached,
     DeviceDisconnected,
     ErrorOccurred,
+    Event,
     EventBus,
     FitModeChanged,
+    FrameSent,
+    LedColorsChanged,
     LedSettingsChanged,
     MaskApplied,
     MaskPositionChanged,
     MaskVisibilityChanged,
     OrientationChanged,
     OverlayChanged,
+    RgbFollowSent,
     SensorsUpdated,
     SplitModeChanged,
     SystemResumed,
     TempUnitChanged,
-    TimeFormatChanged,
+    UpdateChecked,
     VideoStarted,
     VideoStopped,
 )
 from .core.led_models import LedRuntimeState
 from .core.libraries import DeviceLibraries
-from .core.logs import per_frame
+from .core.logs import current_origin, per_frame, recurring_warning, sink_for
 from .core.models import (
+    Capability,
     DeviceInfo,
     DeviceQuirks,
     HardwareMetrics,
+    RgbFollowMode,
     Theme,
+    format_device_key,
     oriented_resolution,
+    parse_device_key,
     quirks_for,
 )
 from .core.ports import (
+    CommandBus,
     DataInstallRunner,
     Device,
     Diagnostics,
     Platform,
     Renderer,
+    RgbMirror,
     SendScheduler,
     SendTask,
+    TlsIdentity,
     VideoExportRunner,
 )
 from .core.protocol import background_variant, mask_variant, theme_variant
 from .core.registry import find_product
-from .core.results import ConnectResult, Result
+from .core.results import ConnectResult, Result, UpdateCheckResult
 from .services.audio import AudioCapture
 from .services.background import BackgroundSlot
 from .services.cloud_theme import CloudThemeService
 from .services.device_sender import DeviceSender
 from .services.display import DisplayService
 from .services.first_run import FirstRunService
+from .services.game_mode import GameModeGate
 from .services.led_animation_loop import LedAnimationLoop
 from .services.led_effects import LEDEffectEngine
 from .services.media import MediaService
@@ -80,8 +95,12 @@ from .services.metrics_loop import MetricsLoop
 from .services.migration import LibraryMigration
 from .services.overlay import OverlayService
 from .services.quickstart import QuickstartService
+from .services.reconnect_watcher import ReconnectWatcher
+from .services.rgb_mirror import Columns, RgbMirrorService
 from .services.settings import Settings
 from .services.slideshow import SlideshowService
+from .services.update_watch import UpdateWatch
+from .services.video_loop import VideoLoop
 
 log = logging.getLogger(__name__)
 frame_log = per_frame(__name__)
@@ -95,7 +114,7 @@ R = TypeVar("R", bound=Result)
 # =========================================================================
 
 
-class App:
+class App(CommandBus):
     """Application hub.
 
     * `platform` — the OS (Linux/Windows/macOS/BSD), DI'd at construction.
@@ -111,6 +130,8 @@ class App:
                  send_scheduler: SendScheduler | None = None,
                  data_install_runner: DataInstallRunner | None = None,
                  video_export_runner: VideoExportRunner | None = None,
+                 make_rgb_mirror: Callable[[RgbFollowMode, str, int],
+                                           RgbMirror] | None = None,
                  ) -> None:
         log.debug("__init__: platform=%s renderer=%s", platform, renderer)
         self.platform = platform
@@ -124,10 +145,10 @@ class App:
         # back via the DeviceConnectionIssues command (bus-pure, survives the
         # GUI not existing yet when the failure happened).
         self._connect_issues: dict[str, ConnectResult] = {}
-        self.events = EventBus()
+        self._events = EventBus()
         self.settings = Settings(platform.paths())
         self.themes = FileContentStore(platform.paths())
-        self.media = MediaService()
+        self.media = MediaService(install_hint=platform.software_install_hint)
         # The current background per device.  Here rather than on
         # DisplayService because ``_wire_display`` rebuilds that service
         # whenever a renderer is attached, and a background that vanished on
@@ -136,6 +157,11 @@ class App:
         # Currently-loaded Theme per device — set by LoadTheme, read by
         # RenderAndSend ticker, cleared on DisconnectDevice.
         self.active_themes: dict[str, Theme] = {}
+        # Panels a one-shot push holds (SendImage / SendColor / SendFrame /
+        # SetLedColors): nothing implicit may paint over them until the next
+        # theme load or LED settings change.  In memory only — a restart, like
+        # a reconnect, gives the panel back to its saved theme (#306).
+        self.held: set[str] = set()
         # Per-device LED runtime counters — populated lazily by RenderLed,
         # cleared by DisconnectDevice.  Not persisted — these are tick
         # phase counters, not user prefs.
@@ -151,9 +177,13 @@ class App:
         # the first broadcast — consumers fall back to a one-off read.
         self.last_raw_readings: dict[str, float] | None = None
         self.last_raw_snapshot: HardwareMetrics | None = None
-        # Cloud theme catalog + service.  HTTP adapter is the only seam
-        # that talks to the network; tests inject a fake fetcher.
-        self.http = UrllibHttpFetcher()
+        # Each panel's game-mode hysteresis -- whether a busy CPU holds it and
+        # how far the count has run.  The App's, not the task's, because
+        # every frame source must be able to ask "is this panel held?".
+        self.game_gates: dict[str, GameModeGate] = {}
+        # Cloud theme catalog + service.  The platform's fetcher is the only
+        # seam that talks to the network -- a test or dev platform's is offline.
+        self.http = platform.http_fetcher()
         self.cloud_themes = CloudThemeService(
             catalog=CzhordeCatalog(
                 http=self.http,
@@ -202,7 +232,9 @@ class App:
             from .adapters.infra.video_export_runner import (
                 ThreadVideoExportRunner,
             )
-            video_export_runner = ThreadVideoExportRunner(self.events)
+            video_export_runner = ThreadVideoExportRunner(
+                self.events, self.themes,
+                install_hint=platform.software_install_hint)
         self.video_export_runner: VideoExportRunner = video_export_runner
         # Per-device slideshow cursor — tick-driven, no background thread.
         self.slideshow = SlideshowService()
@@ -222,6 +254,22 @@ class App:
         # (``SyncSendScheduler``); production defaults to a thread per device.
         # See ``doc/SEND_FOUNDATION.md``.
         self.senders: dict[str, DeviceSender] = {}
+        # Panels a send found unusable since their last connect -- so the loss
+        # is announced ONCE, however many frames were still in flight.
+        self._lost: set[str] = set()
+        # Panels worth waiting for: every one a scan found or that connected,
+        # minus one the user let go (DisconnectDevice).  A permanent failure --
+        # a denied open, a missing library -- is not retried (``_unretryable``):
+        # it stays that way until the user acts.  ``_was_connected`` only
+        # picks the cadence: a panel that never answered is tried less often.
+        self._wanted: set[str] = set()
+        self._was_connected: set[str] = set()
+        self._unretryable: set[str] = set()
+        self._watchers: dict[str, ReconnectWatcher] = {}
+        # Hotplug, resume and the reconnect watcher each run on their own
+        # thread; two connects of one key at once would build two transports
+        # and leak the first one's open handle.
+        self._connect_lock = threading.RLock()
         if send_scheduler is None:
             from .adapters.infra.send_scheduler import ThreadSendScheduler
             send_scheduler = ThreadSendScheduler()
@@ -253,6 +301,10 @@ class App:
         # diagnostics through this injected port (never importing the adapter).
         from .adapters.diagnostics.adapter import DiagnosticsAdapter
         self.diagnostics: Diagnostics = DiagnosticsAdapter(platform)
+        # TLS for the LAN API — ``ProvideApiTls`` reaches it through this port,
+        # so no UI imports the adapter or does network I/O of its own.
+        from .adapters.infra.tls import CryptographyTls
+        self.tls: TlsIdentity = CryptographyTls()
         # Quickstart — guided first-session orchestrator.  Sequences
         # doctor + scan with explicit step boundaries so any UI renders
         # the same flow.
@@ -268,6 +320,8 @@ class App:
         # slow sensor broadcast — breathing/colour-cycle/rainbow/carousel need
         # the C#-cadence to actually animate.  Same opt-in start as metrics_loop.
         self.led_animation_loop = LedAnimationLoop(self)
+        # The one video ticker (#249) — see services/video_loop.py.
+        self.video_loop = VideoLoop(self)
         self._renderer = renderer
         # DisplayService is lazy: needs a Renderer.  None until one is set.
         self._display: DisplayService | None = None
@@ -313,6 +367,32 @@ class App:
         # which the metrics / LED-animation loops and render observers resume on
         # their own.  Core-level so the daemon, GUI and CLI all recover.
         self.events.subscribe(SystemResumed, self._on_system_resumed)
+        # Cloud tiles: a video downloaded while ffmpeg was missing, or whose
+        # GIF failed, had a static tile for good.  Each landed install gives
+        # its resolution's videos their GIFs, off every caller's thread.
+        self._preview_backfill_lock = threading.Lock()
+        self.events.subscribe(DataInstalled, self._on_data_installed)
+        # Other RGB follows the cooler (#160): the LED render's colours go to
+        # OpenRGB's devices or to Corsair RAM, from the follower's own thread.
+        # The RAM follower reaches the SMBus only through ``platform``, so a
+        # stand-in platform's scripted sticks are all a test or mock can touch.
+        self.rgb_mirror = RgbMirrorService(make_rgb_mirror or partial(
+            make_mirror, smbuses=platform.smbuses), on_sent=self._follow_sent)
+        self.events.subscribe(LedColorsChanged, self.rgb_mirror.on_colors)
+        # Whether a newer TRCC exists: asked here, for every window, from
+        # start_session on -- never by a window (services/update_watch.py).
+        self.update_watch = UpdateWatch(self._check_for_update,
+                                        self._update_checked)
+        # An LCD as the source: its frames' backgrounds, read through the
+        # renderer.
+        self.events.subscribe(FrameSent, self._follow_frame)
+        prefs = self.settings.app
+        self.rgb_mirror.configure(self.settings.rgb_follow_mode(),
+                                  prefs.openrgb_host, prefs.openrgb_port,
+                                  prefs.rgb_follow_source,
+                                  self.settings.rgb_follow_mapping(),
+                                  self.settings.rgb_follow_targets(),
+                                  colors=self.settings.rgb_follow_colors())
         # Hotplug listener — caller (daemon, GUI launcher, tests) decides
         # whether to ``start_hotplug``.  In-process CLI scripts that
         # only do one Command don't need it; the daemon and GUI do.
@@ -322,6 +402,18 @@ class App:
         # discover the gui's splash worker already did, or a device that
         # failed to connect is retried and recorded twice.
         self._coldplug_done = False
+        # Session prime: inside a long-lived session (daemon / gui / qtgui /
+        # api) a panel that connects, or whose themes finish installing,
+        # shows its saved display — decided HERE, once, instead of by each UI
+        # (#148 was one UI missing its copy).  Subscribed in __init__ on
+        # purpose: the bus calls handlers in subscription order, so the panel
+        # is primed before any UI hears DeviceConnected, and no UI races it.
+        # A one-shot CLI never starts a session, so ``trcc color`` does not
+        # load a theme first.
+        self._session = False
+        self._prime_lock = threading.Lock()
+        self.events.subscribe(DeviceConnected, self._prime_all)
+        self.events.subscribe(DataInstalled, self._prime_all)
         # Seed the persisted GPU choice into the (singleton) enumerator so a
         # restart / CLI / API / daemon honours it, not just an in-session GUI
         # click — the composition root applies persisted state to the port.
@@ -330,6 +422,14 @@ class App:
             self.platform.sensors().set_preferred_gpu(self.settings.app.active_gpu)
         if self.settings.app.active_disk:
             self.platform.sensors().set_preferred_disk(self.settings.app.active_disk)
+        # The dashboard's FAN rows pick which header fills each LCD fan slot
+        # (#145).  Read only when a dashboard was saved; the sensors are built
+        # only when a row actually pins one, like the two choices above.
+        if self.sysinfo.path.is_file():
+            from .core.commands._helpers import fan_slot_pins
+            self.sysinfo.load()
+            if pins := fan_slot_pins(self.sysinfo.panels):
+                self.platform.sensors().set_fan_slot_pins(pins)
 
     def _persist_user_mask_dc(self, event: Any) -> None:
         """On any overlay-metric edit (``OverlayChanged``), rewrite an active
@@ -340,8 +440,13 @@ class App:
         from .core.commands._helpers import persist_user_mask_dc
         persist_user_mask_dc(self, event.key)
 
-    def _release_stale_device(self, key: str) -> None:
+    def release_device(self, key: str) -> None:
         """Stop the sender and close a dead transport, keeping the content.
+
+        Public because ``ConnectDevice`` needs it too: a handshake that fails
+        while a lost panel is being retried must drop only the half-made
+        device -- ``detach`` there threw away the theme and stopped the cast,
+        slideshow or stream the panel was coming back to.
 
         The teardown half of a replug.  Deliberately NOT :meth:`detach` —
         that also drops ``active_themes`` / ``led_runtime`` / media /
@@ -359,7 +464,7 @@ class App:
         try:
             device.disconnect()
         except Exception:
-            log.exception("_release_stale_device: disconnect %s raised", key)
+            log.exception("release_device: disconnect %s raised", key)
 
     def _on_device_detached(self, event: Any) -> None:
         """Hotplug ``DeviceDetached`` → release the handle the unplug killed.
@@ -367,40 +472,162 @@ class App:
         Without this the device stayed in ``self.devices`` holding a dead
         transport, so (a) its ``DeviceSender`` spun forever logging a write
         failure every ~150 ms, and (b) the replug's ``DeviceAttached`` hit the
-        "already connected" guard below and never reconnected — the panel only
+        "already connected" guard and never reconnected — the panel only
         recovered by restarting the process (#254, #246).
+
+        The fast path is unchanged.  A monitor publishes the plain ``vid:pid``,
+        which never names one of two identical coolers (#287) — so when units
+        of the model are still attached afterwards, the scan decides which one
+        left.  Only then: reconciling a lone cooler would rescan a device that
+        may still be mid-unplug and reconnect it.
         """
-        if event.key not in self.devices:
-            log.debug("_on_device_detached: %s not attached", event.key)
-            return
-        log.info("_on_device_detached: %s unplugged — stopping sender + "
-                 "releasing stale transport", event.key)
-        self._release_stale_device(event.key)
+        # Unplugged: its replug announces itself, so stop polling for it.
+        self.stop_watching(event.key)
+        if event.key in self.devices:
+            log.info("_on_device_detached: %s unplugged — stopping sender + "
+                     "releasing stale transport", event.key)
+            self.release_device(event.key)
+        if self._attached_units(event.vid, event.pid):
+            self._reconcile(event.vid, event.pid, fallback="")
+        else:
+            log.debug("_on_device_detached: %s — nothing left attached",
+                      event.key)
 
     def _on_device_attached(self, event: Any) -> None:
-        """Hotplug ``DeviceAttached`` → connect the device.
+        """Hotplug ``DeviceAttached`` → connect every unit of that model.
 
         Runs on the hotplug poll thread (same off-main-thread pattern the
         splash ``BootstrapWorker`` already uses for ``ConnectDevice``).  A
         genuinely-connected device is a no-op, so coldplug replays and
         duplicate adds stay idempotent.  On success ``ConnectDevice`` emits
         ``DeviceConnected``, which UIs already observe.
+
+        Reconciled through a scan rather than trusting ``event.key``: that is
+        the plain ``vid:pid``, and when a SECOND identical cooler arrives the
+        first must be re-keyed to its port and both connected (#287).
         """
-        existing = self.devices.get(event.key)
-        if existing is not None and existing.is_connected:
-            log.debug("_on_device_attached: %s already connected", event.key)
+        log.info("_on_device_attached: %s", event.key)
+        self._reconcile(event.vid, event.pid, fallback=event.key)
+
+    def _attached_units(self, vid: int, pid: int) -> list[str]:
+        """Keys in ``self.devices`` that are units of this model."""
+        keys = [k for k in self.devices if parse_device_key(k)[:2] == (vid, pid)]
+        log.debug("_attached_units: %04x:%04x -> %s", vid, pid, keys)
+        return keys
+
+    def _reconcile(self, vid: int, pid: int, *, fallback: str) -> None:
+        """Make ``self.devices`` match a fresh scan, for ONE model.
+
+        Releases every attached unit the scan no longer shows — gone, or
+        re-keyed because a twin arrived or left — then connects every scanned
+        unit that is not connected.  With one cooler that is exactly the old
+        attach path.  ``fallback`` is connected when the scan does not show the
+        model yet (an arrival can outrun enumeration), so a lone cooler never
+        loses hotplug to a slow scan; empty means "connect nothing".
+        """
+        scan = self.platform.scan_devices()
+        self.remember_scan(scan)
+        live = [i.key for i in scan if (i.vid, i.pid) == (vid, pid)]
+        if not live and fallback:
+            live = [fallback]
+        log.info("_reconcile: %04x:%04x live=%s attached=%s",
+                 vid, pid, live, self._attached_units(vid, pid))
+        self._wanted.update(live)
+        for key in self._attached_units(vid, pid):
+            if key not in live:
+                log.info("_reconcile: %s no longer scanned — releasing", key)
+                self.release_device(key)
+        # A unit key the scan does not show is gone for good: when a twin
+        # leaves, the survivor is re-keyed to the plain vid:pid, so a watcher
+        # on the old ``vid:pid@unit`` would retry a key nothing will answer.
+        for key in [k for k in self._watchers
+                    if parse_device_key(k)[:2] == (vid, pid) and k not in live]:
+            self.stop_watching(key)
+        for key in live:
+            self.connect_unit(key)
+
+    def connect_unit(self, key: str) -> ConnectResult:
+        """Connect one unit unless it already is; release a dead one first.
+
+        THE connect path, under ``_connect_lock``: hotplug, a wake, the
+        reconnect watcher and ``EnsureConnected`` (every Command that connects
+        first) all come here.  ``EnsureConnected`` used to dispatch
+        ``ConnectDevice`` on its own, so a UI action during a loss could run
+        a second connect beside the watcher's -- on SCSI the single-owner claim
+        fails one, and that one's cleanup released the device by KEY.
+
+        A panel that does not come up is waited for (:meth:`watch_for_return`):
+        a usb add can land before its SCSI node exists, and a panel a VM holds
+        has none until it is handed back -- with no event to say so.
+        """
+        with self._connect_lock:
+            existing = self.devices.get(key)
+            if existing is not None and existing.is_connected:
+                log.debug("connect_unit: %s already connected", key)
+                return ConnectResult(ok=True, key=key,
+                                     message=f"{key} already connected")
+            if existing is not None:
+                # Present but DEAD: the detach event never arrived (coalesced
+                # or dropped udev event, or a monitor that only reports adds).
+                # The entry is a corpse holding a stale transport, so tear it
+                # down rather than bail — bailing here was the #254 / #246 bug.
+                log.info("connect_unit: %s present but not connected — "
+                         "releasing stale transport before reconnect", key)
+                self.release_device(key)
+            log.info("connect_unit: connecting %s", key)
+            from .core.commands import ConnectDevice
+            result = self.dispatch(ConnectDevice(key=key))
+        if not result.ok:
+            self.watch_for_return(key)
+        return result
+
+    def try_reconnect(self, key: str) -> bool:
+        """One reconnect attempt for the watcher; True once *key* is connected."""
+        self.connect_unit(key)
+        device = self.devices.get(key)
+        connected = device is not None and device.is_connected
+        log.debug("try_reconnect: %s -> %s", key, connected)
+        return connected
+
+    def watch_for_return(self, key: str) -> None:
+        """Keep retrying *key* until it connects (see ``ReconnectWatcher``)."""
+        if key not in self._wanted or key in self._unretryable:
+            log.debug("watch_for_return: %s not waited for (wanted=%s "
+                      "retryable=%s)", key, key in self._wanted,
+                      key not in self._unretryable)
             return
-        if existing is not None:
-            # Present but DEAD: the detach event never arrived (coalesced or
-            # dropped udev event, or a monitor that only reports adds).  The
-            # entry is a corpse holding a stale transport, so tear it down
-            # rather than bail — bailing here was the #254 / #246 bug.
-            log.info("_on_device_attached: %s present but not connected — "
-                     "releasing stale transport before reconnect", event.key)
-            self._release_stale_device(event.key)
-        log.info("_on_device_attached: connecting %s", event.key)
-        from .core.commands import ConnectDevice
-        self.dispatch(ConnectDevice(key=event.key))
+        watcher = self._watchers.get(key)
+        if watcher is None:
+            watcher = self._watchers[key] = ReconnectWatcher(self, key)
+            self.add_task(watcher)
+        watcher.arm(slow=key not in self._was_connected)
+
+    def stop_watching(self, key: str, *, forget: bool = False) -> None:
+        """Stop retrying *key*; *forget* also drops it from the panels it had."""
+        log.info("stop_watching: %s forget=%s", key, forget)
+        if (watcher := self._watchers.get(key)) is not None:
+            watcher.disarm()
+        if forget:
+            self._wanted.discard(key)
+
+    def _on_data_installed(self, event: Any) -> None:
+        """``DataInstalled`` -> backfill that resolution's cloud tile GIFs."""
+        log.debug("_on_data_installed: %s ok=%s", event.resolution, event.ok)
+        if not event.ok:
+            return
+        threading.Thread(target=self._backfill_previews,
+                         args=(event.resolution,), daemon=True,
+                         name="trcc-cloud-previews").start()
+
+    def _backfill_previews(self, resolution: tuple[int, int]) -> None:
+        """Both orientations' cloud videos; one backfill at a time."""
+        w, h = resolution
+        with self._preview_backfill_lock:
+            for size in dict.fromkeys(((w, h), (h, w))):
+                try:
+                    self.cloud_themes.backfill_previews(size)
+                except Exception:
+                    log.exception("_backfill_previews: %dx%d failed", *size)
 
     def _on_system_resumed(self, _event: Any) -> None:
         """``SystemResumed`` → reconnect every attached device after wake.
@@ -416,35 +643,44 @@ class App:
         keeping them lets the metrics / LED-animation loops and render observers
         repaint the same content on the next tick.  So both the LED segment
         displays and the LCD panels recover without a manual restart (#189).
+
+        The reconnect is :meth:`connect_unit`, the replug's own path, so a
+        panel whose node is late after the wake is retried by the reconnect
+        watcher.  It used to be one ``ConnectDevice``: a node not back yet
+        failed it, and the panel stayed dark until a restart.  The stale
+        transport is closed first because it still LOOKS open, which
+        ``connect_unit`` would take for connected.
         """
-        from .core.commands import ConnectDevice
         keys = list(self.devices)
         log.info("_on_system_resumed: reconnecting %d device(s) after wake", len(keys))
         for key in keys:
-            old = self.devices.get(key)
-            log.info("_on_system_resumed: %s — stale transport after suspend, "
-                     "stop sender + reopen", key)
-            self.stop_sender(key)
-            if old is not None:
-                try:
-                    old.disconnect()
-                except Exception:
-                    log.exception("_on_system_resumed: disconnect %s raised", key)
-            self.dispatch(ConnectDevice(key=key))
+            with self._connect_lock:
+                old = self.devices.get(key)
+                log.info("_on_system_resumed: %s — stale transport after "
+                         "suspend, stop sender + reopen", key)
+                self.stop_sender(key)
+                if old is not None:
+                    try:
+                        old.disconnect()
+                    except Exception:
+                        log.exception("_on_system_resumed: disconnect %s raised",
+                                      key)
+                self.connect_unit(key)
 
     def _on_orientation_changed(self, event: Any) -> None:
-        """``OrientationChanged`` → reload the active theme + mask from the
-        orientation-keyed resolution dir.
+        """``OrientationChanged`` → the folder of the new orientation, with its
+        own theme, brightness, split mode and slideshow -- the port of the C#
+        ``UpDateUCComboBox1``, which reads that folder's ``Theme.dc``.
 
         Non-square panels store theme / web-mask catalogs per oriented
         resolution (``theme1280480`` vs ``theme4801280``, ``web/zt1280480`` vs
-        ``web/zt4801280``).  On rotation the active content must follow — the
-        port of the C# ``UpDateUCComboBox1`` reload.  Theme first, then the
-        user mask (so an explicitly-applied mask wins over the theme's bundled
-        one).  Each reload is best-effort + skipped when no rotated variant is
-        on disk (the renderer pixel-rotates the landscape art as fallback,
-        matching C# ``isFanZhuan``).  ``event`` is ``Any`` to satisfy the
-        ``Handler`` type, as the other subscribers do.
+        ``web/zt4801280``).  The folder's remembered theme loads; never
+        visited, the same-named theme there, else Theme1 -- never the theme of
+        the folder just left, which drew black on a widescreen panel's
+        portrait canvas.  Then the background and the user mask (so an
+        explicitly-applied mask wins over the theme's bundled one).
+        ``event`` is ``Any`` to satisfy the ``Handler`` type, as the other
+        subscribers do.
         """
         key = event.key
         device = self.devices.get(key)
@@ -457,34 +693,18 @@ class App:
         log.info("_on_orientation_changed: %s degrees=%d catalog=%dx%d",
                  key, event.degrees, bw, bh)
 
-        from .core.commands import ApplyMask, LoadCloudTheme, LoadTheme
-        from .core.commands._helpers import oriented_theme_path
+        from .core.commands import ApplyMask, LoadCloudTheme
+        from .core.commands.theme import show_orientation_theme
 
         web_root = paths.data_dir() / "web"
 
-        # Active theme → reload from the rotated-resolution theme dir.  Shared
-        # resolver with RestoreLastTheme so connect-restore + runtime rotation
-        # agree on the oriented variant (#136).
-        #
-        # reset_overrides=False: a rotation re-roots the SAME theme to its
-        # oriented variant — it is NOT an explicit theme switch.  The original
-        # C# app rotates at the render layer and NEVER drops the user's overlay/
-        # background/mask edits on rotate; legacy's startup restore likewise
-        # re-applied them.  Resetting here (the old default=True) PERSIST-CLEARED
-        # user_overlay_elements + stopped video + reverted the cloud background —
-        # so on a connect/restart the user's "last preview with changes" was lost
-        # before RestoreLastTheme could replay it.  Preserve them; the dedicated
-        # cloud-background + mask reload blocks below still re-resolve those two
-        # to the oriented resolution.  (Catalog selection + encode are untouched,
-        # so the hardware-verified widescreen behavior in #169 is unaffected.)
-        if s.current_theme:
-            cur = Path(s.current_theme)
-            cand = oriented_theme_path(self, key, cur, degrees=event.degrees)
-            if cand != cur:
-                log.info("_on_orientation_changed: reload theme %s → %s "
-                         "(preserve overrides)", cur.name, cand)
-                self.dispatch(LoadTheme(key=key, path=cand,
-                                        reset_overrides=False))
+        # The folder's own theme and values (``show_orientation_theme``).  The
+        # overlay layout does not survive into another folder: LoadTheme takes
+        # the folder's own (``_layer_laid_out_elsewhere``), as 2.1.8's
+        # ``Theme_Click_Event`` re-copies the working dir on every rotation
+        # (FormCZTV.cs:7046-7054).  A restart at the same orientation stays in
+        # the same folder, so edits survive it.
+        show_orientation_theme(self, key, event.degrees)
 
         # Active cloud background → re-apply from the rotated-resolution web dir.
         # Stored as ``web/{res}/<id>``; ``LoadCloudTheme`` now materialises per
@@ -560,21 +780,61 @@ class App:
                   libs.mask_variant)
         return libs
 
+    @property
+    def has_renderer(self) -> bool:
+        """Whether a Renderer is attached -- an LED-only App has none (#299)."""
+        frame_log.debug("App.has_renderer: %s", self._renderer is not None)
+        return self._renderer is not None
+
+    def _follow_frame(self, event: Event) -> None:
+        """A sent frame to the RGB follower, when it follows that LCD.
+
+        The follower takes the picture under the overlay: a theme's clock
+        and readings are white text, and the lights should take the video's
+        colours.  A frame not drawn on a theme (an image, a cast) has no
+        separate background, so it is followed as sent.
+        """
+        renderer = self._renderer
+        frame_log.debug("App._follow_frame: %s renderer=%s",
+                        type(event).__name__, renderer is not None)
+        if not isinstance(event, FrameSent) or renderer is None:
+            return
+        surface = self.display.background_surface(event.key)
+        if surface is None:
+            surface = event.surface
+        if surface is not None:
+            self.rgb_mirror.on_frame(event.key, surface, renderer.raw_argb32)
+
+    def _follow_sent(self, source: str, columns: Columns) -> None:
+        """What following just sent, for every window's preview."""
+        frame_log.debug("App._follow_sent: %s %d column(s)", source,
+                        len(columns))
+        self.events.publish(RgbFollowSent(source=source, columns=columns))
+
     def set_renderer(self, renderer: Renderer) -> None:
         """Attach a Renderer (headless modes can defer until needed)."""
         log.info("set_renderer: renderer=%s", type(renderer).__name__)
         self._renderer = renderer
         self._wire_display(renderer)
 
+    def _unsupported_sensors(self) -> frozenset[str]:
+        """The host's static "no backend reads this" set -- asked by the
+        overlay only when a metric comes back blank, so building an App does
+        not build the sensors (see OverlayService.__init__)."""
+        unsupported = self.platform.sensors().unsupported()
+        frame_log.debug("App._unsupported_sensors: %d key(s)", len(unsupported))
+        return unsupported
+
     def _wire_display(self, renderer: Renderer) -> None:
         log.debug("_wire_display: renderer=%s", type(renderer).__name__)
         self._display = DisplayService(
             renderer=renderer,
             themes=self.themes,
-            # The host's static "can never read this" set, resolved ONCE —
-            # see OverlayService.__init__.
+            # The host's static "can never read this" set, asked only when a
+            # metric comes back blank — see OverlayService.__init__.
             overlay=OverlayService(
-                renderer, unsupported=self.platform.sensors().unsupported(),
+                renderer,
+                unsupported=self._unsupported_sensors,
             ),
             settings=self.settings,
             media=self.media,
@@ -602,7 +862,7 @@ class App:
         the renderer directly without going through DisplayService's
         scene cache.  Raises if no renderer is attached.
         """
-        log.debug("renderer")
+        frame_log.debug("renderer")
         if self._renderer is None:
             raise RuntimeError(
                 "Renderer unavailable — call App.set_renderer(...) first"
@@ -612,7 +872,7 @@ class App:
     # ── Device lifecycle ──────────────────────────────────────────────
 
     def attach(self, vid: int, pid: int, *,
-               quirk_transport: bool = False) -> Device:
+               quirk_transport: bool = False, unit: str = "") -> Device:
         """Build and cache a Device for (vid, pid).  Does not connect.
 
         Resolves the right transport for the device's wire via the
@@ -637,22 +897,20 @@ class App:
                 f"Unknown product: {vid:04x}:{pid:04x}"
             )
         cls = DEVICES[info.wire]
-        quirks = self._quirks_for(vid, pid)
-        # Which transport a WIRE needs is the Platform's business — it owns the
-        # Wire→opener table, so this no longer branches on Wire.SCSI.  What
-        # remains is a FIRMWARE override: one revision accepts only HID output
-        # reports (#228), and that is keyed on (vid, pid, bcdDevice), not on
-        # wire — so it belongs here with the rest of quirk resolution.
-        if quirks.hid_reports and quirk_transport:
-            from .adapters.device.transport import HidApiTransport
+        quirks = self._quirks_for(vid, pid, unit)
+        # WHICH transport a firmware needs is quirk knowledge, keyed on
+        # (vid, pid, bcdDevice), so it is decided here.  OPENING it is the
+        # Platform's job, so a stand-in platform scripts it like any other --
+        # building HidApiTransport here let a mock reach a real panel.
+        hid_reports = quirks.hid_reports and quirk_transport
+        if hid_reports:
             log.info("attach: %04x:%04x retrying on HID output reports (quirk)",
                      vid, pid)
-            transport = HidApiTransport(vid, pid)
-        else:
-            if quirks.hid_reports:
-                log.debug("attach: %04x:%04x has a HID output-report quirk, "
-                          "trying the ordinary transport first", vid, pid)
-            transport = self.platform.open_transport(info.wire, vid, pid)
+        elif quirks.hid_reports:
+            log.debug("attach: %04x:%04x has a HID output-report quirk, "
+                      "trying the ordinary transport first", vid, pid)
+        transport = self.platform.open_transport(
+            info.wire, vid, pid, unit=unit, hid_reports=hid_reports)
         device = cls(info, transport)
         # Hand down the OS-specific EACCES hint (resolved here, where Platform
         # is in scope) so the device's recovery tracker can surface it without
@@ -663,6 +921,10 @@ class App:
         device.set_state_dir(self.platform.paths().config_dir())
         # Inject firmware-specific overrides resolved from the live fingerprint.
         device.set_quirks(quirks)
+        # WHICH of several identical units this is (#287).  Keyword with an
+        # empty default, so the 31 existing call sites keep meaning exactly
+        # what they meant: "the only one of this model".
+        device.set_unit(unit)
         self.devices[device.key] = device
         log.debug("App.attach: %s → %s", device.key, cls.__name__)
         return device
@@ -674,7 +936,7 @@ class App:
         for info in infos:
             self._scanned[info.key] = info
 
-    def _quirks_for(self, vid: int, pid: int) -> DeviceQuirks:
+    def _quirks_for(self, vid: int, pid: int, unit: str = "") -> DeviceQuirks:
         """Resolve firmware quirks from the device's live fingerprint.
 
         Quirks are keyed on ``(vid, pid, bcdDevice)``, and bcdDevice comes off
@@ -697,7 +959,9 @@ class App:
         default, because a quirk lookup must never be the thing that breaks a
         connect.
         """
-        key = f"{vid:04x}:{pid:04x}"
+        # The scan caches a twin under ``vid:pid@unit`` (#287), so the lookup
+        # must build the SAME key or every twin misses and gets bcdDevice 0.
+        key = format_device_key(vid, pid, unit)
         if key not in self._scanned:
             log.debug("_quirks_for: %s not scanned — enumerating for its "
                       "fingerprint", key)
@@ -720,18 +984,41 @@ class App:
         frame_log.debug("get: key=%s", key)
         device = self.devices.get(key)
         if device is None:
-            raise DeviceNotFoundError(f"Not attached: {key}")
+            # Say WHY when a connect was tried: "permission denied on
+            # /dev/sg1" is the whole diagnosis for hardware we do not own.
+            reason = self.connect_issue(key)
+            raise DeviceNotFoundError(
+                f"Not attached: {key}" + (f" — {reason}" if reason else ""))
         return device
+
+    def connect_issue(self, key: str) -> str:
+        """Why *key*'s last connect failed, or ``""`` -- for error messages."""
+        issue = self._connect_issues.get(key)
+        frame_log.debug("connect_issue: key=%s -> %s", key,
+                        issue.message if issue is not None else "none")
+        return issue.message if issue is not None else ""
 
     # ── Connect-issue model (queried via DeviceConnectionIssues) ─────────
 
-    def note_connect_issue(self, result: ConnectResult) -> None:
-        """Record a failed connect so any UI can query why it didn't come up."""
-        log.info("note_connect_issue: key=%s msg=%s", result.key, result.message)
+    def note_connect_issue(self, result: ConnectResult, *,
+                           permanent: bool = False) -> None:
+        """Record a failed connect so any UI can query why it didn't come up.
+
+        *permanent* marks a failure retrying cannot fix (a denied open, a
+        missing library, an unknown product): the reconnect watcher leaves it
+        alone until the next failure says otherwise.
+        """
+        log.info("note_connect_issue: key=%s permanent=%s msg=%s",
+                 result.key, permanent, result.message)
         self._connect_issues[result.key] = result
+        if permanent:
+            self._unretryable.add(result.key)
+        else:
+            self._unretryable.discard(result.key)
 
     def clear_connect_issue(self, key: str) -> None:
         """Drop a device's recorded failure (it connected, or it's gone)."""
+        self._unretryable.discard(key)
         if self._connect_issues.pop(key, None) is not None:
             log.info("clear_connect_issue: key=%s", key)
 
@@ -744,13 +1031,16 @@ class App:
         """Disconnect and drop a device.  Frees the scene cache + active theme."""
         log.info("detach: key=%s", key)
         self.clear_connect_issue(key)
+        self._lost.discard(key)
         # Stop the send worker BEFORE closing the transport so no in-flight
         # write races the disconnect (the scheduler joins the thread).
+        self.stop_sources(key)
         self.stop_sender(key)
         device = self.devices.pop(key, None)
         if device is not None:
             device.disconnect()
         self.active_themes.pop(key, None)
+        self.held.discard(key)
         self.led_runtime.pop(key, None)
         self.media.unload(key)
         self.backgrounds.clear(key)
@@ -779,19 +1069,92 @@ class App:
         Without this, a daemon on those three comes up owning USB with
         nothing connected until the user physically replugs.
 
+        It also switches on the session prime (:meth:`_prime`): from here on a
+        panel that connects, or whose themes finish installing, shows its saved
+        display.  Every UI used to do that its own way — the API not at all.
+
         Idempotent, like everything it calls: a repeat skips the coldplug and
         the loops early-return.  ``on_progress`` is forwarded to
         :meth:`discover_and_connect` for splash display.
         """
         log.info("start_session: coldplug_done=%s devices=%d",
                  self._coldplug_done, len(self.devices))
+        self._session = True
         if self._coldplug_done:
             log.info("start_session: coldplug already ran — skipping it")
         else:
             self.discover_and_connect(on_progress)
+        # The gui's splash coldplug ran before the session existed, so its
+        # connects primed nothing.  Idempotent for everything already primed.
+        self._prime_all()
         self.start_hotplug()
         self.metrics_loop.start()
         self.led_animation_loop.start()
+        self.video_loop.start()
+        self.update_watch.start()
+
+    def _check_for_update(self) -> UpdateCheckResult:
+        """The watch's check: the one Command every UI's check goes through."""
+        log.debug("App._check_for_update")
+        from .core.commands import CheckForUpdate
+        return self.dispatch(CheckForUpdate())
+
+    def _update_checked(self, result: UpdateCheckResult) -> None:
+        """Each answer, for every window."""
+        log.info("App._update_checked: ok=%s available=%s latest=%s",
+                 result.ok, result.update_available, result.latest_version)
+        self.events.publish(UpdateChecked(
+            ok=result.ok, local_version=result.local_version,
+            latest_version=result.latest_version,
+            release_url=result.release_url,
+            update_available=result.update_available,
+            message=result.message))
+
+    def _prime_all(self, _event: Any = None) -> None:
+        """Session-only: prime every attached panel (see :meth:`_prime`)."""
+        if not self._session:
+            frame_log.debug("_prime_all: no session — one-shot app, not priming")
+            return
+        log.info("_prime_all: %d device(s)", len(self.devices))
+        for key in list(self.devices):
+            self._prime(key)
+
+    def _prime(self, key: str) -> None:
+        """Show *key*'s saved display if the panel shows nothing.
+
+        The automatic restore, so it never overrides: a panel with an active
+        theme, or held by a pushed frame, is left alone.  The lock makes the
+        blank check and the restore one step — ``DataInstalled`` arrives on the
+        install worker while the coldplug primes on the caller's thread.
+        """
+        from .core.commands import RestoreDeviceState
+        with self._prime_lock:
+            device = self.devices.get(key)
+            # What is restored is a rendered display, so only a device that
+            # draws frames has one — not "anything that is not an LED".
+            draws = (device is not None
+                     and Capability.FRAME_RENDER in device.info.capabilities)
+            if (device is None or not device.is_connected or not draws
+                    or key in self.active_themes or key in self.held):
+                log.debug("_prime: %s skipped (connected=%s frames=%s "
+                          "active=%s held=%s)", key, device is not None
+                          and device.is_connected, draws,
+                          key in self.active_themes, key in self.held)
+                return
+            log.info("_prime: %s is blank — restoring its saved display", key)
+            self.dispatch(RestoreDeviceState(key=key))
+
+    @property
+    def events(self) -> EventBus:
+        """The in-process event bus (the ``CommandBus`` port)."""
+        frame_log.debug("events: in-process bus")
+        return self._events
+
+    @property
+    def remote(self) -> bool:
+        """False: this process runs the Commands (the ``CommandBus`` port)."""
+        log.debug("remote: in-process App")
+        return False
 
     def close(self) -> None:
         """Disconnect every attached device + stop background threads.
@@ -803,15 +1166,21 @@ class App:
         alive past ``QApplication.quit()``.
         """
         log.info("close: devices=%d", len(self.devices))
+        self.update_watch.stop()
+        self.rgb_mirror.close()
         self.metrics_loop.stop()
         self.led_animation_loop.stop()
+        self.video_loop.stop()
         self.stop_hotplug()
         # Blank every panel before releasing it so it goes dark on shutdown
         # instead of holding its last frame lit (#143).  Best-effort: the
         # Command swallows a mid-unplug send, and any unexpected error here
         # must not block device release below.
         from .core.commands import SleepDevice
-        for key in list(self.devices):
+        # Connected panels only: an unconnected one cannot take the black
+        # frame, and SleepDevice uses its device -- dispatching it would retry
+        # a failed connect (with its handshake retries) on the way out.
+        for key in [k for k, d in self.devices.items() if d.is_connected]:
             try:
                 self.dispatch(SleepDevice(key=key))
             except Exception:
@@ -856,6 +1225,9 @@ class App:
             device, volatile=device.needs_keepalive,
             on_failure=self._on_sender_failure,
         )
+        self._lost.discard(key)
+        self._wanted.add(key)
+        self._was_connected.add(key)
         self.senders[key] = sender
         self._send_scheduler.add(sender)
         log.info("start_sender: %s volatile=%s", key, device.needs_keepalive)
@@ -865,15 +1237,37 @@ class App:
         Command's ``except TransportError`` would (the producer that submitted
         it isn't waiting, so the sender routes the failure here)."""
         if exc is None:
-            log.warning("_on_sender_failure: %s write returned False", key)
+            log.debug("_on_sender_failure: %s write returned False", key)
+        elif key in self._lost:
+            # Every window was told when it was lost; an error per frame
+            # after that is the same news on repeat.
+            frame_log.debug("_on_sender_failure: %s still lost: %s", key, exc)
+        else:
+            self.events.publish(ErrorOccurred(
+                message=str(exc), kind="transport", key=key,
+            ))
+        # Both: the frame that finds a re-open impossible RETURNS False, and
+        # since producers stop at the next one, it is the only one that will.
+        self.note_lost(key)
+
+    def note_lost(self, key: str) -> None:
+        """A send just failed on *key* -- if its panel is now unusable, say so ONCE.
+
+        The device decides, not the exception: a panel closes its own transport
+        both at the recovery threshold (``DeviceDisconnectedError``) and when a
+        ``_reconnect`` cannot re-open (a plain ``TransportError``, every frame
+        after).  Keying on the exception type missed the second for good, so
+        on 2026-10-06 no window was ever told the panel had gone.
+        """
+        device = self.devices.get(key)
+        if device is None or device.is_connected or key in self._lost:
+            log.debug("note_lost: %s — nothing new (attached=%s lost=%s)",
+                      key, device is not None, key in self._lost)
             return
-        self.events.publish(ErrorOccurred(
-            message=str(exc), kind="transport", key=key,
-        ))
-        if isinstance(exc, DeviceDisconnectedError):
-            log.info("_on_sender_failure: %s auto-disconnect (recovery threshold)",
-                     key)
-            self.events.publish(DeviceDisconnected(key=key))
+        self._lost.add(key)
+        log.warning("note_lost: %s lost its connection", key)
+        self.events.publish(DeviceDisconnected(key=key))
+        self.watch_for_return(key)
 
     def add_task(self, task: SendTask) -> None:
         """Drive *task* on the shared scheduler.
@@ -894,27 +1288,58 @@ class App:
         self._send_scheduler.remove(key)
 
     def stop_sender(self, key: str) -> None:
-        """Stop + drop the send worker for *key* (idempotent).
+        """Stop + drop the send worker for *key* (idempotent) -- the WIRE only.
 
-        Also drops the device's NAMESPACED drivers — screencast and slideshow —
-        which live in the same scheduler.  Removing only the bare key would
-        leave a disconnected device being captured or rotated forever: the
-        driver would keep dispatching, and every turn would fail on a device
-        that is no longer attached.  The namespacing exists because the
-        scheduler evicts by key and would otherwise have killed this device's
-        own sender; that same namespacing is why each removal has to be
-        explicit here, and why a NEW driver must be added to this list.
+        What plays on the panel is :meth:`stop_sources`.  A panel that blinks
+        -- a wake, a replug, a VM taking it -- loses its wire and keeps its
+        source, the way a monitor does: this used to drop the screencast,
+        slideshow and stream drivers too, and since a reconnect restores
+        nothing a panel still has a theme for, every wake ended a running
+        cast, slideshow or stream for good (measured 2026-10-06).
         """
-        from .services.screencast_driver import task_key as screencast_task
-        from .services.slideshow_driver import task_key as slideshow_task
-
-        self._send_scheduler.remove(screencast_task(key))
-        self._send_scheduler.remove(slideshow_task(key))
         sender = self.senders.pop(key, None)
         if sender is None:
+            log.debug("stop_sender: %s has no sender", key)
             return
         log.info("stop_sender: %s", key)
         self._send_scheduler.remove(key)
+
+    def game_engaged(self, key: str) -> bool:
+        """Whether game mode holds *key*'s panel -- the C#'s ``myCpuHigh``.
+
+        Every producer of the panel's own picture asks this and stands still
+        while it is True, as the C#'s ``Timer_event`` returns before drawing
+        anything (FormCZTV.cs:2988): the video, the slideshow, the cast, the
+        stream and the reactive re-render.  Only the game task draws.
+        """
+        gate = self.game_gates.get(key)
+        engaged = gate is not None and gate.engaged
+        frame_log.debug("game_engaged: %s %s", key, engaged)
+        return engaged
+
+    def stop_sources(self, key: str) -> None:
+        """Stop what plays on *key*'s panel: its screencast, slideshow, stream
+        and game mode.
+
+        Only for letting the panel go (``detach``: a disconnect, quitting),
+        never for a blink -- see :meth:`stop_sender`.  While the panel is away
+        the drivers wait (``BaseSendTask``), so a lost panel costs no capture.
+        The namespacing exists because the scheduler evicts by key and would
+        otherwise kill the device's own sender; it is also why each removal is
+        explicit here, and why a NEW driver must be added to this list.
+        """
+        from .services.game_mode_driver import task_key as game_task
+        from .services.screencast_driver import task_key as screencast_task
+        from .services.slideshow_driver import task_key as slideshow_task
+        from .services.stream_driver import task_key as stream_task
+
+        log.info("stop_sources: %s", key)
+        self._send_scheduler.remove(screencast_task(key))
+        self._send_scheduler.remove(slideshow_task(key))
+        self._send_scheduler.remove(stream_task(key))
+        self._send_scheduler.remove(game_task(key))
+        self.game_gates.pop(key, None)
+        self.media.close_stream(key)
 
     def send(self, key: str, payload: Any, *, wait: bool = True) -> bool:
         """Submit a frame to a device's send worker.
@@ -927,7 +1352,16 @@ class App:
         if sender is None:
             log.warning("send: no sender for %s (not connected?)", key)
             return False
-        return sender.submit(payload, wait=wait)
+        if not wait:
+            return sender.submit(payload, wait=False)   # failures: on_failure
+        try:
+            ok = sender.submit(payload, wait=True)
+        except TransportError:
+            self.note_lost(key)
+            raise
+        if not ok:
+            self.note_lost(key)
+        return ok
 
     def exclusive_wire(self, key: str) -> AbstractContextManager[None]:
         """Context manager holding a device's wire exclusively for a
@@ -957,7 +1391,7 @@ class App:
         (splash display); connect *failures* are logged + recorded on the App
         model (queried via ``DeviceConnectionIssues``), never raised.
         """
-        from .core.commands import ConnectDevice, DiscoverDevices
+        from .core.commands import DiscoverDevices
 
         def _say(message: str) -> None:
             log.debug("_say: message=%s", message)
@@ -968,14 +1402,16 @@ class App:
         self._coldplug_done = True
         _say("Discovering devices…")
         result = self.dispatch(DiscoverDevices())
-        for product in result.products:
+        # Connect each scanned UNIT, not each catalog product: two identical
+        # coolers are one product and two units, and only the scan's key
+        # carries the port that tells them apart (#287).  Iterating products
+        # attached the same model twice, unit-less, into one Device.
+        for key, product in result.units():
             _say(f"Connecting {product.vendor} {product.product}…")
-            connect = self.dispatch(ConnectDevice(key=product.key))
-            if not connect.ok:
-                log.warning(
-                    "discover_and_connect: connect %s failed: %s",
-                    product.key, connect.message,
-                )
+            # Through the replug's path: a panel that is not ready when TRCC
+            # starts -- a VM holding it, a node still coming -- is waited for.
+            self._wanted.add(key)
+            self.connect_unit(key)
         log.info(
             "discover_and_connect: %d product(s) discovered, %d attached",
             len(result.products), len(self.devices),
@@ -1026,23 +1462,65 @@ class App:
         # per-frame family and are silenced with it, while one-shot dispatches
         # ("dispatch LoadTheme(...)") stay in every report, which is what a
         # report is read for.
-        sink = frame_log if cmd.LOG_LEVEL <= logging.DEBUG else log
-        sink.log(cmd.LOG_LEVEL, "dispatch %r", cmd)
-        result = cmd.execute(self)
+        # ``[origin]`` names the UI that asked (``UserInterface.dispatch``), or
+        # ``core`` for what the app does on its own.  It goes BEFORE the word:
+        # ``dev/tools/diagnose.py`` replays a report by matching
+        # ``dispatch Name(`` anywhere in the line, old reports and new.
+        origin = current_origin()
+        sink = sink_for(cmd.LOG_LEVEL, log, frame_log)
+        sink.log(cmd.LOG_LEVEL, "[%s] dispatch %r", origin, cmd)
+        if (why := self._lacks_capability(cmd)) is not None:
+            result = cmd.refusal(why)
+        else:
+            if cmd.USES_DEVICE:
+                self._connect_for(cmd)
+            result = cmd.execute(self)
         if not getattr(result, "ok", True):
-            log.warning(
-                "%s failed: %s",
-                type(cmd).__name__,
+            # A per-tick Command that fails fails again next tick: warn once
+            # per distinct message, or a broken screencast writes seven
+            # WARNINGs a second into the file ``trcc report`` sends.
+            warn = (partial(recurring_warning, log) if sink is frame_log
+                    else log.warning)
+            warn(
+                "[%s] %s failed: %s",
+                origin, type(cmd).__name__,
                 getattr(result, "message", "(no message)"),
             )
         else:
             sink.log(
                 cmd.LOG_LEVEL,
-                "%s ok: %s",
-                type(cmd).__name__,
+                "[%s] %s ok: %s",
+                origin, type(cmd).__name__,
                 getattr(result, "message", ""),
             )
         return result
+
+
+    def _lacks_capability(self, cmd: Command[Any]) -> str | None:
+        """Why *cmd*'s device cannot do what it ``REQUIRES``, or None."""
+        frame_log.debug("_lacks_capability: %s requires %s", type(cmd).__name__,
+                        cmd.REQUIRES.value if cmd.REQUIRES else "nothing")
+        if cmd.REQUIRES is None:
+            return None
+        from .core.commands._helpers import _lacks
+        return _lacks(self, getattr(cmd, "key", ""), cmd.REQUIRES)
+
+    def _connect_for(self, cmd: Command[Any]) -> None:
+        """Bring *cmd*'s device up before it runs — the one place that decides.
+
+        An attempt, never a gate: the Command still runs and says what an
+        absent device means to IT — ``SendColor`` fails, ``LoadTheme`` still
+        saves the choice.  A failed connect is recorded, so the Command's "Not
+        attached" carries the reason.
+        """
+        key = getattr(cmd, "key", "")
+        device = self.devices.get(key)
+        if not key or (device is not None and device.is_connected):
+            return
+        from .core.commands import EnsureConnected
+        log.info("_connect_for: %s needs %s — connecting", type(cmd).__name__,
+                 key)
+        self.dispatch(EnsureConnected(key=key))
 
 
 # =========================================================================
@@ -1093,14 +1571,6 @@ class _DeviceRenderObserver:
             # up the change on the very next render — UIs don't have
             # to loop over handlers and force a re-render themselves.
             TempUnitChanged,
-            # Per-device clock + date format changes — DisplayService
-            # reads DeviceSettings.{time_format,date_format} in
-            # compute_clock; the Command's invalidate already drops
-            # the scene cache, this just kicks the re-render so the
-            # user sees the change without waiting for the next
-            # sensor tick.
-            TimeFormatChanged,
-            DateFormatChanged,
             # Any LED settings mutation (mode, colour, selected metric
             # page/zone, carousel) — re-render the device + preview right
             # away instead of waiting for the next sensor tick.  RenderLed
@@ -1118,8 +1588,6 @@ class _DeviceRenderObserver:
         events (SensorsUpdated) re-render every connected device with
         an active theme — the new sensor reading affects every overlay.
         """
-        if self._app._renderer is None:  # pyright: ignore[reportPrivateUsage]
-            return
         keys: list[str]
         evt_key = getattr(event, "key", "")
         if evt_key:
@@ -1144,6 +1612,7 @@ class _DeviceRenderObserver:
                 if d.is_connected
                 and (d.is_led or k in self._app.active_themes)
                 and k not in animating
+                and k not in self._app.held
             ]
         for key in keys:
             device = self._app.devices.get(key)
@@ -1161,6 +1630,19 @@ class _DeviceRenderObserver:
                 # sensor broadcast doesn't race the metric page forward.
                 self._app.dispatch(self._RenderLed(key=key, advance=False))
                 continue
+            if Capability.FRAME_RENDER not in device.info.capabilities:
+                log.debug(
+                    "DeviceRenderObserver: skip %s for %s (draws no frames)",
+                    type(event).__name__, key,
+                )
+                continue
+            # No renderer stops the FRAME path only.  This guard sat at the
+            # top and skipped the LED branch too, which never needed one --
+            # an LED-only App (#299) would have frozen its segment displays.
+            if not self._app.has_renderer:
+                frame_log.debug("DeviceRenderObserver: skip %s for %s (no "
+                                "renderer)", type(event).__name__, key)
+                continue
             theme = self._app.active_themes.get(key)
             if theme is None:
                 log.debug(
@@ -1170,13 +1652,13 @@ class _DeviceRenderObserver:
                 continue
             owner = self._cadence_owner(key)
             if owner is not None:
-                log.debug(
+                frame_log.debug(
                     "DeviceRenderObserver: skip %s for %s (%s owns the panel; "
                     "its tick renders at its own rate)",
                     type(event).__name__, key, owner,
                 )
                 continue
-            log.debug(
+            frame_log.debug(
                 "DeviceRenderObserver: %s for %s → RenderAndSend",
                 type(event).__name__, key,
             )
@@ -1189,6 +1671,9 @@ class _DeviceRenderObserver:
         writing the device.  When something is, the extra frame is at best
         redundant and at worst visible:
 
+        * **game** — game mode holds the panel; its own task draws the only
+          frames it shows, as the C#'s ``Timer_event`` draws nothing else
+          (FormCZTV.cs:2988).
         * **screencast** — its tick composes background + mask + metrics at
           capture rate, and its background is the captured region while this
           one's is the theme.  Two DIFFERENT pictures, so at ~7 fps capture
@@ -1215,10 +1700,14 @@ class _DeviceRenderObserver:
         #202).  Folding it in would be duplication removal that changes
         behaviour.
         """
+        if self._app.game_engaged(key):
+            return "game"
         if self._app.settings.for_device(key).screencast_region is not None:
             return "screencast"
+        if self._app.media.stream(key) is not None:
+            return "stream"
         playback = self._app.media.playback(key)
         if playback is not None and not playback.paused:
             return "video"
-        log.debug("_cadence_owner: %s — nothing else owns this panel", key)
+        frame_log.debug("_cadence_owner: %s — nothing else owns this panel", key)
         return None

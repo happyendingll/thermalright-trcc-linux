@@ -20,13 +20,21 @@ All readings are normalized at the source:
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from pathlib import Path
 
 from ...core.logs import per_frame
-from ...core.ports import CpuSource, DiskSource, DramSource, FanSource, GpuSource
-from .psutil_sources import PsutilCpu
+from ...core.ports import (
+    CpuSource,
+    DiskSource,
+    DramSource,
+    FanSource,
+    GpuSource,
+    VoltageSource,
+)
+from .psutil_sources import PsutilCpu, sensor_slug
 
 log = logging.getLogger(__name__)
 #: Sensor readers run once per metrics tick — their records must never
@@ -45,7 +53,9 @@ _RAPL_REDISCOVER_INTERVAL_S = 30.0
 
 _CPU_DRIVERS = ("coretemp", "k10temp", "zenpower")
 _AMD_DRIVER = "amdgpu"
+_NOUVEAU_DRIVER = "nouveau"
 _INTEL_DRIVERS = ("i915", "xe")
+_GPU_DRIVERS = (_AMD_DRIVER, _NOUVEAU_DRIVER, *_INTEL_DRIVERS)
 
 # Label-preference order for GPU package temperature.  A fixed
 # read_temp(1) assumes the die sensor lives at temp1_input, but that
@@ -118,13 +128,21 @@ class HwmonDevice:
 
     def __init__(self, path: Path) -> None:
         log.debug("__init__: path=%s", path)
+        #: The hwmon NODE (``/sys/class/hwmon/hwmonN``) -- what the DRM-card
+        #: and NVMe-serial lookups walk from.
         self.path = path
-        self.driver = _read_text(path / "name") or path.name
+        #: Where this driver keeps its sensor files: the node itself, or its
+        #: ``device/`` for older drivers (sch5636 and kin), which register the
+        #: hwmon node but leave every ``*_input`` -- and ``name`` -- on the
+        #: platform device.  psutil falls back the same way; our scanner did
+        #: not, so such a chip showed no fans and was named "hwmon1" (#282).
+        self.attrs = _attribute_dir(path)
+        self.driver = _read_text(self.attrs / "name") or path.name
 
     def read_temp(self, idx: int = 1) -> float | None:
         """tempN_input reports millidegrees C."""
         frame_log.debug("read_temp: idx=%s", idx)
-        val = _read_int(self.path / f"temp{idx}_input")
+        val = _read_int(self.attrs / f"temp{idx}_input")
         return val / 1000.0 if val is not None else None
 
     def read_temp_labeled(
@@ -143,12 +161,12 @@ class HwmonDevice:
         """
         by_label: dict[str, int] = {}
         indices: list[int] = []
-        for input_path in self.path.glob("temp*_input"):
+        for input_path in self.attrs.glob("temp*_input"):
             idx = _channel_index(input_path.name, "temp")
             if idx is None:
                 continue
             indices.append(idx)
-            label = _read_text(self.path / f"temp{idx}_label")
+            label = _read_text(self.attrs / f"temp{idx}_label")
             if label is not None:
                 by_label[label.strip().lower()] = idx
         for want in prefer:
@@ -170,21 +188,45 @@ class HwmonDevice:
         log.debug("read_temp_labeled(%s): no readable temp*_input", self.driver)
         return None
 
+    def read_temp_label(self, label: str) -> float | None:
+        """The channel whose ``tempN_label`` is exactly *label*, else None.
+
+        No fallback, unlike :meth:`read_temp_labeled`: a card without a
+        junction sensor has no hot spot, and answering with its edge
+        temperature would show the same number twice under two names.
+        """
+        for input_path in self.attrs.glob("temp*_input"):
+            idx = _channel_index(input_path.name, "temp")
+            if (idx is not None and (_read_text(self.attrs / f"temp{idx}_label")
+                                     or "").strip().lower() == label):
+                return self.read_temp(idx)
+        frame_log.debug("read_temp_label(%s): no %r channel", self.driver, label)
+        return None
+
     def read_fan_rpm(self, idx: int = 1) -> int | None:
         frame_log.debug("read_fan_rpm: idx=%s", idx)
-        return _read_int(self.path / f"fan{idx}_input")
+        return _read_int(self.attrs / f"fan{idx}_input")
 
     def read_pwm(self, idx: int = 1) -> float | None:
         """pwmN reports 0-255 duty cycle; normalize to 0-100."""
         frame_log.debug("read_pwm: idx=%s", idx)
-        val = _read_int(self.path / f"pwm{idx}")
+        val = _read_int(self.attrs / f"pwm{idx}")
         return (val / 255.0 * 100.0) if val is not None else None
 
     def read_power(self, idx: int = 1) -> float | None:
         """powerN_average reports μW; return W."""
         frame_log.debug("read_power: idx=%s", idx)
-        val = _read_int(self.path / f"power{idx}_average")
+        val = _read_int(self.attrs / f"power{idx}_average")
         return val / 1_000_000.0 if val is not None else None
+
+
+def _attribute_dir(node: Path) -> Path:
+    """*node*, or ``node/device`` when only the latter holds sensor inputs."""
+    device = node / "device"
+    if not any(node.glob("*_input")) and any(device.glob("*_input")):
+        log.info("_attribute_dir: %s keeps its sensors in device/", node.name)
+        return device
+    return node
 
 
 def scan_hwmon_devices() -> list[HwmonDevice]:
@@ -196,6 +238,38 @@ def scan_hwmon_devices() -> list[HwmonDevice]:
 
 
 # ── CPU package power (powercap RAPL energy counter) ────────────────
+
+
+class _EnergyRate:
+    """Watts from a monotonic microjoule counter: Δenergy / Δt.
+
+    The first reading seeds the baseline and answers None; a negative delta
+    is a counter wraparound and is dropped the same way.  RAPL's
+    ``energy_uj`` and the Intel GPU's ``energy1_input`` are both such
+    counters -- i915 and xe expose no ``power1_average`` at all -- so the
+    arithmetic lives here once.  Locked: the MetricsLoop poll thread and a
+    render tick may both read, and pairing one thread's ``now`` with the
+    other's baseline would report garbage watts.
+    """
+
+    __slots__ = ("_last", "_lock")
+
+    def __init__(self) -> None:
+        log.debug("_EnergyRate.__init__")
+        self._last: tuple[float, float] | None = None   # (microjoules, monotonic)
+        self._lock = threading.Lock()
+
+    def watts(self, microjoules: float) -> float | None:
+        with self._lock:
+            now = time.monotonic()
+            watts: float | None = None
+            if self._last is not None:
+                prev, then = self._last
+                if (dt := now - then) > 0 and (w := (microjoules - prev) / (dt * 1_000_000)) >= 0:
+                    watts = w
+            self._last = (microjoules, now)
+        frame_log.debug("_EnergyRate.watts: %s uJ -> %s W", microjoules, watts)
+        return watts
 
 
 class _RaplCpuPower:
@@ -215,12 +289,12 @@ class _RaplCpuPower:
     ``prev`` and report garbage watts.
     """
 
-    __slots__ = ("_last", "_lock", "_next_rediscover", "_paths")
+    __slots__ = ("_lock", "_next_rediscover", "_paths", "_rate")
 
     def __init__(self) -> None:
         log.debug("__init__")
         self._paths = self._discover()
-        self._last: tuple[float, float] | None = None   # (sum_uj, monotonic)
+        self._rate = _EnergyRate()
         self._lock = threading.Lock()
         self._next_rediscover = 0.0
 
@@ -282,17 +356,7 @@ class _RaplCpuPower:
                 if val is None:
                     return None     # became unreadable — bail this tick
                 total += val
-            now = time.monotonic()
-            watts: float | None = None
-            if self._last is not None:
-                prev_energy, prev_time = self._last
-                dt = now - prev_time
-                if dt > 0:
-                    computed = (total - prev_energy) / (dt * 1_000_000)
-                    if computed >= 0:    # drop counter-wraparound ticks
-                        watts = computed
-            self._last = (total, now)
-            return watts
+            return self._rate.watts(total)
 
 
 # ── CPU temperature (composes PsutilCpu with a hwmon temp source) ───
@@ -369,6 +433,52 @@ def _find_drm_card_for_hwmon(hwmon_path: Path) -> Path | None:
     return None
 
 
+#: libdrm's marketing-name table, ``device,<TAB>revision,<TAB>name`` per line.
+AMDGPU_IDS = Path("/usr/share/libdrm/amdgpu.ids")
+#: The PCI ID database: a vendor line, then ``<TAB>device  name`` lines.
+PCI_IDS = Path("/usr/share/hwdata/pci.ids")
+
+
+def amd_marketing_name(device_dir: Path) -> str | None:
+    """The card's marketing name from its PCI device and revision ids.
+
+    Consumer cards mostly lack ``product_name``, and the old fallback was
+    ``vbios_version`` -- #301's picker said "113-D7070100-101" for a Radeon.
+    libdrm's ``amdgpu.ids`` names (device, revision) exactly, which is what
+    Mesa shows; ``pci.ids`` names the device family when that has no row.
+    """
+    device = (_read_text(device_dir / "device") or "").lower().removeprefix("0x")
+    revision = (_read_text(device_dir / "revision") or "").lower().removeprefix("0x")
+    if not device:
+        log.debug("amd_marketing_name: no PCI device id under %s", device_dir)
+        return None
+    try:
+        for line in AMDGPU_IDS.read_text(encoding="utf-8").splitlines():
+            fields = [f.strip() for f in line.split(",", 2)]
+            if (len(fields) == 3 and fields[0].lower() == device
+                    and fields[1].lower() == revision):
+                log.info("amd_marketing_name: %s:%s -> %r (amdgpu.ids)",
+                         device, revision, fields[2])
+                return fields[2]
+    except OSError as e:
+        log.debug("amd_marketing_name: %s unreadable (%s)", AMDGPU_IDS, e)
+    try:
+        in_amd = False
+        for line in PCI_IDS.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line and not line.startswith(("\t", "#")):
+                in_amd = line.startswith("1002 ")
+            elif in_amd and line.startswith("\t") and not line.startswith("\t\t"):
+                dev, _, name = line.strip().partition(" ")
+                if dev.lower() == device:
+                    log.info("amd_marketing_name: %s -> %r (pci.ids)", device,
+                             name.strip())
+                    return f"AMD {name.strip()}"
+    except OSError as e:
+        log.debug("amd_marketing_name: %s unreadable (%s)", PCI_IDS, e)
+    log.info("amd_marketing_name: %s:%s is in neither table", device, revision)
+    return None
+
+
 class AmdGpu(GpuSource):
     """AMD Radeon/Ryzen APU — hwmon amdgpu + DRM sysfs.
 
@@ -394,14 +504,14 @@ class AmdGpu(GpuSource):
         frame_log.debug("name")
         if self._name_cache is not None:
             return self._name_cache
-        # /sys/class/drm/cardN/device/product_name is populated by the kernel
-        # on newer drivers; fall back to the PCI ID if not present.
+        # product_name when the kernel has one; else the marketing name from
+        # the PCI ids.  Never vbios_version: it is a part number (#301).
         name = None
         if self._drm is not None:
-            name = _read_text(self._drm / "device" / "product_name")
-            if name is None:
-                name = _read_text(self._drm / "device" / "vbios_version")
+            name = (_read_text(self._drm / "device" / "product_name")
+                    or amd_marketing_name(self._drm / "device"))
         self._name_cache = name or f"AMD GPU {self._index}"
+        frame_log.debug("AmdGpu %d: name %r", self._index, self._name_cache)
         return self._name_cache
 
     @property
@@ -414,6 +524,16 @@ class AmdGpu(GpuSource):
         frame_log.debug("temp")
         return self._hwmon.read_temp(1)
 
+    def hotspot(self) -> float | None:
+        """``junction`` -- amdgpu labels it on SOC15 dGPUs (docs.kernel.org,
+        gpu/amdgpu/thermal); older cards have only the edge sensor."""
+        frame_log.debug("hotspot")
+        return self._hwmon.read_temp_label("junction")
+
+    def mem_temp(self) -> float | None:
+        frame_log.debug("mem_temp")
+        return self._hwmon.read_temp_label("mem")
+
     def usage(self) -> float | None:
         frame_log.debug("usage")
         if self._drm is None:
@@ -423,7 +543,7 @@ class AmdGpu(GpuSource):
     def clock(self) -> float | None:
         # amdgpu freq1_input reports Hz in some kernels, MHz in others
         frame_log.debug("clock")
-        val = _read_int(self._hwmon.path / "freq1_input")
+        val = _read_int(self._hwmon.attrs / "freq1_input")
         if val is None:
             return None
         return val / 1_000_000.0 if val > 1_000_000 else float(val)
@@ -434,12 +554,12 @@ class AmdGpu(GpuSource):
 
     def fan(self) -> float | None:
         frame_log.debug("fan")
+        return self._hwmon.read_pwm(1)
+
+    def fan_rpm(self) -> float | None:
+        frame_log.debug("fan_rpm")
         rpm = self._hwmon.read_fan_rpm(1)
-        if rpm is None:
-            # Try PWM duty cycle as a percentage fallback
-            return self._hwmon.read_pwm(1)
-        # Approximate %: amdgpu fan1_max isn't always exposed; skip rpm→%
-        return None
+        return float(rpm) if rpm is not None else None
 
     def vram_used(self) -> float | None:
         frame_log.debug("vram_used")
@@ -470,6 +590,7 @@ class IntelGpu(GpuSource):
         self._hwmon = hwmon
         self._drm = drm_card
         self._driver = driver
+        self._energy = _EnergyRate()
 
     @property
     def key(self) -> str:
@@ -496,20 +617,103 @@ class IntelGpu(GpuSource):
         frame_log.debug("temp")
         return self._hwmon.read_temp_labeled() if self._hwmon is not None else None
 
+    def mem_temp(self) -> float | None:
+        """xe (Arc) labels its VRAM channel ``vram``."""
+        frame_log.debug("mem_temp")
+        return (self._hwmon.read_temp_label("vram")
+                if self._hwmon is not None else None)
+
     def clock(self) -> float | None:
-        frame_log.debug("clock")
+        # i915 publishes the GT clock on the card; xe (Arc) per GT, where gt0
+        # is the render engine and act_freq the frequency PCODE actually
+        # granted (xe_gt_freq.c).  Reading only the i915 file left Arc at None.
+        frame_log.debug("clock: driver=%s", self._driver)
         if self._drm is None:
             return None
-        return _read_float(self._drm / "gt_cur_freq_mhz")
+        return _read_float(self._drm / (
+            "device/tile0/gt0/freq0/act_freq" if self._driver == "xe"
+            else "gt_cur_freq_mhz"))
 
     def power(self) -> float | None:
+        # Neither i915 nor xe has power1_average -- only the energy1_input
+        # microjoule counter -- so this read nothing on every Intel GPU (#236).
         frame_log.debug("power")
-        return self._hwmon.read_power(1) if self._hwmon is not None else None
+        if self._hwmon is None or (uj := _read_float(self._hwmon.attrs / "energy1_input")) is None:
+            return None
+        return self._energy.watts(uj)
 
     def fan(self) -> float | None:
         # Intel iGPUs don't have their own fan.  Arc discrete may.
         frame_log.debug("fan")
         return self._hwmon.read_pwm(1) if self._hwmon is not None else None
+
+    def fan_rpm(self) -> float | None:
+        # xe has fan1..3_input and no pwm, so fan() is None on Arc (#236).
+        frame_log.debug("fan_rpm")
+        rpm = self._hwmon.read_fan_rpm(1) if self._hwmon is not None else None
+        return float(rpm) if rpm is not None else None
+
+class NouveauGpu(GpuSource):
+    """NVIDIA on the open-source nouveau driver -- hwmon only.
+
+    Units are the driver's own (``drivers/gpu/drm/nouveau/nouveau_hwmon.c``):
+    temp1 in millidegrees, fan1 in RPM, **pwm1 already a percent** -- nvkm
+    clamps the duty to 0-100, so the shared 0-255 ``read_pwm`` would show 30%
+    as 12% -- and ``power1_input`` in µW, with no ``power1_average``.  Usage,
+    clock and VRAM are never exposed, so they stay un-overridden and
+    ``unsupported()`` names them.  GSP boards (Turing and later) register no
+    hwmon node at all today, so in practice this reads pre-Turing cards.
+    """
+
+    def __init__(self, index: int, hwmon: HwmonDevice) -> None:
+        log.debug("NouveauGpu.__init__: index=%s hwmon=%s", index, hwmon)
+        self._index = index
+        self._hwmon = hwmon
+
+    @property
+    def key(self) -> str:
+        frame_log.debug("NouveauGpu.key")
+        return f"nouveau:{self._index}"
+
+    @property
+    def name(self) -> str:
+        frame_log.debug("NouveauGpu.name")
+        return f"NVIDIA GPU {self._index} (nouveau)"
+
+    @property
+    def is_discrete(self) -> bool:
+        frame_log.debug("NouveauGpu.is_discrete")
+        return True
+
+    def temp(self) -> float | None:
+        frame_log.debug("NouveauGpu.temp")
+        return self._hwmon.read_temp(1)
+
+    def power(self) -> float | None:
+        frame_log.debug("NouveauGpu.power")
+        uw = _read_int(self._hwmon.attrs / "power1_input")
+        return uw / 1_000_000.0 if uw is not None else None
+
+    def fan(self) -> float | None:
+        frame_log.debug("NouveauGpu.fan")
+        duty = _read_int(self._hwmon.attrs / "pwm1")
+        return float(duty) if duty is not None else None
+
+    def fan_rpm(self) -> float | None:
+        frame_log.debug("NouveauGpu.fan_rpm")
+        rpm = self._hwmon.read_fan_rpm(1)
+        return float(rpm) if rpm is not None else None
+
+
+def discover_nouveau_gpus(devices: list[HwmonDevice]) -> list[GpuSource]:
+    """One NouveauGpu per ``nouveau`` hwmon node."""
+    gpus: list[GpuSource] = [
+        NouveauGpu(i, dev)
+        for i, dev in enumerate(d for d in devices if d.driver == _NOUVEAU_DRIVER)
+    ]
+    log.info("discover_nouveau_gpus: devices=%d -> %d gpu(s)", len(devices), len(gpus))
+    return gpus
+
 
 def discover_amd_gpus(devices: list[HwmonDevice]) -> list[GpuSource]:
     """Find amdgpu hwmon entries, link them to /sys/class/drm cards."""
@@ -574,16 +778,21 @@ class HwmonFan(FanSource):
         frame_log.debug("percent")
         return self._hwmon.read_pwm(self._idx)
 
+    @property
+    def on_gpu(self) -> bool:
+        frame_log.debug("on_gpu: %s", self._hwmon.driver)
+        return self._hwmon.driver in _GPU_DRIVERS
+
 
 def discover_fans(devices: list[HwmonDevice]) -> list[FanSource]:
     log.info("discover_fans: devices=%d", len(devices))
     fans: list[FanSource] = []
     for dev in devices:
-        for fan_input in sorted(dev.path.glob("fan*_input")):
+        for fan_input in sorted(dev.attrs.glob("fan*_input")):
             idx = _channel_index(fan_input.name, "fan")
             if idx is None:
                 continue
-            label = _read_text(dev.path / f"fan{idx}_label")
+            label = _read_text(dev.attrs / f"fan{idx}_label")
             fans.append(HwmonFan(dev, idx, label))
     return fans
 
@@ -661,7 +870,7 @@ def discover_disk_temp(devices: list[HwmonDevice]) -> list[DiskSource]:
         if dev.read_temp(1) is None:
             log.debug("discover_disk_temp: %s has no temp1_input — skip", dev.driver)
             continue
-        label = _read_text(dev.path / "temp1_label")
+        label = _read_text(dev.attrs / "temp1_label")
         disks.append(HwmonDisk(dev, label))
     return disks
 
@@ -675,21 +884,37 @@ def discover_disk_temp(devices: list[HwmonDevice]) -> list[DiskSource]:
 _DRAM_DRIVERS = ("spd5118", "jc42")
 
 
+#: An i2c client directory: ``<bus>-<4-hex-digit address>``.
+_I2C_CLIENT = re.compile(r"\d+-([0-9a-f]{4})")
+
+
 class HwmonDram(DramSource):
-    """One DIMM's temp1 sensor on a hwmon ``spd5118`` / ``jc42`` node."""
+    """One DIMM's temp1 sensor on a hwmon ``spd5118`` / ``jc42`` node.
+
+    Keyed by its i2c client (``3-0051``), never the ``hwmonN`` directory,
+    which renumbers between boots -- a saved binding on it would drift to
+    another DIMM.  Named "DIMM n" from the address: the low three bits pick
+    the slot, for spd5118 (0x50..0x57) and jc42 (0x18..0x1f) alike.  Every
+    module used to be called "spd5118 DRAM" (#310).
+    """
 
     def __init__(self, hwmon: HwmonDevice, label: str | None) -> None:
         log.debug("__init__: hwmon=%s label=%s", hwmon, label)
         self._hwmon = hwmon
-        self._label = label or f"{hwmon.driver} DRAM"
+        client = (hwmon.path / "device").resolve().name
+        if (match := _I2C_CLIENT.fullmatch(client)) is not None:
+            self._client = client
+            slot: str = f"DIMM {int(match[1], 16) & 7}"
+        else:
+            self._client, slot = hwmon.path.name, f"{hwmon.driver} DRAM"
+        self._label = label or slot
+        log.info("HwmonDram: %s at %s -> %r", hwmon.driver, self._client,
+                 self._label)
 
     @property
     def key(self) -> str:
-        # Include the hwmon dir name: matched DIMMs share a driver, so a
-        # driver-only key would collide across modules (and conflate their
-        # per-source read-failure bookkeeping).
         frame_log.debug("key")
-        return f"hwmon:{self._hwmon.driver}:{self._hwmon.path.name}:temp1"
+        return f"dimm:{self._client}"
 
     @property
     def name(self) -> str:
@@ -709,30 +934,107 @@ def discover_dram_temp(devices: list[HwmonDevice]) -> list[DramSource]:
         if dev.driver not in _DRAM_DRIVERS:
             continue
         if dev.read_temp(1) is None:
-            log.debug("discover_dram_temp: %s has no temp1_input — skip", dev.driver)
+            if (dev.attrs / "temp1_input").exists():
+                # There, and not answering: the memory's SPD hub is stuck --
+                # seen 2026-10-09 after another program probed the bus.
+                log.warning("discover_dram_temp: %s at %s does not answer -- "
+                            "the memory's SPD hub is stuck; a full power-off "
+                            "(not a restart) clears it", dev.driver, dev.attrs)
+            else:
+                log.debug("discover_dram_temp: %s has no temp1_input — skip",
+                          dev.driver)
             continue
-        label = _read_text(dev.path / "temp1_label")
+        label = _read_text(dev.attrs / "temp1_label")
         dram.append(HwmonDram(dev, label))
     return dram
 
 
-# ── Memory channel clock (DDR5 SPD, rootless one-shot) ───────────────
+# ── Board voltages (inN_input, millivolts) ────────────────────────────
 
 
-class SpdClock:
-    """Memory channel clock (MHz) decoded once from the DDR5 SPD EEPROM.
+class HwmonVoltage(VoltageSource):
+    """One ``inN_input`` -- named by ``inN_label`` when the driver has one
+    (nct6686: "CPU Vcore", "+12V"), else "inN (chip)"."""
 
-    The clock is a static nameplate value, so it is read+decoded a single
-    time at construction and cached — ``clock()`` is then a cheap accessor the
-    aggregator can call every poll tick without touching sysfs.
+    def __init__(self, hwmon: HwmonDevice, index: int, label: str) -> None:
+        log.debug("HwmonVoltage: %s in%d label=%r", hwmon.driver, index, label)
+        self._hwmon = hwmon
+        self._index = index
+        self._label = label
+        self._key = sensor_slug(hwmon.driver, label or f"in{index}", index)
+
+    @property
+    def key(self) -> str:
+        frame_log.debug("key")
+        return self._key
+
+    @property
+    def name(self) -> str:
+        frame_log.debug("name")
+        return self._label or f"in{self._index} ({self._hwmon.driver})"
+
+    def volts(self) -> float | None:
+        frame_log.debug("volts")
+        milli = _read_int(self._hwmon.attrs / f"in{self._index}_input")
+        return None if milli is None else milli / 1000.0
+
+
+def discover_voltages(devices: list[HwmonDevice]) -> list[VoltageSource]:
+    """One source per ``inN_input`` on every chip, except one reading exactly
+    0 -- an input the board never wired, the board-temperature rule (#259's
+    nct6686 ``in1`` reads 0.000)."""
+    sources: list[VoltageSource] = []
+    for dev in devices:
+        indices = (_channel_index(p.name, "in") for p in dev.attrs.glob("in*_input"))
+        for index in sorted(i for i in indices if i is not None):
+            if not _read_int(dev.attrs / f"in{index}_input"):
+                continue
+            label = _read_text(dev.attrs / f"in{index}_label") or ""
+            sources.append(HwmonVoltage(dev, index, label))
+    log.info("discover_voltages: %d input(s) across %d chip(s)", len(sources),
+             len({id(s._hwmon) for s in sources if isinstance(s, HwmonVoltage)}))
+    return sources
+
+
+# ── Memory channel clock (what the controller RUNS, read once) ────────
+
+
+class MemoryClock:
+    """Memory channel clock in MHz — the speed the memory controller RUNS.
+
+    Prefers dmidecode's ``Configured Memory Speed`` (MT/s ÷ 2, DDR), and falls
+    back to the DDR5 SPD nameplate.  It used to read ONLY the nameplate, which
+    is the JEDEC base profile — 4800 MT/s for every DDR5 stick by spec — so an
+    MC-3 on a machine running XMP 8000 showed 4800 (#279).  The Windows side
+    has always preferred the configured value (``ConfiguredClockSpeed``).
+
+    Read on the FIRST ``clock()`` and cached: the value is static, and the
+    dmidecode read goes through pkexec, which a CLI command that never shows
+    the RAM speed should not pay for.
     """
 
     def __init__(self) -> None:
-        from ..system.spd import read_spd_timings
-        timings = read_spd_timings()
-        self._mhz: float | None = float(timings.mhz) if timings else None
-        log.info("SpdClock: mhz=%s", self._mhz)
+        self._mhz: float | None = None
+        self._read = False
+        log.debug("MemoryClock: created (read deferred to first clock())")
 
     def clock(self) -> float | None:
         frame_log.debug("clock")
+        if not self._read:
+            self._read = True
+            self._mhz = self._resolve()
         return self._mhz
+
+    @staticmethod
+    def _resolve() -> float | None:
+        """Configured speed if dmidecode answers, else the SPD nameplate."""
+        from ..system.linux import configured_memory_mts
+        from ..system.spd import read_spd_timings
+        if (mts := configured_memory_mts()) is not None:
+            log.info("MemoryClock: %d MT/s configured -> %.0f MHz", mts, mts / 2)
+            return mts / 2
+        timings = read_spd_timings()
+        mhz = float(timings.mhz) if timings else None
+        log.info("MemoryClock: no configured speed readable -> SPD nameplate "
+                 "mhz=%s", mhz)
+        return mhz

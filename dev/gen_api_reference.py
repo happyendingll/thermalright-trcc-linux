@@ -30,6 +30,12 @@ from pathlib import Path
 # The API composes a QtRenderer, which wants a platform plugin.  Same knob the
 # daemon sets for headless rendering — set before Qt is imported.
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# In-process: ``build_app()`` composes an App to walk its routes, and the
+# production default would find or START the shared App — which it did, from
+# the pre-commit hook's system python, on every commit after the default flipped.
+# Assigned, not ``setdefault``: a shell exporting TRCC_DAEMON=1 (the CLI used to
+# advise it) would otherwise send every commit's hook to the shared App again.
+os.environ["TRCC_DAEMON"] = "0"
 
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO / "src"))
@@ -64,11 +70,10 @@ def _summary(endpoint: object) -> str:
 def generate() -> str:
     from fastapi.routing import APIRoute, APIWebSocketRoute
 
-    from trcc.ui.api.main import build_app
+    from trcc.ui.api.main import api_routes, build_app
 
-    api = build_app()
     rows: list[tuple[str, str, str, str, str]] = []   # tag, path, methods, resp, summary
-    for route in api.routes:
+    for route in api_routes(build_app()):
         if isinstance(route, APIRoute):
             methods = " ".join(sorted(m for m in route.methods
                                       if m not in ("HEAD", "OPTIONS")))

@@ -219,6 +219,21 @@ def test_lhm_discover_gpus_normalizes_vendor_keys() -> None:
     assert nvidia_gpu.is_discrete is True
 
 
+def test_lhm_gpu_fan_is_control_percent_and_fan_rpm() -> None:
+    """LHM's ``Fan`` type is RPM and ``Control`` the duty %; ``fan()`` used to
+    return the RPM under a 0-100 contract (#145)."""
+    ns = _FakeLhmNamespace([
+        _FakeLhmHardware(identifier="/gpu-nvidia/0", name="GeForce RTX 4090",
+                         hw_type="GpuNvidia", sensors=[
+                             _FakeLhmSensor(name="GPU Fan", sensor_type="Fan", value=1450.0),
+                             _FakeLhmSensor(name="GPU Fan", sensor_type="Control", value=38.0),
+                         ]),
+    ])
+    (gpu,) = discover_lhm_gpus(handle_factory=lambda: ns)
+    assert gpu.fan_rpm() == 1450.0
+    assert gpu.fan() == 38.0
+
+
 def test_lhm_discover_gpus_handles_missing_namespace() -> None:
     assert discover_lhm_gpus(handle_factory=lambda: None) == []
 
@@ -538,3 +553,124 @@ def test_aggregator_enters_thread_context_on_poll_thread() -> None:
 
 
 _ = Any  # quiet ruff if Any falls out of use
+
+
+def test_msacpi_does_not_ask_again_after_finding_nothing() -> None:
+    """No handle, or no thermal zones: None for good -- not a fresh WMI
+    connect on every sensor read.
+
+    MUTATION CHECK: drop the short-circuit in ``temp`` and the factory is
+    asked on every read.
+    """
+    asked: list[int] = []
+
+    def no_handle() -> None:
+        asked.append(1)
+        return None
+
+    cpu = WmiAcpiCpu(handle_factory=no_handle)
+
+    assert [cpu.temp() for _ in range(3)] == [None, None, None]
+    assert asked == [1]
+
+
+def test_a_failed_wmi_handle_is_remembered_on_its_thread(monkeypatch) -> None:
+    """The default factory cached ``None`` for a failure, and ``None`` also
+    meant "not tried", so it reconnected on every call.
+
+    MUTATION CHECK: cache ``None`` again and ``wmi.WMI`` runs every call.
+    """
+    import sys
+    import types
+
+    from trcc.adapters.sensors import _msacpi
+
+    tries: list[int] = []
+
+    def refuse(**_kw: Any) -> None:
+        tries.append(1)
+        raise RuntimeError("namespace refused")
+
+    monkeypatch.setitem(sys.modules, "wmi", types.SimpleNamespace(WMI=refuse))
+    seen: list[Any] = []
+
+    def on_fresh_thread() -> None:      # a thread of its own: the cache is per thread
+        seen.extend(_msacpi._default_handle_factory() for _ in range(3))
+
+    t = threading.Thread(target=on_fresh_thread)
+    t.start()
+    t.join()
+
+    assert seen == [None, None, None]
+    assert tries == [1]
+
+
+# ── The HWiNFO mapping keeps a 64-bit view address ──────────────────────
+#
+# ctypes' default return type is a C int, so without restype=c_void_p a
+# 64-bit Windows process got MapViewOfFile's address truncated and read()
+# copied from wherever that pointed -- a crash, not an exception.  Legacy set
+# the prototypes; the rebuild dropped them.  Off Windows this cannot run the
+# real call, so it pins the prototypes and the address read() is handed.
+
+_HIGH_VIEW = 0x7FF6_1234_5000          # above 4 GiB: a C int cannot hold it
+
+
+class _FakeFn:
+    def __init__(self, result: int) -> None:
+        self.result = result
+        self.restype: Any = None
+        self.argtypes: Any = None
+        self.calls: list[tuple] = []
+
+    def __call__(self, *args: Any) -> int:
+        self.calls.append(args)
+        return self.result
+
+
+class _FakeKernel32:
+    def __init__(self) -> None:
+        self.OpenFileMappingW = _FakeFn(0x1F4)
+        self.MapViewOfFile = _FakeFn(_HIGH_VIEW)
+        self.UnmapViewOfFile = _FakeFn(1)
+        self.CloseHandle = _FakeFn(1)
+
+
+def _windows_mapping(monkeypatch) -> tuple[Any, _FakeKernel32, list]:
+    import ctypes
+    import sys as _sys
+
+    from trcc.adapters.sensors._hwinfo import _HWiNFOMapping
+
+    k32 = _FakeKernel32()
+    opened: list = []
+
+    def fake_windll(name: str, use_last_error: bool = False) -> _FakeKernel32:
+        opened.append((name, use_last_error))
+        return k32
+
+    copies: list = []
+    monkeypatch.setattr(_sys, "platform", "win32")
+    monkeypatch.setattr(ctypes, "WinDLL", fake_windll, raising=False)
+    monkeypatch.setattr(ctypes, "memmove",
+                        lambda dst, src, n: copies.append((src, n)))
+    mapping = _HWiNFOMapping()
+    return mapping, k32, [opened, copies]
+
+
+def test_the_hwinfo_view_address_is_never_truncated(monkeypatch) -> None:
+    import ctypes
+
+    mapping, k32, (opened, copies) = _windows_mapping(monkeypatch)
+    assert opened == [("kernel32", True)]
+    assert k32.OpenFileMappingW.restype is ctypes.c_void_p
+    assert k32.MapViewOfFile.restype is ctypes.c_void_p
+    assert k32.UnmapViewOfFile.argtypes == [ctypes.c_void_p]
+    assert k32.CloseHandle.argtypes == [ctypes.c_void_p]
+
+    mapping.read(16, 4)
+    assert copies == [(_HIGH_VIEW + 16, 4)]
+
+    mapping.close()
+    assert k32.UnmapViewOfFile.calls == [(_HIGH_VIEW,)]
+    assert k32.CloseHandle.calls == [(0x1F4,)]

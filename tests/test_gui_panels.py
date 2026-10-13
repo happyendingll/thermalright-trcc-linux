@@ -19,7 +19,7 @@ import pytest
 from trcc.app import App
 from trcc.core.led_models import LED_STYLES
 
-from .conftest import FakePlatform
+from .conftest import FakeMic, FakePlatform
 
 # =========================================================================
 # QApplication fixture — module-scoped so all GUI tests share it
@@ -207,6 +207,29 @@ def test_uc_about_gpu_widget_label_and_dropdown(qapp: object) -> None:
     assert two._gpu_combo.count() == 2
 
 
+def test_uc_about_shows_the_apps_update_answer_and_starts_no_thread(
+        gui_app: App, qapp: object) -> None:
+    """The App checks for updates; the panel reads its last answer on open
+    and shows each new one.  It used to start a thread that held the panel,
+    which deadlocked Qt when a window was dropped mid-check (2026-10-10)."""
+    import threading
+
+    from trcc.core.events import UpdateChecked
+    from trcc.ui.gui.assets import _PKG_ASSETS_DIR, set_assets_dir
+    from trcc.ui.gui.uc_about import UCAbout
+    set_assets_dir(_PKG_ASSETS_DIR)
+
+    before = {t.ident for t in threading.enumerate()}
+    panel = UCAbout(app=gui_app)
+    started = [t.name for t in threading.enumerate() if t.ident not in before]
+    assert started == []                                 # no thread of its own
+    assert not panel._update_overlay.isVisibleTo(panel)  # "Not checked yet"
+    panel.on_update_checked(UpdateChecked(ok=True, latest_version="999.0.0",
+                                          update_available=True))
+    assert panel._update_overlay.isVisibleTo(panel)
+    assert panel._latest_version == "999.0.0"
+
+
 def test_sensor_picker_renders_hardware_metrics(
     gui_app: App, qapp: object,
 ) -> None:
@@ -269,6 +292,51 @@ def test_qtgui_advanced_tab_sections_match_panel_model(gui_app: App, style) -> N
     assert tab._misc_box.isVisibleTo(tab) == (
         m.show_memory_panel or m.show_disk_panel
     ), f"{style.name} memory/disk"
+
+
+# 1x1 GIF -- Qt reads GIF but cannot write one.
+_GIF = (b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff"
+        b"!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01"
+        b"\x00\x00\x02\x02D\x01\x00;")
+
+
+def test_cloud_tile_reads_the_apps_gif_or_shows_the_png(
+    qapp: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#264: the tile made its GIF itself with ffmpeg, on the UI thread,
+    ~100 ms a tile on every visit.  It only reads now -- the App's GIF when
+    there is one, else the preview PNG (all the C# ever shows).  With no GIF
+    it used to show the placeholder, because a downloaded theme had no
+    image path at all."""
+    import subprocess
+
+    from PySide6.QtGui import QColor, QImage
+
+    from trcc.core.models import CloudThemeItem
+    from trcc.ui.gui.uc_theme_web import CloudThemeThumbnail
+
+    def refuse(*_a: object, **_k: object) -> None:
+        raise AssertionError("the cloud tile ran a subprocess")
+
+    monkeypatch.setattr(subprocess, "run", refuse)
+    monkeypatch.setattr(subprocess, "Popen", refuse)
+    png = tmp_path / "a001.png"
+    still = QImage(60, 30, QImage.Format.Format_RGB32)
+    still.fill(QColor(255, 0, 0))
+    assert still.save(str(png))
+    mp4 = tmp_path / "a001.mp4"
+    mp4.write_bytes(b"\x00\x00\x00\x1cftypmp42")
+    item = CloudThemeItem(name="a001", id="a001", video=str(mp4),
+                          preview=str(png), is_local=True)
+
+    tile = CloudThemeThumbnail(item)
+    assert tile._movie is None
+    assert tile.thumb_label.pixmap().toImage().pixelColor(60, 60) == QColor(255, 0, 0)
+
+    (tmp_path / "a001.gif").write_bytes(_GIF)
+    animated = CloudThemeThumbnail(item)
+    assert animated._movie is not None
+    assert animated._movie.fileName() == str(tmp_path / "a001.gif")
 
 
 def test_about_panel_constructs(gui_app: App) -> None:
@@ -355,6 +423,47 @@ def _maintenance_box(gui_app: App, qtbot):
     return box
 
 
+def test_maintenance_box_shows_the_apps_update_answer(gui_app: App,
+                                                      qtbot) -> None:
+    """The App's answer, published as ``UpdateChecked``, reaches this box
+    as it reaches the classic window -- one truth, every window."""
+    from trcc.core.events import UpdateChecked
+
+    box = _maintenance_box(gui_app, qtbot)
+    gui_app.events.publish(UpdateChecked(
+        ok=True, local_version="9.10.8", latest_version="9.11.0",
+        release_url="https://example.invalid/r", update_available=True))
+    qtbot.waitUntil(lambda: "9.11.0" in box._status.text(), timeout=2000)
+    assert box._status.text().startswith("Update available: 9.11.0 (you have 9.10.8)")
+
+
+def test_check_for_updates_does_not_wait_on_the_gui_thread(
+        gui_app: App, qtbot, monkeypatch) -> None:
+    """The button used to dispatch CheckForUpdate on the GUI thread, so the
+    window froze while GitHub answered."""
+    import threading
+
+    from trcc.core.commands import CheckForUpdate
+    from trcc.core.results import UpdateCheckResult
+
+    box = _maintenance_box(gui_app, qtbot)
+    asked_on: list[str] = []
+    real = gui_app.dispatch
+
+    def dispatch(cmd):  # type: ignore[no-untyped-def]
+        if isinstance(cmd, CheckForUpdate):
+            asked_on.append(threading.current_thread().name)
+            return UpdateCheckResult(ok=True, local_version="9.10.8",
+                                     latest_version="9.10.8")
+        return real(cmd)
+
+    monkeypatch.setattr(gui_app, "dispatch", dispatch)
+    box._update_btn.click()
+    qtbot.waitUntil(lambda: box._status.text() == "Up to date (9.10.8).",
+                    timeout=2000)
+    assert asked_on == ["trcc-CheckForUpdate"]          # not the GUI thread
+
+
 def test_autostart_picker_offers_every_target(gui_app: App, qtbot) -> None:
     """The picker's list IS the registry — never a second copy to drift."""
     from trcc.core.models import AUTOSTART_TARGETS
@@ -407,6 +516,52 @@ def test_autostart_picker_shows_the_installed_target(
     gui_app.platform.autostart().enable("qtgui")    # changed behind its back
     box.refresh()
     assert box._autostart_target.currentData() == "qtgui"
+
+
+@pytest.mark.parametrize(("readings", "text"), [
+    ({"fan:gpu": 1000.0}, "1000RPM"),
+    ({"fan:gpu:percent": 30.0}, "30%"),            # never "0RPM" or "30RPM"
+    ({}, "--"),
+])
+def test_gui_gpufan_row_shows_the_unit_its_reading_has(
+        qtbot, readings: dict[str, float], text: str) -> None:
+    """The ``ui/gui`` activity sidebar's GPUFAN row -- the #145 screenshot.
+    The row is the dashboard's FAN row, bound to the ``fan:gpu`` slot."""
+    from trcc.core.models import HardwareMetrics, OverlayElementConfig
+    from trcc.ui.gui.uc_activity_sidebar import SensorItem
+
+    item = SensorItem("GPUFAN", "fan:gpu", "RPM", OverlayElementConfig(), "#ffffff")
+    qtbot.addWidget(item)
+    item.update_value(HardwareMetrics(readings=readings))
+    assert item.value_label.text() == text
+
+
+def test_the_activity_list_is_the_dashboard_and_adds_any_sensor(
+        qtbot, gui_app: App) -> None:
+    """#223 #259 #310: the gui's Activity list was a fixed 24-entry catalog,
+    so a board probe the dashboard showed could not be placed.  It is the
+    dashboard's rows now -- custom panels included -- and a click adds that
+    sensor by id."""
+    from PySide6.QtCore import Qt
+
+    from trcc.core.models import PanelConfig, SensorBinding
+    from trcc.ui.gui.uc_activity_sidebar import UCActivitySidebar
+
+    sidebar = UCActivitySidebar()
+    qtbot.addWidget(sidebar)
+    custom = PanelConfig.custom("Probes")
+    custom.sensors[0] = SensorBinding("T_SENSOR1", "board:nct6798_auxtin1:temp", "°C")
+    sidebar.set_panels([PanelConfig(1, "CPU", [SensorBinding("TEMP", "cpu:temp", "°C")]),
+                        custom])
+    added: list = []
+    sidebar.sensor_clicked.connect(added.append)
+
+    ids = [item.sensor_id for item in sidebar._sensor_items]
+    qtbot.mouseClick(sidebar._sensor_items[1], Qt.MouseButton.LeftButton)
+
+    assert ids == ["cpu:temp", "board:nct6798_auxtin1:temp"]
+    assert [(c.mode.name, c.metric) for c in added] == [
+        ("HARDWARE", "board:nct6798_auxtin1:temp")]
 
 
 def test_activity_sidebar_emits_selection(gui_app: App) -> None:
@@ -527,103 +682,101 @@ def test_overlay_editor_dialog_round_trips_values(gui_app: App) -> None:
     assert out["show_unit"] is False        # button0 unit-switch round-trips
 
 
-def test_overlay_editor_adopts_theme_layout_and_edits_in_place(
-    gui_app: App, tmp_path: object,
+def test_overlay_editor_shows_the_layout_and_writes_nothing_on_open(
+    gui_app: App, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """qtgui parity with the legacy GUI: the editor works on the ONE overlay
-    layout, seeded from the active theme, and edits replace in place.
-
-    Regression lock for the cutover's additive model: editing used to add a
-    duplicate on top of the theme.  Now opening the editor adopts the theme's
-    elements into the editable user layer and an edit mutates them in place —
-    one element in, one element out, moved.
-    """
+    """Opening the editor, or switching it to a device, reads that device's
+    layout and writes nothing.  It used to adopt the theme's layout into the
+    user layer with a SetOverlayConfig on every refresh -- which, once the
+    rail's selection reached it, would have fired on every device pick.
+    ``LoadTheme`` adopts the layout itself, for every UI.  An edit then
+    changes the listed element in place."""
     from pathlib import Path
 
-    from trcc.core.commands import UpdateOverlayElement
+    from trcc.core.commands import AddOverlayElement, Query, UpdateOverlayElement
     from trcc.core.models import Theme
     from trcc.ui.qtgui.panels.overlay_editor import OverlayEditorPanel
 
     key = "0402:3922"
+    # A theme's layout with no user layer of its own: the state the editor
+    # used to "adopt" by writing it.  It must show it, and write nothing.
     gui_app.active_themes[key] = Theme(
-        path=Path(str(tmp_path)), name="t", resolution=(320, 320),
-        config={"overlay_enabled": True, "elements": [
-            {"type": "text", "x": 10, "y": 10, "text": "CPU",
-             "color": "#ffffff", "size": 16},
-        ]},
+        path=Path("/nonexistent/t"), name="t", resolution=(320, 320),
+        config={"elements": [{"type": "text", "text": "CPU", "x": 10, "y": 10}]},
     )
+    writes: list[str] = []
+    real = gui_app.dispatch
 
+    def _record(command: object) -> object:
+        if not isinstance(command, Query):
+            writes.append(type(command).__name__)
+        return real(command)
+
+    monkeypatch.setattr(gui_app, "dispatch", _record)
     panel = OverlayEditorPanel(gui_app, _bus(gui_app))
     panel._picker.set_key(key)
     panel.refresh()
 
-    # Opening adopted the theme's one element into the editable user layer.
-    user = gui_app.settings.for_device(key).user_overlay_elements
-    assert len(user) == 1, "editor must adopt the theme's layout, not start blank"
-    assert user[0].text == "CPU"
-    adopted_id = user[0].id
+    assert writes == [], f"opening the editor wrote {writes}"
+    assert panel._list.count() == 1
+    assert gui_app.settings.for_device(key).user_overlay_elements is None
 
-    # Editing moves it IN PLACE — still exactly one element, now relocated.
-    gui_app.dispatch(
-        UpdateOverlayElement(key=key, element_id=adopted_id, x=99, y=99),
-    )
+    assert gui_app.dispatch(AddOverlayElement(
+        key=key, element_id="cpu", type="text", text="CPU", x=10, y=10)).ok
+    assert gui_app.dispatch(
+        UpdateOverlayElement(key=key, element_id="cpu", x=99, y=99)).ok
     after = gui_app.settings.for_device(key).user_overlay_elements
-    assert len(after) == 1, "edit must replace in place, not duplicate"
+    assert after is not None and len(after) == 1, "edit must replace in place"
     assert (after[0].x, after[0].y) == (99, 99)
 
 
-def test_overlay_grid_loads_metric_and_edits_persist(
+def test_overlay_grid_loads_metric_from_the_app_with_its_ids(
     gui_app: App, qapp: object,
 ) -> None:
-    """Legacy-style grid: metrics load (not dropped) and edits persist.
+    """Legacy-style grid: a metric element loads (not dropped), every cell
+    keeps the App's id.
 
-    Before the fix the grid mapped metrics by legacy name so next/-id
-    metrics (cpu:temp) were dropped on load (couldn't be dragged), and its
-    edit payload carried no id so SetOverlayConfig rejected it (colour/drag
-    never applied).  This drives the real widget + Command bus end to end.
+    Metrics were once dropped on load (mapped by legacy name, not ``cpu:temp``)
+    so they could not be dragged; and the grid once re-minted every id
+    positionally, so an id the CLI or API held stopped naming anything.
     """
-    from trcc.core.commands import SetOverlayConfig
+    from trcc.core.commands import AddOverlayElement, ResolveOverlay
+    from trcc.core.models import OverlayMode
     from trcc.ui.gui.overlay_grid import OverlayGridPanel
+    from trcc.ui.presentation.overlay_serialization import entries_to_configs
+
+    key = "0402:3922"
+    assert gui_app.dispatch(AddOverlayElement(
+        key=key, element_id="m1", type="metric", metric="cpu:temp",
+        x=74, y=250, color="#112233")).ok
+    assert gui_app.dispatch(AddOverlayElement(
+        key=key, element_id="t1", type="text", text="HI")).ok
 
     grid = OverlayGridPanel()
-    grid.set_overlay_enabled(True)
-    grid.load_from_overlay_config({
-        "cpu_temp": {"metric": "cpu:temp", "x": 74, "y": 250,
-                     "color": "#112233", "enabled": True,
-                     "font": {"size": 24}},
-        "custom_0": {"text": "HI", "x": 5, "y": 5, "color": "#abcdef",
-                     "enabled": True},
-    })
+    grid.load_configs(entries_to_configs(
+        gui_app.dispatch(ResolveOverlay(key=key)).elements))
 
-    # Metric element reached the editable grid (was dropped before the fix).
-    assert len(grid.get_all_configs()) == 2
-
-    # The edit dispatch shape is accepted, and the colour persists.
-    key = "0402:3922"
-    result = gui_app.dispatch(
-        SetOverlayConfig(key=key, elements=tuple(grid.to_next_elements())),
-    )
-    assert result.ok, result.message
-    stored = gui_app.settings.for_device(key).user_overlay_elements
-    metric = next(e for e in stored if e.type == "metric")
-    assert metric.metric == "cpu:temp"
+    cells = grid.get_all_configs()
+    assert [c.id for c in cells] == ["m1", "t1"]
+    metric = cells[0]
+    assert metric.mode is OverlayMode.HARDWARE
+    assert (metric.main_count, metric.sub_count) == (0, 1)
     assert metric.color == "#112233"
 
 
-def test_color_change_emits_list_payload_to_delegate(
+def test_color_change_sends_one_update_naming_the_element(
     gui_app: App, qapp: object,
 ) -> None:
-    """A colour edit must reach the delegate as a non-empty next/ element
-    LIST carrying the new colour.
+    """A colour edit reaches the delegate as ONE ``UpdateOverlayElement`` for
+    the selected element, carrying the colour and nothing else.
 
-    The delegate forwarder in trcc_app gates CMD_OVERLAY_CHANGED on
-    ``isinstance(info, (dict, list))``; when ``_on_elements_changed`` switched
-    to the list shape, a dict-only gate silently dropped the payload to ``{}``
-    so colour/drag never reached on_overlay_changed.  This drives the real
-    UCThemeSetting → delegate hop (the one a direct SetOverlayConfig test
-    bypasses).
+    It used to send the whole grid through ``SetOverlayConfig``, which
+    rewrote every other element in the grid's reduced shape and put back what
+    another UI had changed.  Drives the real UCThemeSetting → delegate hop.
     """
     del gui_app, qapp
+    from trcc.core.commands import UpdateOverlayElement
+    from trcc.core.models import OverlayElementConfig, OverlayMode
     from trcc.ui.gui.uc_theme_setting import UCThemeSetting
 
     panel = UCThemeSetting()
@@ -631,22 +784,20 @@ def test_color_change_emits_list_payload_to_delegate(
     panel.delegate.connect(lambda cmd, info, data: captured.append((cmd, info)))
 
     panel.set_overlay_enabled(True)
-    panel.load_from_overlay_config({
-        "custom_0": {"text": "HI", "x": 5, "y": 5, "color": "#ffffff",
-                     "enabled": True},
-    })
+    panel.load_configs([
+        OverlayElementConfig(id="t1", mode=OverlayMode.CUSTOM, text="HI",
+                             x=5, y=5, color="#ffffff"),
+    ])
     panel.overlay_grid.select_element(0)
     panel._on_color_changed(0x11, 0x22, 0x33)
 
-    overlay_emits = [
-        info for cmd, info in captured
-        if cmd == UCThemeSetting.CMD_OVERLAY_CHANGED
-    ]
-    assert overlay_emits, "colour change emitted no CMD_OVERLAY_CHANGED"
-    payload = overlay_emits[-1]
-    # Must be a LIST (the gate forwards list/dict; anything else → {} → dropped)
-    assert isinstance(payload, list) and payload, f"payload not a list: {payload!r}"
-    assert payload[0]["color"] == "#112233"
+    edits = [info for cmd, info in captured
+             if cmd == UCThemeSetting.CMD_OVERLAY_CHANGED]
+    assert len(edits) == 1, f"one colour change, {len(edits)} edits"
+    command = edits[0](key="0402:3922")
+    assert command == UpdateOverlayElement(
+        key="0402:3922", element_id="t1", color="#112233",
+    ), "only the changed field may be sent"
 
 
 def test_configuration_panel_constructs(gui_app: App) -> None:
@@ -661,8 +812,213 @@ def test_configuration_panel_load_without_key(gui_app: App) -> None:
     from trcc.ui.qtgui.panels.configuration_panel import ConfigurationPanel
 
     panel = ConfigurationPanel(gui_app, _bus(gui_app))
-    panel._load_from_snapshot()
+    panel._show_state()
     assert "pick a device" in panel._status.text().lower()
+
+
+_KEY_Q3 = "0402:3922"
+
+
+def _seed_non_defaults(app: App) -> None:
+    """A value different from every control's default, so a reset shows."""
+    from trcc.core.commands import (
+        EnableOverlay,
+        SetBackgroundMode,
+        SetBrightness,
+        SetFitMode,
+        SetLanguage,
+        SetOrientation,
+        SetRefreshInterval,
+        SetTempUnit,
+    )
+    for command in (SetFitMode(key=_KEY_Q3, mode="height"),
+                    EnableOverlay(key=_KEY_Q3, enabled=False),
+                    SetBackgroundMode(key=_KEY_Q3, mode="color"),
+                    SetBrightness(key=_KEY_Q3, percent=30),
+                    SetOrientation(key=_KEY_Q3, degrees=180),
+                    SetTempUnit(unit="F"), SetLanguage(language="de"),
+                    SetRefreshInterval(seconds=3.0)):
+        assert app.dispatch(command).ok, command
+
+
+def _on_device(panel) -> None:
+    """Point a bare panel's picker at the Q3 device and show it."""
+    panel._picker.current_key = lambda: _KEY_Q3   # pyright: ignore[reportAttributeAccessIssue]
+    panel._show_state() if hasattr(panel, "_show_state") else panel._on_refresh()
+
+
+def _writes(panel) -> list:
+    """Every non-Query Command the panel sends from here on."""
+    from trcc.core.commands import Query
+
+    sent: list = []
+    real = panel.dispatch
+
+    def spy(cmd):
+        if not isinstance(cmd, Query):
+            sent.append(cmd)
+        return real(cmd)
+
+    panel.dispatch = spy                      # pyright: ignore[reportAttributeAccessIssue]
+    return sent
+
+
+def test_the_configuration_panel_shows_what_the_app_holds(
+    gui_app: App, qtbot, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On open it showed 9 of 9 settings wrong (widget defaults, measured
+    2026-09-30), and "Apply" wrote them back.  Recorded at the App, from
+    BEFORE construction: the panel's first show runs in its constructor."""
+    from trcc.core.commands import Query
+    from trcc.ui.qtgui.panels.configuration_panel import ConfigurationPanel
+
+    _seed_non_defaults(gui_app)
+    sent: list[str] = []
+    real = gui_app.dispatch
+
+    def _record(command: object) -> object:
+        if not isinstance(command, Query):
+            sent.append(type(command).__name__)
+        return real(command)
+
+    monkeypatch.setattr(gui_app, "dispatch", _record)
+    panel = ConfigurationPanel(gui_app, _bus(gui_app))
+    qtbot.addWidget(panel)
+    _on_device(panel)
+
+    shown = (panel._fit.currentData(), panel._overlay.currentData(),
+             panel._bg_mode.currentData(), panel._temp_unit.currentData(),
+             panel._language.currentData(), panel._refresh.value())
+    assert shown == ("height", False, "color", "F", "de", 3.0)
+    assert sent == [], f"showing the App's state wrote {sent}"
+
+
+def test_one_configuration_control_sends_its_one_command(
+    gui_app: App, qtbot,
+) -> None:
+    from trcc.core.commands import SetFitMode, SetRefreshInterval
+    from trcc.ui.qtgui.panels.configuration_panel import ConfigurationPanel
+
+    _seed_non_defaults(gui_app)
+    panel = ConfigurationPanel(gui_app, _bus(gui_app))
+    qtbot.addWidget(panel)
+    _on_device(panel)
+    sent = _writes(panel)
+
+    stretch = panel._fit.findData("stretch")
+    panel._fit.setCurrentIndex(stretch)
+    panel._fit.activated.emit(stretch)                    # the user's pick
+    panel._refresh.setValue(4.0)                          # typed + finished
+
+    assert sent == [SetFitMode(key=_KEY_Q3, mode="stretch"),
+                    SetRefreshInterval(seconds=4.0)], sent
+
+
+@pytest.mark.parametrize("panel_name", ["configuration", "display", "status"])
+def test_a_panel_follows_another_uis_change(
+    gui_app: App, qtbot, panel_name: str,
+) -> None:
+    """Another UI sets brightness / fit; the panel shows it, no click."""
+    from trcc.core.commands import SetBrightness, SetFitMode
+    from trcc.ui.qtgui.panels.configuration_panel import ConfigurationPanel
+    from trcc.ui.qtgui.panels.display_panel import DisplayPanel
+    from trcc.ui.qtgui.panels.status_panel import StatusPanel
+
+    cls = {"configuration": ConfigurationPanel, "display": DisplayPanel,
+           "status": StatusPanel}[panel_name]
+    panel = cls(gui_app, _bus(gui_app))
+    qtbot.addWidget(panel)
+    _on_device(panel)
+
+    gui_app.dispatch(SetFitMode(key=_KEY_Q3, mode="height"))
+    gui_app.dispatch(SetBrightness(key=_KEY_Q3, percent=42))
+
+    shows = {
+        "configuration": lambda: panel._fit.currentData() == "height",
+        "display": lambda: panel._brightness.value() == 42,
+        "status": lambda: panel._brightness_label.text() == "42%",
+    }[panel_name]
+    qtbot.waitUntil(shows, timeout=2000)
+
+
+def test_the_game_mode_controls_send_their_own_half(
+    gui_app: App, qtbot,
+) -> None:
+    """The switch and the threshold are two controls, as in the C#; each
+    sends only its own field."""
+    from trcc.core.commands import SetGameMode
+    from trcc.ui.qtgui.panels.configuration_panel import ConfigurationPanel
+
+    panel = ConfigurationPanel(gui_app, _bus(gui_app))
+    qtbot.addWidget(panel)
+    _on_device(panel)
+    sent = _writes(panel)
+
+    on = panel._game.findData(True)
+    panel._game.setCurrentIndex(on)
+    panel._game.activated.emit(on)                         # the user's pick
+    panel._game_threshold.setValue(60)                     # typed + finished
+
+    assert sent == [SetGameMode(key=_KEY_Q3, enabled=True),
+                    SetGameMode(key=_KEY_Q3, threshold=60)], sent
+    assert panel._game_threshold.maximum() == 99
+
+
+def test_a_game_mode_change_reaches_other_windows(gui_app: App, qtbot) -> None:
+    """Changed ALONE, so only GameModeChanged can carry it."""
+    from trcc.core.commands import SetGameMode
+    from trcc.ui.qtgui.panels.configuration_panel import ConfigurationPanel
+
+    panel = ConfigurationPanel(gui_app, _bus(gui_app))
+    qtbot.addWidget(panel)
+    _on_device(panel)
+    sent = _writes(panel)
+
+    gui_app.dispatch(SetGameMode(key=_KEY_Q3, enabled=True, threshold=40))
+
+    qtbot.waitUntil(lambda: (panel._game.currentData(),
+                             panel._game_threshold.value()) == (True, 40),
+                    timeout=2000)
+    assert sent == [], "showing it must not send it back"
+
+
+def test_a_background_change_reaches_other_windows(gui_app: App, qtbot) -> None:
+    """SetBackgroundMode / SetOverlayBackground published nothing, so no other
+    window could show the change.  Changed ALONE: any other event would make
+    the panel re-read everything and hide a missing publish."""
+    from trcc.core.commands import SetBackgroundMode, SetOverlayBackground
+    from trcc.ui.qtgui.panels.configuration_panel import ConfigurationPanel
+
+    panel = ConfigurationPanel(gui_app, _bus(gui_app))
+    qtbot.addWidget(panel)
+    _on_device(panel)
+
+    gui_app.dispatch(SetBackgroundMode(key=_KEY_Q3, mode="color"))
+    qtbot.waitUntil(lambda: panel._bg_mode.currentData() == "color", timeout=2000)
+    gui_app.dispatch(SetOverlayBackground(key=_KEY_Q3, color=(1, 2, 3)))
+    qtbot.waitUntil(lambda: panel._bg_color_label.text() == "#010203",
+                    timeout=2000)
+
+
+def test_the_display_panel_shows_and_sends_one_setting_at_a_time(
+    gui_app: App, qtbot,
+) -> None:
+    """Its Apply sent orientation AND brightness AND re-loaded the theme on
+    every press: 30% -> 100% and 180° -> 0° with nothing touched."""
+    from trcc.core.commands import SetBrightness
+    from trcc.ui.qtgui.panels.display_panel import DisplayPanel
+
+    _seed_non_defaults(gui_app)
+    panel = DisplayPanel(gui_app, _bus(gui_app))
+    qtbot.addWidget(panel)
+    sent = _writes(panel)
+    _on_device(panel)
+    panel._require_key = lambda: _KEY_Q3          # pyright: ignore[reportAttributeAccessIssue]
+    assert (panel._orientation.currentData(), panel._brightness.value()) == (180, 30)
+    assert sent == [], f"showing the App's state wrote {sent}"
+
+    panel._brightness.setValue(55)                # released at 55
+    assert sent == [SetBrightness(key=_KEY_Q3, percent=55)], sent
 
 
 def test_preview_panel_constructs(gui_app: App) -> None:
@@ -797,11 +1153,10 @@ def test_status_panel_records_events(gui_app: App) -> None:
 # =========================================================================
 
 
-def test_main_window_constructs_and_includes_panels(gui_app: App) -> None:
+def test_main_window_constructs_and_includes_panels(make_window, gui_app: App) -> None:
     """The top-level MainWindow constructs and embeds the three panels."""
-    from trcc.ui.qtgui.app import MainWindow
 
-    window = MainWindow(gui_app)
+    window = make_window(gui_app)
     assert window is not None
     assert window.windowTitle()           # non-empty title set
     # Status bar gets wired during init for platform info + events
@@ -832,6 +1187,7 @@ class _StubDevice:
         # window look broken when it reads what every real device has.
         self.profile = None
         self.handshake = None
+        self.needs_keepalive = False
 
     @property
     def is_led(self) -> bool:
@@ -856,111 +1212,97 @@ def _spy_on_dispatch(app: App) -> list[str]:
     return seen
 
 
-def test_main_window_restores_attached_lcds_at_startup(gui_app: App) -> None:
-    """The coldplug fleet is restored, and LED devices are skipped.
-
-    ``discover_and_connect()`` runs at ``app.py:355`` and the window is built
-    at ``:360``, so devices attached at startup NEVER emit a
-    ``DeviceConnected`` this window can hear.  Wiring only ``_on_connected``
-    would restore hotplugged devices and miss the common case entirely.
-
-    The LED skip matters because ``RestoreDeviceState`` on an LED resolves no
-    resolution, warns, and returns ``ok=False`` — noise for a device that has
-    no display state to restore.
-    """
-    from trcc.core.models import Wire
-    from trcc.ui.qtgui.app import MainWindow
-
-    lcd, led = _StubDevice(Wire.SCSI), _StubDevice(Wire.LED)
-    gui_app.devices[lcd.key] = lcd            # type: ignore[assignment]
-    gui_app.devices[led.key] = led            # type: ignore[assignment]
-    seen = _spy_on_dispatch(gui_app)
-
-    MainWindow(gui_app)
-
-    assert f"RestoreDeviceState:{lcd.key}" in seen, (
-        "the LCD attached before the window existed was never restored"
-    )
-    assert f"RestoreDeviceState:{led.key}" not in seen, (
-        "an LED has no display state to restore"
-    )
-
-
-def test_main_window_skips_a_disconnected_device(gui_app: App) -> None:
-    """A device in the registry but not connected is not restored."""
-    from trcc.core.models import Wire
-    from trcc.ui.qtgui.app import MainWindow
-
-    lcd = _StubDevice(Wire.SCSI, connected=False)
-    gui_app.devices[lcd.key] = lcd            # type: ignore[assignment]
-    seen = _spy_on_dispatch(gui_app)
-
-    MainWindow(gui_app)
-
-    assert f"RestoreDeviceState:{lcd.key}" not in seen
-
-
-def test_hotplugged_device_gets_the_same_restore(gui_app: App) -> None:
-    """The other half: a device that arrives later must not sit dark."""
+def test_the_window_restores_nothing_itself(make_window, gui_app: App) -> None:
+    """Loading the saved display is the SESSION's (``App._prime``), for every
+    UI.  qtgui restored its coldplug fleet in ``__init__`` and each hotplug in
+    ``_on_connected`` — a second loader, which on the hotplug thread raced the
+    session's for the same panel."""
     from trcc.core.events import DeviceConnected
     from trcc.core.models import Wire
-    from trcc.ui.qtgui.app import MainWindow
 
-    window = MainWindow(gui_app)                    # nothing attached yet
     lcd = _StubDevice(Wire.SCSI)
     gui_app.devices[lcd.key] = lcd            # type: ignore[assignment]
     seen = _spy_on_dispatch(gui_app)
 
+    window = make_window(gui_app)
     window._on_connected(DeviceConnected(key=lcd.key, resolution=(320, 320)))
 
-    assert f"RestoreDeviceState:{lcd.key}" in seen
+    assert not [s for s in seen if s.startswith("RestoreDeviceState:")]
 
 
-def test_restore_runs_after_the_bus_is_subscribed() -> None:
-    """Ordering trap, pinned structurally — because the invariant IS structural.
+def _record_dispatches(app: App, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Every Command name *app* is asked to run from here on, in order."""
+    sent: list[str] = []
+    real = app.dispatch
 
-    The restore loads a theme, which publishes ``ThemeLoaded``, which is what
-    starts the render ticker.  Called earlier in ``__init__`` the event fires
-    into an unconnected bus and nothing ever animates — a bug that presents as
-    "video just doesn't play" and points nowhere near its cause.
+    def _record(command: object) -> object:
+        sent.append(type(command).__name__)
+        return real(command)
 
-    Asserted over the AST of ``MainWindow.__init__`` rather than at runtime:
-    the subscriptions use ``Qt.QueuedConnection``, so a probe emit would not
-    deliver synchronously and could not tell a connected bus from a bare one.
+    monkeypatch.setattr(app, "dispatch", _record)
+    return sent
+
+
+def _with_a_theme(app: App) -> None:
+    """A connected panel showing a theme -- what the window's ticker drove."""
+    from pathlib import Path
+
+    from trcc.core.commands import SetRefreshInterval
+    from trcc.core.models import Theme, Wire
+
+    lcd = _StubDevice(Wire.SCSI)
+    app.devices[lcd.key] = lcd            # type: ignore[assignment]
+    app.active_themes[lcd.key] = Theme(
+        path=Path("/nonexistent/primed"), name="primed", resolution=(320, 320),
+        config={"elements": []},
+    )
+    assert app.dispatch(SetRefreshInterval(seconds=1.0)).ok   # the minimum
+
+
+def test_the_window_sends_nothing_to_the_panel(
+    make_window, gui_app: App, qtbot, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The App's MetricsLoop renders every panel; the window only shows.
+
+    qtgui ran its own RenderAndSend ticker beside it, so every frame went to
+    the panel twice (measured 2026-09-30: 5 -> 10 in 5 s at a 1 s refresh,
+    shown or hidden).  No session runs here, so any render is the window's.
     """
-    import ast
+    _with_a_theme(gui_app)
+    sent = _record_dispatches(gui_app, monkeypatch)
 
-    import trcc.ui.qtgui.app as qtgui_app
+    window = make_window(gui_app)
+    window.show()
+    qtbot.wait(2300)          # two ticks of the 1 s interval the ticker ran at
 
-    source = Path(qtgui_app.__file__).read_text(encoding="utf-8")
-    init = next(
-        node
-        for cls in ast.walk(ast.parse(source))
-        if isinstance(cls, ast.ClassDef) and cls.name == "MainWindow"
-        for node in cls.body
-        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
-    )
-
-    subscribe_lines, restore_lines = [], []
-    for node in ast.walk(init):
-        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
-            continue
-        if node.func.attr == "connect" and "_bus" in ast.dump(node.func):
-            subscribe_lines.append(node.lineno)
-        elif node.func.attr == "_restore_display_state":
-            restore_lines.append(node.lineno)
-
-    assert subscribe_lines, "no _bus.*.connect() found — test is measuring nothing"
-    assert restore_lines, "MainWindow.__init__ no longer restores display state"
-    assert min(restore_lines) > max(subscribe_lines), (
-        f"_restore_display_state() runs at line {min(restore_lines)}, before the "
-        f"last bus subscription at line {max(subscribe_lines)} — a restored "
-        f"theme would publish ThemeLoaded into an unconnected bus and the "
-        f"render ticker would never start"
-    )
+    assert not {"RenderAndSend", "TickDisplay"} & set(sent), sent
 
 
-def test_main_window_repairs_a_stale_autostart_entry(gui_app: App) -> None:
+def test_the_preview_renders_only_while_the_window_is_on_screen(
+    make_window, gui_app: App, qtbot, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Closing qtgui hides it to the tray; its preview kept rendering a full
+    frame every second for nobody (3 in 3 s, measured), and a window never
+    shown did the same -- which is what 8 leaked test windows did into later
+    tests.  It waits for a show, and stops at a hide."""
+    _with_a_theme(gui_app)
+    sent = _record_dispatches(gui_app, monkeypatch)
+
+    window = make_window(gui_app)
+    qtbot.wait(1300)
+    assert sent.count("BuildPreview") == 0, "rendered before it was ever shown"
+
+    window.show()
+    qtbot.waitUntil(lambda: sent.count("BuildPreview") >= 2, timeout=3000)
+
+    window.hide()
+    qtbot.wait(100)
+    after_hide = sent.count("BuildPreview")
+    qtbot.wait(1300)
+    assert sent.count("BuildPreview") == after_hide, "rendered while hidden"
+
+
+def test_main_window_repairs_a_stale_autostart_entry(make_window, gui_app: App) -> None:
     """qtgui was the ONE ui that could not reach ``RefreshAutostart``.
 
     Measured: cli, api and gui each had a dispatch site; qtgui had zero.  So a
@@ -970,19 +1312,18 @@ def test_main_window_repairs_a_stale_autostart_entry(gui_app: App) -> None:
     its own window's ``__init__``; this is that, the same Command.
     """
     from trcc.core.commands import EnableAutostart
-    from trcc.ui.qtgui.app import MainWindow
 
     mgr = gui_app.platform.autostart()
     gui_app.dispatch(EnableAutostart())
     mgr.command = "/moved/bin/trcc"               # the install moved
     assert mgr.installed_command != mgr.command, "fixture drift: not stale"
 
-    MainWindow(gui_app)
+    make_window(gui_app)
 
     assert mgr.installed_command == "/moved/bin/trcc"
 
 
-def test_main_window_does_not_enable_autostart(gui_app: App) -> None:
+def test_main_window_does_not_enable_autostart(make_window, gui_app: App) -> None:
     """...and must NOT pick up gui's first-launch auto-enable.
 
     That half is a documented product decision for gui alone —
@@ -991,13 +1332,43 @@ def test_main_window_does_not_enable_autostart(gui_app: App) -> None:
     behaviour it does not have."  Refresh repairs what the user already chose;
     enable would choose FOR them.  Pinned so the distinction cannot erode.
     """
-    from trcc.ui.qtgui.app import MainWindow
 
-    MainWindow(gui_app)
+    make_window(gui_app)
 
     assert not gui_app.platform.autostart().is_enabled(), (
         "opening the qtgui window opted the user into autostart"
     )
+
+
+def test_the_gui_enables_autostart_once_and_then_respects_off(
+    fake_platform: FakePlatform,
+) -> None:
+    """The regression: keyed on ``enabled``, the gui turned a user's "off"
+    back on at EVERY launch.  Each launch is a fresh App reading settings
+    back from disk, as a real relaunch is."""
+    from trcc.core.commands import DisableAutostart, GetAutostartStatus
+    from trcc.ui.gui.uc_about import ensure_autostart
+
+    assert ensure_autostart(App(fake_platform)) is True, "first launch enables"
+    App(fake_platform).dispatch(DisableAutostart())          # the user: off
+
+    relaunched = App(fake_platform)
+    assert ensure_autostart(relaunched) is False
+    assert relaunched.dispatch(GetAutostartStatus()).enabled is False, (
+        "the gui turned autostart back on after the user turned it off"
+    )
+
+
+def test_the_gui_respects_a_choice_made_in_another_ui_first(
+    fake_platform: FakePlatform,
+) -> None:
+    """Turned off from the CLI, API or qtgui before the gui ever ran."""
+    from trcc.core.commands import DisableAutostart
+    from trcc.ui.gui.uc_about import ensure_autostart
+
+    App(fake_platform).dispatch(DisableAutostart())
+
+    assert ensure_autostart(App(fake_platform)) is False
 
 
 # =========================================================================
@@ -1280,29 +1651,6 @@ def test_led_zone_tab_builds_rows_for_multi_zone(
     assert len(tab._zone_widgets) == 3
 
 
-def test_led_segment_tab_hides_when_no_segments(
-    gui_app: App, qapp: object,
-) -> None:
-    """SegmentTab shows its placeholder when segment_on is empty."""
-    from trcc.ui.qtgui.panels.led import SegmentTab
-
-    tab = SegmentTab(gui_app, _led_key)
-    tab.refresh_from(_snap(segment_on=()))
-    assert tab.has_visible_content() is False
-
-
-def test_led_segment_tab_builds_checks(gui_app: App, qapp: object) -> None:
-    """SegmentTab builds one checkbox per segment when populated."""
-    from trcc.ui.qtgui.panels.led import SegmentTab
-
-    tab = SegmentTab(gui_app, _led_key)
-    tab.refresh_from(_snap(segment_on=(True, False, True, True, False)))
-    assert tab.has_visible_content() is True
-    assert len(tab._checks) == 5
-    assert tab._checks[0].isChecked() is True
-    assert tab._checks[1].isChecked() is False
-
-
 def test_led_advanced_tab_refreshes_radio_state(
     gui_app: App, qapp: object,
 ) -> None:
@@ -1443,17 +1791,24 @@ def test_screencast_panel_constructs(gui_app: App, qapp: object) -> None:
     assert panel._stop_btn.isEnabled() is False
 
 
-def test_screencast_panel_start_without_region_is_a_no_op(
-    gui_app: App, qapp: object,
-) -> None:
-    """Start without a chosen region surfaces guidance, starts no cast."""
+def test_screencast_panel_start_casts_the_stored_region(cast_app: App) -> None:
+    """No region to choose first: the device has one (the theme's, or the
+    C#'s default), and Start casts it -- as every other UI's Start does."""
+    from trcc.core.commands import ConnectDevice, LcdSnapshot
     from trcc.ui.qtgui.panels.screencast_panel import ScreencastPanel
 
-    panel = ScreencastPanel(gui_app, _bus(gui_app))
+    resp = bytearray(0xE100)
+    resp[0] = 100                       # FBL=100 -> 320x320
+    cast_app.platform.scsi.read_script.append(bytes(resp))   # type: ignore[attr-defined]
+    assert cast_app.dispatch(ConnectDevice(key="0402:3922")).ok
+    panel = ScreencastPanel(cast_app, _bus(cast_app))
     panel._picker.set_key("0402:3922")
+
     panel._on_start()
-    assert panel._casting_key is None
-    assert "region" in panel._status.text().lower()
+
+    rect = cast_app.dispatch(LcdSnapshot(key="0402:3922")).screencast_rect
+    assert panel._casting is True, panel._status.text()
+    assert cast_app.settings.for_device("0402:3922").screencast_region == (*rect, False)
 
 
 def test_screencast_panel_start_without_key_is_a_no_op(
@@ -1463,23 +1818,60 @@ def test_screencast_panel_start_without_key_is_a_no_op(
     from trcc.ui.qtgui.panels.screencast_panel import ScreencastPanel
 
     panel = ScreencastPanel(gui_app, _bus(gui_app))
-    panel._region = (0, 0, 200, 100)
     panel._on_start()
-    assert panel._casting_key is None
+    assert panel._casting is False
     assert "device" in panel._status.text().lower()
 
 
-def test_screencast_panel_records_picked_region(
+def test_screencast_panel_stores_the_picked_region(cast_app: App) -> None:
+    """A drag is the device's region now -- fitted to the canvas (320x320
+    here) and stored in the App, where every UI and a save read it."""
+    from trcc.core.commands import LcdSnapshot
+
+    panel = _casting_panel(cast_app)
+    panel._on_region_selected(40, 60, 300, 240)
+
+    assert cast_app.dispatch(LcdSnapshot(key="0402:3922")).screencast_rect == (
+        40, 60, 300, 300)
+    assert tuple(panel._fields[a].value() for a in "xywh") == (40, 60, 300, 300)
+
+
+def test_screencast_panel_follows_another_uis_region(cast_app: App, qtbot) -> None:
+    from trcc.core.commands import SetScreencastRegion
+
+    panel = _casting_panel(cast_app)
+    qtbot.addWidget(panel)
+    cast_app.dispatch(SetScreencastRegion(key="0402:3922", x=9, y=8, w=64, h=64,
+                                          hide_border=False))
+
+    qtbot.waitUntil(
+        lambda: tuple(panel._fields[a].value() for a in "xywh") == (9, 8, 64, 64),
+        timeout=2000)
+    assert panel._hide_border.isChecked() is False
+
+
+def test_screencast_panel_without_a_device_stores_nothing(
     gui_app: App, qapp: object,
 ) -> None:
-    """Receiving region_selected updates the panel's region + label."""
     from trcc.ui.qtgui.panels.screencast_panel import ScreencastPanel
 
     panel = ScreencastPanel(gui_app, _bus(gui_app))
+    sent = _writes(panel)
     panel._on_region_selected(40, 60, 320, 240)
-    assert panel._region == (40, 60, 320, 240)
-    assert "320" in panel._region_label.text()
-    assert "240" in panel._region_label.text()
+
+    assert sent == []
+    assert "device" in panel._status.text().lower()
+
+
+def test_screencast_panel_hide_border_is_the_apps_flag(cast_app: App) -> None:
+    from trcc.core.commands import LcdSnapshot
+
+    panel = _casting_panel(cast_app)
+    assert panel._hide_border.isChecked() is True       # the C#'s default
+    panel._hide_border.setChecked(False)
+
+    snap = cast_app.dispatch(LcdSnapshot(key="0402:3922"))
+    assert (snap.screencast_rect, snap.screencast_hide_border) == ((0, 0, 200, 200), False)
 
 
 def test_screencast_build_frame_returns_bytes(gui_app: App) -> None:
@@ -1502,20 +1894,157 @@ def test_screencast_build_frame_returns_bytes(gui_app: App) -> None:
     del target_w, target_h
 
 
+@pytest.fixture
+def cast_app(fake_platform: FakePlatform, qapp: object) -> App:
+    """``gui_app`` with a SYNCHRONOUS send scheduler.
+
+    Not a style preference.  ``ConnectDevice`` registers the device with the
+    scheduler, and the default ``ThreadSendScheduler`` then publishes
+    ``FrameSent`` from its own thread — after the test has returned and Qt has
+    collected the ``BusBridge`` behind the subscription.  The bus prints
+    "EventBus handler failed for FrameSent / Signal source has been deleted"
+    for every late frame, which is noise that would sit on top of any REAL
+    failure in this file.  Measured: 0 such lines from the panels that never
+    connect, 1 from each that does.
+    """
+    del qapp                                # explicit dependency, no use
+    from trcc.adapters.infra.send_scheduler import SyncSendScheduler
+    from trcc.adapters.render.qt import QtRenderer
+
+    app = App(platform=fake_platform, renderer=QtRenderer(),
+              send_scheduler=SyncSendScheduler())
+    # And NEVER a real microphone: ``StartScreencast(audio=True)`` would open
+    # an ``sd.InputStream`` that outlives the test.  See ``FakeMic``.
+    app.audio = FakeMic()                   # type: ignore[assignment]
+    return app
+
+
+def _casting_panel(app: App):
+    """A ScreencastPanel over a CONNECTED device, region already chosen.
+
+    The panel's own guards return before dispatching without these two, so a
+    test that skips them asserts against a Command that was never built.
+    """
+    from trcc.core.commands import ConnectDevice
+    from trcc.ui.qtgui.panels.screencast_panel import ScreencastPanel
+
+    resp = bytearray(0xE100)
+    resp[0] = 100                       # FBL=100 -> 320x320
+    app.platform.scsi.read_script.append(bytes(resp))   # type: ignore[attr-defined]
+    assert app.dispatch(ConnectDevice(key="0402:3922")).ok
+
+    panel = ScreencastPanel(app, _bus(app))
+    panel._picker.set_key("0402:3922")
+    panel._on_region_selected(0, 0, 200, 100)
+    return panel
+
+
+def _persisted_audio(app: App) -> bool | None:
+    """The audio flag as the CAPTURE PATH reads it — region[4], not a spy."""
+    region = app.settings.for_device("0402:3922").screencast_region
+    return None if region is None else region[4]
+
+
+def test_screencast_audio_checkbox_reaches_the_command(cast_app: App) -> None:
+    """qtgui was the last face that could not set ``StartScreencast.audio``.
+
+    gui has a mic button, the CLI has ``--audio``, the API has ``body.audio``,
+    and ``grep -ri audio src/trcc/ui/qtgui/`` returned ZERO lines — so the
+    field took its ``False`` default forever.  Asserted on the PERSISTED
+    truth, which is what the capture path actually reads, not on the Command
+    object: a kwarg that reaches a dataclass and no further is the shape
+    ``test_command_field_reach`` already covers structurally.
+    """
+    panel = _casting_panel(cast_app)
+    panel._audio.setChecked(True)
+    panel._on_start()
+
+    assert panel._casting is True, panel._status.text()
+    assert _persisted_audio(cast_app) is True
+
+
+def test_screencast_audio_unchecked_stays_off(cast_app: App) -> None:
+    """The default, pinned — so the checkbox proves it is the thing deciding."""
+    panel = _casting_panel(cast_app)
+    assert panel._audio.isChecked() is False
+    panel._on_start()
+
+    assert panel._casting is True, panel._status.text()
+    assert _persisted_audio(cast_app) is False
+
+
+def test_screencast_audio_toggles_mid_cast(cast_app: App) -> None:
+    """Toggling mid-cast re-issues the session, exactly as the FPS slider
+    re-registers the driver — the flag lives in ``screencast_region``, so
+    there is no second piece of state to keep in step."""
+    panel = _casting_panel(cast_app)
+    panel._on_start()
+    assert _persisted_audio(cast_app) is False
+
+    panel._audio.setChecked(True)           # fires toggled -> re-issue
+    assert _persisted_audio(cast_app) is True
+
+    panel._audio.setChecked(False)
+    assert _persisted_audio(cast_app) is False
+
+
+def test_screencast_audio_off_session_does_not_dispatch(
+    gui_app: App, qapp: object,
+) -> None:
+    """With no live cast the checkbox is just a checkbox — it must not
+    persist a region for a device that is not casting."""
+    from trcc.ui.qtgui.panels.screencast_panel import ScreencastPanel
+
+    panel = ScreencastPanel(gui_app, _bus(gui_app))
+    panel._audio.setChecked(True)
+    assert panel._casting is False
+    assert _persisted_audio(gui_app) is None
+
+
 def test_region_overlay_constructs(qapp: object) -> None:
     """RegionSelectOverlay constructs without raising — no screen grab yet."""
-    from trcc.ui.qtgui.region_overlay import RegionSelectOverlay
+    from trcc.ui.screen_overlay import RegionSelectOverlay
 
     overlay = RegionSelectOverlay()
     assert hasattr(overlay, "region_selected")
     assert hasattr(overlay, "cancelled")
 
 
+def test_a_picked_region_is_in_global_desktop_coordinates(
+    qapp: object, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The overlay covers the primary screen and counts from ITS corner.
+
+    Every capture backend takes global desktop coordinates, so a primary
+    screen right of another monitor cast the wrong area.
+    MUTATION CHECK: emit ``sel.x()`` without the origin → this fails.
+    """
+    from PySide6.QtCore import QRect
+    from PySide6.QtWidgets import QApplication
+
+    from trcc.ui.screen_overlay import RegionSelectOverlay
+
+    class _Screen:
+        def geometry(self) -> QRect:
+            return QRect(1920, 120, 2560, 1440)
+
+    monkeypatch.setattr(QApplication, "primaryScreen", staticmethod(_Screen))
+    overlay = RegionSelectOverlay()
+    got: list[tuple[int, int, int, int]] = []
+    overlay.region_selected.connect(lambda *r: got.append(r))
+
+    overlay._confirm(QRect(10, 20, 300, 200))
+
+    assert got == [(1930, 140, 300, 200)]
+
+
 # =========================================================================
 # Drag-select overlays — ONE interaction, proven on BOTH skins
 #
-# gui's ``ScreenCaptureOverlay`` and qtgui's ``RegionSelectOverlay`` are the
-# same press-drag-release behaviour; it lives once, in ``DragSelectOverlay``.
+# The press-drag-release behaviour lives once, in ``DragSelectOverlay``; its
+# one subclass now is the shared ``RegionSelectOverlay`` (gui's
+# ``ScreenCaptureOverlay`` was reachable from no button and was deleted
+# 2026-10-01).
 # Before that it was written twice and NOTHING drove it, which is how the two
 # copies came to disagree on their own constants (``_MIN_SELECTION`` vs
 # ``_MIN_EDGE``, same value) and their control flow.  These tests are
@@ -1527,8 +2056,7 @@ def test_region_overlay_constructs(qapp: object) -> None:
 #: never at decorator time: importing a Qt widget module during collection
 #: runs its class bodies before ``QApplication`` exists.
 _DRAG_SKINS = {
-    "gui": ("trcc.ui.gui.screen_capture", "ScreenCaptureOverlay"),
-    "qtgui": ("trcc.ui.qtgui.region_overlay", "RegionSelectOverlay"),
+    "shared": ("trcc.ui.screen_overlay", "RegionSelectOverlay"),
 }
 
 
@@ -1687,59 +2215,6 @@ def test_drag_select_right_click_cancels(skin: str, qtbot) -> None:
     assert cancelled == [True]
 
 
-@pytest.mark.parametrize("gesture", sorted(_DIAGONALS))
-def test_screen_capture_crops_the_pixels_that_were_dragged_over(
-    gesture: str, qtbot,
-) -> None:
-    """The gui skin emits the SOURCE pixels inside the rectangle, not just
-    a pixmap of the right size.
-
-    Every pixel of the stand-in screenshot encodes its own coordinates, so
-    the crop names its own provenance: read a corner back and it says which
-    screen pixel it came from.  Sizes alone would pass even if the crop were
-    taken from the wrong origin.
-    """
-    from PySide6.QtGui import QImage, QPixmap
-
-    from trcc.ui.gui.screen_capture import ScreenCaptureOverlay
-
-    width, height = 64, 48
-    shot = QImage(width, height, QImage.Format.Format_RGB32)
-    for y in range(height):
-        for x in range(width):
-            shot.setPixel(x, y, (0xFF << 24) | (x << 16) | (y << 8))
-
-    (x0, y0), (x1, y1) = _DIAGONALS[gesture]
-    # Scale the shared diagonals down into this small stand-in screen.
-    x0, x1, y0, y1 = x0 // 10, x1 // 10, y0 // 10, y1 // 10
-
-    got: list[object] = []
-    overlay = ScreenCaptureOverlay()
-    qtbot.addWidget(overlay)
-    overlay._screenshot = QPixmap.fromImage(shot)
-    overlay.captured.connect(got.append)
-
-    _press(overlay, x0, y0)
-    _move_to(overlay, x1, y1)
-    _release(overlay, x1, y1)
-
-    assert len(got) == 1 and got[0] is not None
-    cropped = got[0].toImage()          # type: ignore[attr-defined]
-    left, right = sorted((x0, x1))
-    top, bottom = sorted((y0, y1))
-    assert (cropped.width(), cropped.height()) == (right - left + 1,
-                                                   bottom - top + 1)
-    for corner_x, corner_y, want in (
-        (0, 0, (left, top)),
-        (cropped.width() - 1, cropped.height() - 1, (right, bottom)),
-    ):
-        colour = cropped.pixelColor(corner_x, corner_y)
-        assert (colour.red(), colour.green()) == want, (
-            f"{gesture}: crop corner ({corner_x}, {corner_y}) came from screen "
-            f"pixel {(colour.red(), colour.green())}, expected {want}"
-        )
-
-
 def test_both_skins_share_one_drag_implementation() -> None:
     """Neither skin may re-implement the interaction it inherits.
 
@@ -1836,6 +2311,7 @@ def test_uc_device_spec_matches_the_layout_table() -> None:
     expected = {
         "sensor_btn": Layout.SENSOR_BTN,
         "about_btn": Layout.ABOUT_BTN,
+        "rgb_btn": Layout.RGB_BTN,
         "no_devices_label": Layout.NO_DEVICES_LABEL,
         "hint_label": Layout.HINT_LABEL,
     }
@@ -2001,7 +2477,7 @@ def test_screencast_plus_button_keeps_the_region_on_aspect(
     scp = ScreenCastPanel()
     qtbot.addWidget(scp)
     scp.set_resolution(width, height)
-    scp.screencast_params_changed.connect(
+    scp.region_edited.connect(
         lambda x, y, w, h: emitted.append((x, y, w, h)),
     )
     scp.set_values(x=100, y=100, w=200, h=round(200 * height / width))
@@ -2017,24 +2493,72 @@ def test_screencast_plus_button_keeps_the_region_on_aspect(
 def test_screencast_does_not_lock_before_a_device_is_known(qtbot) -> None:
     """With no resolution set the lock stays out of the way.
 
-    ``_get_aspect_ratio`` returns 0.0 rather than a plausible default, so a
-    width typed before any device is attached does not silently write a
-    height computed from somebody else's panel.
+    A width typed before any device is attached must not silently write a
+    height computed from somebody else's panel.  The decision is
+    ``lock_region_to_panel``'s (``None`` = nobody has told us yet), shared
+    with qtgui; this panel used to keep its own ratio method for it.
     """
     from trcc.ui.gui.display_mode_panels import ScreenCastPanel
 
     scp = ScreenCastPanel()
     qtbot.addWidget(scp)
-    # None, the same word ``DeviceStateResult.resolution`` uses for it — not a
-    # 0.0 sentinel the panel invented, and not a plausible default ratio.
-    assert scp._get_aspect_ratio() is None
     scp.entry_w.setText("200")
     assert scp.entry_h.text() == "0"      # untouched, not invented
 
     # A device that answers nonsense is the THIRD state and is not the same
     # as never having asked: it warns, and still declines to lock.
     scp.set_resolution(0, 0)
-    assert scp._get_aspect_ratio() is None
+    scp.entry_w.setText("300")
+    assert scp.entry_h.text() == "0"
+
+
+def test_screencast_region_is_sent_when_finished_not_per_keystroke(qtbot) -> None:
+    """Typing "320" is not three regions; Enter or focus leaving sends one,
+    and a focus change with nothing edited sends none."""
+    from trcc.ui.gui.display_mode_panels import ScreenCastPanel
+
+    emitted: list[tuple[int, int, int, int]] = []
+    scp = ScreenCastPanel()
+    qtbot.addWidget(scp)
+    scp.set_values(x=0, y=0, w=320, h=240)
+    scp.region_edited.connect(lambda *r: emitted.append(r))
+
+    for typed in ("1", "12", "123"):
+        scp.entry_x.setText(typed)
+    assert emitted == []
+    scp.entry_x.editingFinished.emit()
+    scp.entry_x.editingFinished.emit()          # focus moved, no new edit
+
+    assert emitted == [(123, 0, 320, 240)]
+
+
+def test_showing_a_region_is_not_an_edit(qtbot) -> None:
+    from trcc.ui.gui.display_mode_panels import ScreenCastPanel
+
+    emitted: list[tuple[int, ...]] = []
+    scp = ScreenCastPanel()
+    qtbot.addWidget(scp)
+    scp.region_edited.connect(lambda *r: emitted.append(r))
+
+    scp.set_values(x=5, y=6, w=320, h=240)
+    scp.entry_w.editingFinished.emit()
+
+    assert emitted == []
+
+
+def test_the_border_button_toggles_hide_and_showing_it_sends_nothing(qtbot) -> None:
+    """The C#'s myYcbk starts True (hidden); a click flips it."""
+    from trcc.ui.gui.display_mode_panels import ScreenCastPanel
+
+    toggled: list[bool] = []
+    scp = ScreenCastPanel()
+    qtbot.addWidget(scp)
+    scp.border_toggled.connect(toggled.append)
+
+    scp.set_hide_border(False)
+    scp.border_btn.click()
+
+    assert toggled == [True]
 
 
 # =========================================================================
@@ -2042,20 +2566,20 @@ def test_screencast_does_not_lock_before_a_device_is_known(qtbot) -> None:
 # =========================================================================
 
 
-def _apply_slideshow(gui_app: App, qtbot, *, enabled: bool) -> list[str]:
-    """Drive the real panel's Apply and report the Commands it dispatched.
-
-    A behaviour gate, not a construction one: ``SetSlideshow`` persists the
-    flag and resets the clock but starts NO driver, so a panel that dispatches
-    only that saves a slideshow which reports itself enabled and never
-    switches a theme.  Nothing structural can see that -- the panel builds,
-    the Command succeeds, the setting reads back correctly.
-    """
+def _slideshow_panel(gui_app: App, qtbot):
     from trcc.ui.qtgui.panels.configuration_panel import ConfigurationPanel
 
     panel = ConfigurationPanel(gui_app, _bus(gui_app))
     qtbot.addWidget(panel)                    # unparented top-levels leak
+    panel._key = lambda: "0402:3922"          # pyright: ignore[reportAttributeAccessIssue]
+    panel._picker.current_key = lambda: "0402:3922"   # pyright: ignore[reportAttributeAccessIssue]
+    return panel
 
+
+def test_the_slideshow_switch_is_one_command(gui_app: App, qtbot) -> None:
+    """The switch sends ``SetSlideshow`` alone -- it is what rotates, so the
+    panel pairs no driver Command by hand -- and Save sends the list alone."""
+    panel = _slideshow_panel(gui_app, qtbot)
     sent: list[str] = []
     real = panel.dispatch
 
@@ -2064,31 +2588,32 @@ def _apply_slideshow(gui_app: App, qtbot, *, enabled: bool) -> list[str]:
         return real(cmd)
 
     panel.dispatch = spy                      # pyright: ignore[reportAttributeAccessIssue]
-    panel._key = lambda: "0402:3922"          # pyright: ignore[reportAttributeAccessIssue]
-    idx = panel._slideshow_enabled.findData(enabled)
-    panel._slideshow_enabled.setCurrentIndex(idx)
-    panel._apply()
-    return sent
+    on = panel._slideshow_enabled.findData(True)
+    panel._slideshow_enabled.setCurrentIndex(on)
+    panel._slideshow_enabled.activated.emit(on)          # the user's pick
+    assert sent == ["SetSlideshow"], sent
+
+    sent.clear()
+    panel._slideshow_themes.setPlainText("A\nB")
+    panel._slideshow_save.click()
+    assert sent == ["ConfigureSlideshow"], sent
 
 
-def test_enabling_the_slideshow_starts_the_driver(gui_app: App, qtbot) -> None:
-    sent = _apply_slideshow(gui_app, qtbot, enabled=True)
+def test_the_slideshow_controls_follow_another_ui(gui_app: App, qtbot) -> None:
+    """Switched on from the CLI, or off by the App when another source took
+    the panel: the controls show it without a "Load" click.
 
-    assert "SetSlideshow" in sent, "the panel stopped persisting the flag"
-    assert "StartSlideshowDriver" in sent, (
-        "the slideshow was enabled but nothing was asked to rotate it — this "
-        "is the bug cli and api already fixed (services/slideshow_driver)"
-    )
-    assert "StopSlideshowDriver" not in sent
+    MUTATION CHECK: drop the ``slideshow_changed`` connection.
+    """
+    from trcc.core.events import SlideshowChanged
 
+    panel = _slideshow_panel(gui_app, qtbot)
+    gui_app.events.publish(SlideshowChanged(
+        key="0402:3922", enabled=True, interval_s=42.0, themes=("A", "B")))
+    qtbot.waitUntil(lambda: panel._slideshow_enabled.currentData() is True)
 
-def test_disabling_the_slideshow_stops_the_driver(gui_app: App, qtbot) -> None:
-    sent = _apply_slideshow(gui_app, qtbot, enabled=False)
-
-    assert "StopSlideshowDriver" in sent, (
-        "turning the slideshow off left the driver rotating"
-    )
-    assert "StartSlideshowDriver" not in sent
+    assert panel._slideshow_interval.value() == 42.0
+    assert panel._slideshow_themes.toPlainText() == "A\nB"
 
 
 # =========================================================================
@@ -2163,83 +2688,26 @@ def test_toggling_hdd_persists_it(gui_app: App, qtbot) -> None:
     assert gui_app.settings.app.hdd_enabled is box._hdd_check.isChecked()
 
 
-def _drive_upgrade(gui_app: App, qtbot, monkeypatch, *, confirm: bool):
-    """Press Upgrade with the confirmation answered *confirm*.
+def test_the_upgrade_button_shows_the_command_and_runs_nothing(
+    gui_app: App, qtbot, monkeypatch,
+) -> None:
+    """It confirmed, then ran the package manager as root -- which upgraded
+    everything but TRCC.  It now shows the command for this install, and the
+    label (rich text, for release links) escapes the command's ``&&``."""
+    import subprocess
 
-    ``hasattr(box, "_upgrade_btn")`` was the first version of this and it is
-    worthless: it proves a button exists, not that the button is safe.  The
-    safety-critical behaviour is that NOTHING runs until the user agrees --
-    ``RunUpgrade(dry_run=False)`` spawns a package-manager subprocess under
-    sudo.
-    """
-    from PySide6.QtWidgets import QMessageBox
+    def no_spawn(*a, **k):
+        raise AssertionError("the upgrade button spawned a process")
 
+    monkeypatch.setattr(subprocess, "run", no_spawn)
+    monkeypatch.setattr(gui_app.platform, "upgrade_hint",
+                        lambda: "wget -O /tmp/x URL && sudo pacman -U /tmp/x")
     box = _maintenance_box(gui_app, qtbot)
-    # A host with no package manager makes the DRY RUN fail, and the box
-    # correctly bails before confirming -- which is right, and would leave the
-    # confirm path untested everywhere.  Give it a manager so the gate can
-    # reach the branch it exists to guard.
-    monkeypatch.setattr(gui_app.diagnostics, "package_manager",
-                        lambda: "pacman")
-    monkeypatch.setattr(gui_app.platform, "upgrade_command",
-                        lambda: ["true", "-upgrade"])
-    answer = (QMessageBox.StandardButton.Yes if confirm
-              else QMessageBox.StandardButton.No)
-    monkeypatch.setattr(QMessageBox, "question",
-                        staticmethod(lambda *a, **k: answer))
-    sent: list[bool] = []
-    real = box.dispatch
 
-    def spy(cmd):
-        if type(cmd).__name__ == "RunUpgrade":
-            sent.append(cmd.dry_run)
-        return real(cmd)
-
-    box.dispatch = spy                        # pyright: ignore[reportAttributeAccessIssue]
     box._on_upgrade()
-    return sent
 
-
-def test_declining_the_upgrade_runs_nothing(
-    gui_app: App, qtbot, monkeypatch,
-) -> None:
-    sent = _drive_upgrade(gui_app, qtbot, monkeypatch, confirm=False)
-
-    assert sent == [True], (
-        "saying No must leave ONLY the dry run — a False in this list is a "
-        f"sudo subprocess the user declined, got {sent}"
-    )
-
-
-def test_confirming_the_upgrade_runs_it(
-    gui_app: App, qtbot, monkeypatch,
-) -> None:
-    sent = _drive_upgrade(gui_app, qtbot, monkeypatch, confirm=True)
-
-    assert sent == [True, False], (
-        f"expected a dry run, then the real one; got {sent}"
-    )
-
-
-def test_the_confirmation_quotes_the_command_that_will_run(
-    gui_app: App, qtbot,
-) -> None:
-    """The dialog must show the REAL argv, not a UI's guess at it.
-
-    ``RunUpgrade(dry_run=True)`` exists for exactly this: it returns
-    ``message="Would run: ..."`` plus the ``command`` list, so the text the
-    user approves is the text the Command would execute.
-    """
-    box = _maintenance_box(gui_app, qtbot)
-    from trcc.core.commands import RunUpgrade
-
-    preview = box.dispatch(RunUpgrade(dry_run=True))
-
-    if preview.ok:
-        assert preview.command, "dry run reported ok with no command to show"
-        assert " ".join(preview.command) in preview.message
-    else:
-        assert preview.message, "a refusal must say why, it is shown to the user"
+    assert "To upgrade TRCC" in box._status.text()
+    assert "&amp;&amp; sudo pacman -U" in box._status.text()
 
 
 def test_the_date_format_reaches_the_bus(gui_app: App, qtbot) -> None:
@@ -2255,20 +2723,22 @@ def test_the_date_format_reaches_the_bus(gui_app: App, qtbot) -> None:
 
     panel = ConfigurationPanel(gui_app, _bus(gui_app))
     qtbot.addWidget(panel)
-    panel._date.setCurrentText("dd.MM.yyyy")
+    panel._picker.current_key = lambda: "0402:3922"   # pyright: ignore[reportAttributeAccessIssue]
 
-    sent: list[tuple[str, str]] = []
+    sent: list[tuple[str, str, str | None]] = []
     real = panel.dispatch
 
     def spy(cmd):
         if type(cmd).__name__ == "SetDateFormat":
-            sent.append((type(cmd).__name__, cmd.fmt))
+            sent.append((type(cmd).__name__, cmd.fmt, cmd.key))
         return real(cmd)
 
     panel.dispatch = spy                      # pyright: ignore[reportAttributeAccessIssue]
-    panel._apply_app_settings()
+    panel._date.setCurrentText("dd.MM.yyyy")
+    panel._date.lineEdit().editingFinished.emit()        # the user is done
+    panel._date.lineEdit().editingFinished.emit()        # a focus change
 
-    assert sent == [("SetDateFormat", "dd.MM.yyyy")], (
+    assert sent == [("SetDateFormat", "dd.MM.yyyy", "0402:3922")], (
         f"the typed pattern did not reach the bus intact: {sent}"
     )
 
@@ -2299,17 +2769,28 @@ def test_the_carousel_says_which_zones_it_visits(gui_app: App, qtbot) -> None:
     assert [b.isChecked() for b in tab._participation_checks] == [True, False, True]
 
 
-def test_an_unconfigured_mask_shows_every_zone_participating(
-    gui_app: App, qtbot,
+@pytest.mark.parametrize(("mask", "shown"), [
+    ((), [True, False, False]),                 # never configured
+    ((False, True), [False, True, False]),      # shorter than the zones
+    ((False, False, False), [True, False, False]),
+])
+def test_the_participation_boxes_show_the_zones_the_app_uses(
+    gui_app: App, qtbot, mask: tuple, shown: list,
 ) -> None:
-    """An EMPTY mask is the state that silently disables the carousel.
+    """A missing entry is off, and with none on the App uses zone 0 -- for
+    edits (``_edit_zones``) and for the carousel (``next_sync_zone`` returns 0
+    for an empty mask, so it never cycles).  The C# starts the same way
+    (``LunBo1`` only); the gui shows the same.
 
-    Rendering it as "nothing selected" would be accurate about the bytes and a
-    lie about the behaviour the switch above promises.
+    This used to show an empty mask as EVERY zone participating, promising a
+    carousel the App does not run.
+
+    MUTATION CHECK -- MEASURED 2026-10-02: restore the old line (a missing
+    entry shows ON, an all-off mask shows nothing) → all three cases fail.
     """
-    tab = _zone_tab_with(gui_app, qtbot, zones=3, mask=())
+    tab = _zone_tab_with(gui_app, qtbot, zones=3, mask=mask)
 
-    assert all(b.isChecked() for b in tab._participation_checks)
+    assert [b.isChecked() for b in tab._participation_checks] == shown
 
 
 def test_toggling_participation_sends_the_whole_mask(gui_app: App, qtbot) -> None:
@@ -2343,7 +2824,7 @@ def _display_panel(gui_app: App, qtbot):
     return panel
 
 
-def _stub_status(panel, *, cursor, frame_count):
+def _stub_status(panel, *, cursor, frame_count, fps=30):
     from trcc.core.results import VideoStatusResult
 
     real = panel.dispatch
@@ -2355,12 +2836,34 @@ def _stub_status(panel, *, cursor, frame_count):
         if name == "VideoStatus":
             return VideoStatusResult(
                 ok=True, key="0402:3922", playing=True,
-                cursor=cursor, frame_count=frame_count,
+                cursor=cursor, frame_count=frame_count, fps=fps,
             )
         return real(cmd)
 
     panel.dispatch = spy                       # pyright: ignore[reportAttributeAccessIssue]
     return sent
+
+
+def test_a_video_stopped_elsewhere_disables_the_scrubber(gui_app: App, qtbot) -> None:
+    """The slider followed frame advances only, so a video stopped from any
+    UI left it live at its last frame.  Start and stop are followed now, for
+    the selected device and no other."""
+    from trcc.core.events import VideoStarted, VideoStopped
+
+    panel = _display_panel(gui_app, qtbot)
+    panel._picker.current_key = lambda: "0402:3922"  # pyright: ignore[reportAttributeAccessIssue]
+    _stub_status(panel, cursor=4, frame_count=30)
+    gui_app.events.publish(VideoStarted(key="0402:3922", path="/v.mp4",
+                                        interval_ms=33, frame_count=30))
+    qtbot.waitUntil(panel._seek.isEnabled, timeout=1000)
+
+    _stub_status(panel, cursor=0, frame_count=0)       # no playback any more
+    gui_app.events.publish(VideoStopped(key="87ad:70db"))   # another device
+    qtbot.wait(100)
+    assert panel._seek.isEnabled(), "another device's stop reached this one"
+
+    gui_app.events.publish(VideoStopped(key="0402:3922"))
+    qtbot.waitUntil(lambda: not panel._seek.isEnabled(), timeout=1000)
 
 
 def test_no_playback_disables_the_scrubber(gui_app: App, qtbot) -> None:
@@ -2388,7 +2891,20 @@ def test_the_scrubber_shows_the_position(gui_app: App, qtbot) -> None:
     assert panel._seek.isEnabled() is True
     assert panel._seek.value() == 42
     assert panel._seek.maximum() == 299          # 0-based cursor
-    assert panel._seek_label.text() == "43 / 300"
+    assert panel._seek_label.text() == "00:00:01.400/00:00:10.000"   # 42 @ 30 fps
+
+
+def test_dragging_the_scrubber_moves_only_the_label(gui_app: App, qtbot) -> None:
+    """As the C# player's MouseMove: the label shows where a release lands."""
+    panel = _display_panel(gui_app, qtbot)
+    sent = _stub_status(panel, cursor=42, frame_count=300)
+    panel._refresh_video_status()
+    sent.clear()
+
+    panel._seek.sliderMoved.emit(90)
+
+    assert panel._seek_label.text() == "00:00:03.000/00:00:10.000"
+    assert [type(c).__name__ for c in sent] == [], "a drag dispatched something"
 
 
 def test_releasing_the_scrubber_seeks(gui_app: App, qtbot) -> None:
@@ -2396,10 +2912,11 @@ def test_releasing_the_scrubber_seeks(gui_app: App, qtbot) -> None:
     panel = _display_panel(gui_app, qtbot)
     sent = _stub_status(panel, cursor=10, frame_count=300)
     panel._refresh_video_status()
+    panel._seek.setSliderDown(True)          # a drag holds the handle
     panel._seek.setValue(120)
     sent.clear()
 
-    panel._on_seek_released()
+    panel._seek.setSliderDown(False)         # Qt emits sliderReleased
 
     seeks = [c for c in sent if type(c).__name__ == "SeekVideo"]
     assert len(seeks) == 1, f"expected exactly one seek, got {len(seeks)}"
@@ -2528,18 +3045,165 @@ def test_an_unbound_row_says_so(gui_app: App, qtbot) -> None:
         category_id=0, name="Test",
         sensors=[SensorBinding(label="Row", sensor_id="", unit="")],
     )]
-    # redraw from the working layout
-    real = box.dispatch
-    from trcc.core.results import SensorDashboardResult
-
-    box.dispatch = lambda cmd: (                   # pyright: ignore[reportAttributeAccessIssue]
-        SensorDashboardResult(ok=True, panels=tuple(box._panels))
-        if type(cmd).__name__ == "GetSensorDashboard" else real(cmd))
-    box.refresh()
+    box._redraw()        # draw the WORKING layout — no bus round-trip
 
     child = box._tree.topLevelItem(0).child(0)     # pyright: ignore[reportOptionalMemberAccess]
     assert child is not None
     assert "unbound" in child.text(1)
+
+
+def _select_panel_header(box, index: int) -> None:
+    box._tree.setCurrentItem(box._tree.topLevelItem(index))
+
+
+def _select_row(box, panel: int, row: int) -> None:
+    box._tree.setCurrentItem(box._tree.topLevelItem(panel).child(row))
+
+
+def test_a_new_panel_is_the_models_definition_of_one(gui_app: App, qtbot) -> None:
+    """The ONE policy, pinned — not gui's literal and not qtgui's.
+
+    "A new panel is category 0, named Custom, with four unbound rows" is
+    domain policy.  It lived as a literal in ``ui/gui/uc_system_info.py``
+    while gui was the only face that could add one; this asserts the faces
+    now agree because they call the same factory, not because two literals
+    happen to match today.
+    """
+    from trcc.core.models import PanelConfig
+
+    box = _dashboard_box(gui_app, qtbot)
+    before = len(box._panels)
+    box._on_add_panel()
+
+    added = box._panels[-1]
+    assert len(box._panels) == before + 1
+    assert added == PanelConfig.custom()
+    assert added.category_id == PanelConfig.CUSTOM_CATEGORY
+    assert [b.label for b in added.sensors] == [
+        "Sensor 1", "Sensor 2", "Sensor 3", "Sensor 4",
+    ]
+    assert all(b.sensor_id == "" for b in added.sensors)
+
+
+def test_adding_a_panel_shows_it_without_persisting_it(
+    gui_app: App, qtbot,
+) -> None:
+    """Visible immediately, saved only on Save — the same contract as a bind.
+
+    This is why ``refresh`` was split: it re-reads the bus, so using it to
+    show the new panel would discard the very edit being drawn.
+    """
+    from trcc.core.commands import GetSensorDashboard
+
+    box = _dashboard_box(gui_app, qtbot)
+    persisted_before = len(gui_app.dispatch(GetSensorDashboard()).panels)
+
+    box._on_add_panel()
+
+    assert box._tree.topLevelItemCount() == len(box._panels)
+    assert box._tree.topLevelItem(len(box._panels) - 1).text(0) == "Custom"
+    assert len(gui_app.dispatch(GetSensorDashboard()).panels) == persisted_before
+    assert "unsaved" in box._status.text()
+
+    box._on_save()
+    assert len(gui_app.dispatch(GetSensorDashboard()).panels) == persisted_before + 1
+
+
+def test_deleting_resolves_a_selected_ROW_to_its_panel(
+    gui_app: App, qtbot,
+) -> None:
+    """Select a row, delete the panel it belongs to.
+
+    Requiring the header to be selected would be a second rule to learn.
+    Selecting a ROW is the case that distinguishes ``_selected_panel`` from
+    ``_selected_binding``; a test that selected the header would pass against
+    either.
+    """
+    box = _dashboard_box(gui_app, qtbot)
+    box._on_add_panel()
+    target = len(box._panels) - 1
+    _select_row(box, target, 2)
+
+    assert box._selected_binding() == (target, 2)
+    assert box._selected_panel() == target
+
+    box._on_delete_panel()
+    assert len(box._panels) == target
+    assert "Custom" not in [p.name for p in box._panels]
+
+
+def test_deleting_the_last_panel_is_refused(gui_app: App, qtbot) -> None:
+    """``SetSensorDashboard`` refuses an empty layout — say so before saving.
+
+    An empty layout makes the next read fall back to defaults: a wipe dressed
+    up as a write.  Surfacing it at delete time beats a refusal at save time,
+    by which point the user has lost the panel from the tree.
+    """
+    box = _dashboard_box(gui_app, qtbot)
+    box._panels = box._panels[:1]
+    box._redraw()
+    # _redraw CLEARS the selection, so without this the "nothing selected"
+    # branch fires first and the guard goes untested — it did, once.
+    _select_panel_header(box, 0)
+    assert box._selected_panel() == 0
+
+    box._on_delete_panel()
+
+    assert len(box._panels) == 1
+    assert "last panel" in box._status.text()
+
+
+def test_renaming_a_panel_takes_the_dialogs_answer(
+    gui_app: App, qtbot, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """And a cancel or a blank name changes nothing."""
+    from trcc.ui.qtgui.panels.system import dashboard_box as mod
+
+    box = _dashboard_box(gui_app, qtbot)
+
+    def rename_with(value: str, ok: bool) -> None:
+        """Answer the dialog with *value* and re-select FIRST.
+
+        A successful rename calls ``_redraw``, which clears the tree and with
+        it the selection — so without re-selecting, every attempt after the
+        first returns early on "nothing selected" and the cancel/blank guards
+        below assert nothing.  They did: mutation D (dropping ``not ok or``)
+        passed against the first version of this test.
+        """
+        _select_panel_header(box, 0)
+        assert box._selected_panel() == 0
+        monkeypatch.setattr(mod.QInputDialog, "getText",
+                            staticmethod(lambda *a, **k: (value, ok)))
+        box._on_rename_panel()
+
+    rename_with("  Water loop  ", True)     # accepted, and stripped
+    assert box._panels[0].name == "Water loop"
+    assert box._tree.topLevelItem(0).text(0) == "Water loop"
+
+    rename_with("Discarded", False)         # cancelled — ok=False
+    assert box._panels[0].name == "Water loop"
+
+    rename_with("   ", True)                # accepted but blank
+    assert box._panels[0].name == "Water loop"
+
+
+def test_panel_verbs_refuse_politely_with_no_selection(
+    gui_app: App, qtbot,
+) -> None:
+    """No selection is a message, never a crash or a silent no-op."""
+    box = _dashboard_box(gui_app, qtbot)
+    box._tree.clearSelection()
+    box._tree.setCurrentItem(None)
+    assert box._selected_panel() is None
+
+    before = [p.name for p in box._panels]
+    box._on_delete_panel()
+    assert box._panels == box._panels and [p.name for p in box._panels] == before
+    assert "Select a panel" in box._status.text()
+
+    box._on_rename_panel()
+    assert [p.name for p in box._panels] == before
+    assert "Select a panel" in box._status.text()
 
 
 def test_saving_sends_the_whole_layout(gui_app: App, qtbot) -> None:
@@ -2711,8 +3375,9 @@ def _inspector_text(gui_app: App, qtbot, *, pm, sub) -> str:
     qtbot.addWidget(panel)
     panel._current_key = lambda: "0402:3922"   # pyright: ignore[reportAttributeAccessIssue]
     panel.dispatch = lambda cmd: DeviceStateResult(   # pyright: ignore[reportAttributeAccessIssue]
-        ok=True, key="0402:3922", wire="SCSI", native_resolution=(320, 320),
-        pm_byte=pm, sub_byte=sub, fbl=7, serial="ABC")
+        ok=True, key="0402:3922", wire="SCSI", catalog_resolution=(320, 320),
+        catalog_product="Frozen Warframe 360", pm_byte=pm, sub_byte=sub,
+        fbl=7, serial="ABC")
     panel._refresh_inspector()
     w = panel._inspector
     return w.toPlainText() if hasattr(w, "toPlainText") else w.text()
@@ -2739,6 +3404,35 @@ def test_an_unhandshaken_device_shows_no_handshake_block(
     assert "Handshake" not in text, (
         "a device that never handshook reported handshake values"
     )
+
+
+def test_the_inspector_labels_the_catalogs_answer(gui_app: App, qtbot) -> None:
+    """It printed the catalog's size as "native res" -- 480x480 on a 320x240
+    Mjolnir, the one size that panel is not."""
+    text = _inspector_text(gui_app, qtbot, pm=None, sub=None)
+
+    assert "  catalog     Frozen Warframe 360 320×320" in text.splitlines()
+    assert "native res" not in text
+
+
+def test_a_scan_lists_the_catalogs_guess_as_one(qtbot, tmp_path: Path) -> None:
+    """A scan does not handshake: the name and size it lists are the
+    catalog's for the USB id, and the line says so (#176)."""
+    from trcc.adapters.render.qt import QtRenderer
+    from trcc.ui.qtgui.panels.device_panel import DevicePanel
+
+    from .mock_platform import MockPlatform
+
+    app = App(MockPlatform([{"vid": "87ad", "pid": "70db", "pm": 5, "sub": 1}],
+                           tmp_path), renderer=QtRenderer())
+    panel = DevicePanel(app, _bus(app))
+    qtbot.addWidget(panel)
+
+    panel._on_scan()
+
+    rows = [panel._list.item(i).text() for i in range(panel._list.count())]
+    assert rows == ["87ad:70db  —  ChiZhu Tech GrandVision 360 AIO  "
+                    "(bulk, 480×480, catalog)"]
 
 
 # =========================================================================
@@ -2954,7 +3648,7 @@ def _two_device_app(tmp_path: Path):
     return app
 
 
-def test_every_panel_agrees_on_the_selected_device(
+def test_every_panel_agrees_on_the_selected_device(make_window,
     qapp: object, tmp_path: Path, qtbot,
 ) -> None:
     """Picking a device in one panel must be what every other panel edits.
@@ -2975,15 +3669,13 @@ def test_every_panel_agrees_on_the_selected_device(
     """
     del qapp
     from trcc.core.commands import ListDevices
-    from trcc.ui.qtgui.app import MainWindow
 
     app = _two_device_app(tmp_path)
     try:
         keys = [d.key for d in app.dispatch(ListDevices()).devices]
         assert len(keys) == 2, f"fixture must offer two devices, got {keys}"
 
-        window = MainWindow(app)
-        qtbot.addWidget(window)
+        window = make_window(app)
         watched = ["preview", "overlay", "themes", "masks", "display"]
 
         # The user picks the SECOND device.  Through the RAIL: it is the one
@@ -3014,7 +3706,7 @@ def test_every_panel_agrees_on_the_selected_device(
         app.close()
 
 
-def test_the_led_panel_keeps_its_own_device_selection(
+def test_the_led_panel_keeps_its_own_device_selection(make_window,
     qapp: object, tmp_path: Path, qtbot,
 ) -> None:
     """An LCD pick must not blank the LED panel.
@@ -3025,19 +3717,17 @@ def test_the_led_panel_keeps_its_own_device_selection(
     push a key the LED picker cannot show.
     """
     del qapp
-    from trcc.ui.qtgui.app import MainWindow
 
     app = _two_device_app(tmp_path)
     try:
-        window = MainWindow(app)
-        qtbot.addWidget(window)
+        window = make_window(app)
         assert (window._panels["led"].selection
                 is not window._panels["preview"].selection)
     finally:
         app.close()
 
 
-def test_the_sidebar_lists_every_attached_device(
+def test_the_sidebar_lists_every_attached_device(make_window,
     qapp: object, tmp_path: Path, qtbot,
 ) -> None:
     """The devices found are listed on the side, like ``ui/gui``.
@@ -3051,13 +3741,11 @@ def test_the_sidebar_lists_every_attached_device(
     """
     del qapp
     from trcc.core.commands import ListDevices
-    from trcc.ui.qtgui.app import MainWindow
 
     app = _two_device_app(tmp_path)
     try:
         keys = {d.key for d in app.dispatch(ListDevices()).devices}
-        window = MainWindow(app)
-        qtbot.addWidget(window)
+        window = make_window(app)
         assert window._sidebar.device_keys() == keys, (
             f"rail lists {window._sidebar.device_keys()}, attached {keys}"
         )
@@ -3065,7 +3753,7 @@ def test_the_sidebar_lists_every_attached_device(
         app.close()
 
 
-def test_choosing_a_device_in_the_rail_drives_every_panel(
+def test_choosing_a_device_in_the_rail_drives_every_panel(make_window,
     qapp: object, tmp_path: Path, qtbot,
 ) -> None:
     """Clicking the rail is what selects the device — as in ``ui/gui``.
@@ -3076,13 +3764,11 @@ def test_choosing_a_device_in_the_rail_drives_every_panel(
     """
     del qapp
     from trcc.core.commands import ListDevices
-    from trcc.ui.qtgui.app import MainWindow
 
     app = _two_device_app(tmp_path)
     try:
         keys = [d.key for d in app.dispatch(ListDevices()).devices]
-        window = MainWindow(app)
-        qtbot.addWidget(window)
+        window = make_window(app)
 
         window._sidebar.choose(keys[1])
 
@@ -3098,7 +3784,47 @@ def test_choosing_a_device_in_the_rail_drives_every_panel(
         app.close()
 
 
-def test_choosing_an_lcd_on_the_rail_leaves_the_led_panel_alone(
+def test_a_rail_pick_makes_every_device_panel_reload_for_that_device(
+    make_window, qapp: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pointing a panel at the device is not enough -- it has to LOAD it.
+
+    ``set_key`` updated each panel's combo silently, so the panels that
+    reload on their picker's ``key_changed`` never heard a rail pick: 9 of 11
+    kept showing the previous device's state (measured 2026-09-30).  The
+    Queries each panel sends for the NEW device are the proof it reloaded.
+    """
+    del qapp
+    from trcc.core.commands import ListDevices
+
+    app = _two_device_app(tmp_path)
+    try:
+        keys = [d.key for d in app.dispatch(ListDevices()).devices]
+        window = make_window(app)
+        asked: list[tuple[str, str]] = []
+        real = app.dispatch
+
+        def _record(command: object) -> object:
+            asked.append((type(command).__name__, getattr(command, "key", "")))
+            return real(command)
+
+        monkeypatch.setattr(app, "dispatch", _record)
+        # a cast running on the first device, as the App records it
+        app.settings.set_screencast_region(keys[0], (0, 0, 10, 10, False))
+        window._panels["screencast"]._show_state()
+        window._sidebar.choose(keys[1])
+
+        for_new = {name for name, key in asked if key == keys[1]}
+        # the theme browser (its canvas), the mask browser, the overlay editor
+        assert {"DeviceCanvas", "ListMasks", "ResolveOverlay"} <= for_new, (
+            f"panels did not reload for {keys[1]}: asked {sorted(for_new)}")
+        assert not {name for name, _ in asked} & {
+            "StopScreencast", "SetOverlayConfig"}, "a device pick wrote"
+    finally:
+        app.close()
+
+
+def test_choosing_an_lcd_on_the_rail_leaves_the_led_panel_alone(make_window,
     qapp: object, tmp_path: Path, qtbot,
 ) -> None:
     """Rail choices route by ``DeviceEntry.kind``, in BOTH directions.
@@ -3114,7 +3840,6 @@ def test_choosing_an_lcd_on_the_rail_leaves_the_led_panel_alone(
     """
     del qapp
     from trcc.core.commands import ListDevices
-    from trcc.ui.qtgui.app import MainWindow
 
     app = _fleet_app(tmp_path, _MIXED_FLEET)
     try:
@@ -3125,8 +3850,7 @@ def test_choosing_an_lcd_on_the_rail_leaves_the_led_panel_alone(
             f"fleet must mix kinds: lcd={lcds} led={leds}"
         )
 
-        window = MainWindow(app)
-        qtbot.addWidget(window)
+        window = make_window(app)
         led_panel = window._panels["led"]
         preview = window._panels["preview"]
 
@@ -3149,7 +3873,7 @@ def test_choosing_an_lcd_on_the_rail_leaves_the_led_panel_alone(
         app.close()
 
 
-def test_the_device_preview_is_always_on_screen(
+def test_the_device_preview_is_always_on_screen(make_window,
     qapp: object, tmp_path: Path, qtbot,
 ) -> None:
     """The preview is chrome, not a destination.
@@ -3164,12 +3888,10 @@ def test_the_device_preview_is_always_on_screen(
     Asserted for EVERY destination, because "always" is the whole property.
     """
     del qapp
-    from trcc.ui.qtgui.app import MainWindow
 
     app = _two_device_app(tmp_path)
     try:
-        window = MainWindow(app)
-        qtbot.addWidget(window)
+        window = make_window(app)
         surface = window._preview_surface
         for name in window._panels:
             window._sidebar.selected.emit(name)
@@ -3180,7 +3902,7 @@ def test_the_device_preview_is_always_on_screen(
         app.close()
 
 
-def test_the_preview_is_not_rendered_twice(
+def test_the_preview_is_not_rendered_twice(make_window,
     qapp: object, tmp_path: Path, qtbot,
 ) -> None:
     """One surface, not one per place that wants to show it.
@@ -3191,13 +3913,11 @@ def test_the_preview_is_not_rendered_twice(
     explicitly rules out.
     """
     del qapp
-    from trcc.ui.qtgui.app import MainWindow
     from trcc.ui.qtgui.preview_surface import PreviewSurface
 
     app = _two_device_app(tmp_path)
     try:
-        window = MainWindow(app)
-        qtbot.addWidget(window)
+        window = make_window(app)
         surfaces = window.findChildren(PreviewSurface)
         assert len(surfaces) == 1, (
             f"{len(surfaces)} preview surfaces in one window — each one "
@@ -3272,3 +3992,506 @@ def test_the_preview_wears_the_panel_s_bezel(qapp: object, tmp_path: Path) -> No
             )
     finally:
         app.close()
+
+
+# =========================================================================
+# qtgui follows the App: GPU, HDD, screencast, LED (Q4, 2026-09-30)
+# =========================================================================
+
+
+def test_the_gpu_box_shows_and_follows_the_active_gpu(
+    gui_app: App, qtbot, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """It never selected the active GPU and sent its current row on a button
+    press, so an untouched press switched to the first GPU listed."""
+    from trcc.core.commands import ListGpus
+    from trcc.core.events import GpuDeviceChanged
+    from trcc.core.results import GpuDeviceResult, GpuEntry, GpusListResult
+    from trcc.ui.qtgui.panels.system import GpuBox
+
+    gui_app.settings.set_active_gpu("amd:0")
+    real = gui_app.dispatch
+    sent: list[str] = []
+
+    def fake(cmd):
+        if isinstance(cmd, ListGpus):
+            return GpusListResult(ok=True, gpus=[
+                GpuEntry(key="nvidia:0", name="N", is_discrete=True),
+                GpuEntry(key="amd:0", name="A", is_discrete=True)])
+        if type(cmd).__name__ == "SetGpuDevice":
+            sent.append(cmd.gpu_key)
+            return GpuDeviceResult(ok=True, message="ok")
+        return real(cmd)
+
+    monkeypatch.setattr(gui_app, "dispatch", fake)
+    box = GpuBox(gui_app, _bus(gui_app))
+    qtbot.addWidget(box)
+    assert box._combo.currentData() == "amd:0", "opened on the wrong GPU"
+    assert sent == [], "opening the box switched the GPU"
+
+    gui_app.settings.set_active_gpu("nvidia:0")           # another UI
+    gui_app.events.publish(GpuDeviceChanged(gpu_key="nvidia:0"))
+    qtbot.waitUntil(lambda: box._combo.currentData() == "nvidia:0", timeout=2000)
+
+    amd = box._combo.findData("amd:0")
+    box._combo.setCurrentIndex(amd)
+    box._combo.activated.emit(amd)                        # the user's pick
+    assert sent == ["amd:0"]
+
+
+def test_the_hdd_switch_follows_another_ui(gui_app: App, qtbot) -> None:
+    from trcc.core.commands import SetHddEnabled
+    from trcc.ui.qtgui.panels.system import SensorsBox
+
+    assert gui_app.dispatch(SetHddEnabled(enabled=False)).ok
+    box = SensorsBox(gui_app, _bus(gui_app))
+    qtbot.addWidget(box)
+    assert box._hdd_check.isChecked() is False
+    assert gui_app.dispatch(SetHddEnabled(enabled=True)).ok
+    qtbot.waitUntil(box._hdd_check.isChecked, timeout=2000)
+
+
+def test_the_screencast_page_shows_the_selected_devices_cast(
+    gui_app: App, qtbot, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Its buttons described a local ``_casting_key``: a cast started or
+    stopped by another UI never showed, and after a device pick they still
+    described the first device.  Stop now stops the SELECTED device's cast."""
+    from trcc.core.events import ScreencastStarted
+    from trcc.ui.qtgui.panels.screencast_panel import ScreencastPanel
+
+    panel = ScreencastPanel(gui_app, _bus(gui_app))
+    qtbot.addWidget(panel)
+    _on_device(panel)
+    assert (panel._start_btn.isEnabled(), panel._stop_btn.isEnabled()) == (True, False)
+
+    gui_app.settings.set_screencast_region(_KEY_Q3, (10, 20, 300, 200, True))
+    gui_app.events.publish(ScreencastStarted(key=_KEY_Q3, x=10, y=20, w=300,
+                                             h=200, audio=True))
+    qtbot.waitUntil(panel._stop_btn.isEnabled, timeout=2000)
+    assert panel._audio.isChecked()
+
+    sent = _writes(panel)
+    panel._stop_btn.click()
+    assert [type(c).__name__ for c in sent] == ["StopScreencast"]
+    assert sent[0].key == _KEY_Q3
+    qtbot.waitUntil(panel._start_btn.isEnabled, timeout=2000)
+
+
+def test_the_led_panel_reloads_on_settings_not_on_every_render(
+    gui_app: App, qtbot,
+) -> None:
+    """It reloaded on LedColorsChanged, which every render publishes (~6.7/s
+    animated): three Queries a frame, and a pick pulled back mid-edit."""
+    from trcc.core.events import LedColorsChanged, LedSettingsChanged
+    from trcc.ui.qtgui.panels.led_panel import LedPanel
+
+    panel = LedPanel(gui_app, _bus(gui_app))
+    qtbot.addWidget(panel)
+    panel._picker.current_key = lambda: "0416:8001"   # pyright: ignore[reportAttributeAccessIssue]
+    asked: list[str] = []
+    real = panel.dispatch
+
+    def spy(cmd):
+        asked.append(type(cmd).__name__)
+        return real(cmd)
+
+    panel.dispatch = spy                              # pyright: ignore[reportAttributeAccessIssue]
+    for _ in range(5):
+        gui_app.events.publish(LedColorsChanged(key="0416:8001", color_count=30))
+    qtbot.wait(200)
+    assert "LedSnapshot" not in asked, "a render reloaded the panel"
+
+    gui_app.events.publish(LedSettingsChanged(key="0416:8001"))
+    qtbot.waitUntil(lambda: "LedSnapshot" in asked, timeout=2000)
+
+
+# =========================================================================
+# Q5: fields load on open, and only a finished CHANGE writes (2026-09-30)
+# =========================================================================
+
+
+def test_the_mask_browser_opens_on_the_apps_position_and_writes_only_changes(
+    gui_app: App, qtbot, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """It opened at 0,0 / visible (loaded only on a device change), and its
+    spinboxes wrote on editingFinished -- a plain focus change sent the
+    position unchanged."""
+    from trcc.core.commands import Query, SetMaskPosition, SetMaskVisible
+    from trcc.ui.qtgui import device_picker
+    from trcc.ui.qtgui.panels.mask_browser import MaskBrowser
+
+    gui_app.dispatch(SetMaskPosition(key=_KEY_Q3, x=12, y=34))
+    gui_app.dispatch(SetMaskVisible(key=_KEY_Q3, visible=False))
+    monkeypatch.setattr(device_picker.DevicePickerWidget, "current_key",
+                        lambda self: _KEY_Q3)
+    writes: list = []
+    real = gui_app.dispatch
+
+    def _record(command):
+        if not isinstance(command, Query):
+            writes.append(command)
+        return real(command)
+
+    monkeypatch.setattr(gui_app, "dispatch", _record)
+    panel = MaskBrowser(gui_app, _bus(gui_app))
+    qtbot.addWidget(panel)
+    assert (panel._x.value(), panel._y.value(), panel._visible.isChecked()) == (
+        12, 34, False)
+
+    panel._x.editingFinished.emit()                   # focus moved, no change
+    assert writes == [], f"opening or a focus change wrote {writes}"
+    panel._x.setValue(40)                             # a finished change
+    assert writes == [SetMaskPosition(key=_KEY_Q3, x=40, y=34)], writes
+
+
+def test_the_zone_tab_interval_is_in_the_csharps_unit(gui_app: App, qtbot) -> None:
+    """qtgui showed raw ticks (default 13); the C# and the gui show its unit.
+
+    MUTATION CHECK: dispatch the spin value as ticks again → this fails.
+    """
+    tab = _zone_tab_with(gui_app, qtbot, zones=3)
+    sent: list = []
+    real = tab._dispatch
+
+    def spy(command):
+        sent.append(command)
+        return real(command)
+
+    tab._dispatch = spy                               # pyright: ignore[reportAttributeAccessIssue]
+    assert (tab._interval_spin.value(), tab._interval_spin.suffix()) == (2, " s")
+    tab._interval_spin.setValue(3)
+    assert [getattr(c, "ticks", None) for c in sent] == [18], sent
+
+def test_the_zone_tab_interval_writes_only_a_change(gui_app: App, qtbot) -> None:
+    tab = _zone_tab_with(gui_app, qtbot, zones=3)
+    sent: list = []
+    real = tab._dispatch
+
+    def spy(command):
+        sent.append(type(command).__name__)
+        return real(command)
+
+    tab._dispatch = spy                               # pyright: ignore[reportAttributeAccessIssue]
+    tab._interval_spin.editingFinished.emit()         # focus moved, no change
+    assert sent == []
+    tab._interval_spin.setValue(tab._interval_spin.value() + 5)
+    assert sent == ["SetLedZoneSyncInterval"], sent
+
+    sent.clear()
+    row = tab._zone_widgets[0]._brightness            # a zone's own brightness
+    row.editingFinished.emit()
+    assert sent == []
+    row.setValue(row.value() - 10)
+    assert sent == ["SetLedZoneBrightness"], sent
+
+
+def test_the_device_panel_lists_devices_on_open_and_frames_cost_no_query(
+    make_window, qapp: object, tmp_path: Path, qtbot,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Its list was empty until Scan, and its inspector re-queried DeviceState
+    on every sent frame -- a socket round trip per frame under a shared App."""
+    del qapp, make_window
+    from trcc.core.commands import ListDevices
+    from trcc.core.events import FrameSent
+    from trcc.ui.qtgui.panels.device_panel import DevicePanel
+
+    app = _two_device_app(tmp_path)
+    try:
+        keys = [d.key for d in app.dispatch(ListDevices()).devices]
+        panel = DevicePanel(app, _bus(app))
+        qtbot.addWidget(panel)
+        listed = [panel._list.item(i).data(0x0100) for i in range(panel._list.count())]
+        assert listed == keys, f"opened listing {listed}"
+
+        panel._list.setCurrentRow(0)
+        asked: list[str] = []
+        real = panel.dispatch
+
+        def spy(cmd):
+            asked.append(type(cmd).__name__)
+            return real(cmd)
+
+        panel.dispatch = spy                          # pyright: ignore[reportAttributeAccessIssue]
+        for n in (100, 200, 300):
+            app.events.publish(FrameSent(key=keys[0], bytes_sent=n))
+        qtbot.waitUntil(lambda: "300 bytes" in panel._inspector.text(),
+                        timeout=2000)
+        assert asked == [], f"a sent frame dispatched {asked}"
+    finally:
+        app.close()
+
+
+@pytest.mark.parametrize("user_moves_x", [False, True])
+def test_the_qtgui_edit_dialog_sends_only_what_the_user_changed(
+    gui_app: App, qtbot, monkeypatch: pytest.MonkeyPatch, user_moves_x: bool,
+) -> None:
+    """Every field used to go back on OK: a size the dialog clamped (256 ->
+    200) or a colour another UI changed while it was open was overwritten
+    without being touched.  Measured 2026-09-30: 3 of 9 element kinds
+    changed on an untouched OK."""
+    from PySide6.QtWidgets import QDialog
+
+    from trcc.core.commands import AddOverlayElement, UpdateOverlayElement
+    from trcc.ui.qtgui.panels import overlay_editor
+    from trcc.ui.qtgui.panels.overlay_editor import OverlayEditorPanel
+
+    key = "0402:3922"
+    assert gui_app.dispatch(AddOverlayElement(
+        key=key, element_id="e", type="text", text="HERO", size=256, x=5)).ok
+    panel = OverlayEditorPanel(gui_app, _bus(gui_app))
+    qtbot.addWidget(panel)
+    panel._picker.set_key(key)
+    panel.refresh()
+    panel._list.setCurrentRow(0)
+
+    def _exec(dialog):
+        # another UI recolours the element while the dialog is open ...
+        assert gui_app.dispatch(UpdateOverlayElement(
+            key=key, element_id="e", color="#00ff00")).ok
+        if user_moves_x:                          # ... and the user moves it
+            dialog._x.setValue(40)
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(overlay_editor._ElementDialog, "exec", _exec)
+    panel._on_edit()
+
+    element = gui_app.settings.for_device(key).user_overlay_elements[0]
+    assert (element.size, element.color) == (256, "#00ff00"), (
+        "an untouched field was written back")
+    assert element.x == (40 if user_moves_x else 5)
+
+
+# =========================================================================
+# qtgui follows the app-wide settings another UI changes (2026-10-02)
+# =========================================================================
+
+
+def test_qtgui_s_autostart_box_follows_another_ui(gui_app: App, qtbot) -> None:
+    """MUTATION CHECK -- MEASURED 2026-10-02: drop the AutostartChanged case
+    in ``SystemPanel._on_app_settings_changed`` → fails."""
+    from trcc.core.commands import DisableAutostart, EnableAutostart
+    from trcc.ui.qtgui.panels.system_panel import SystemPanel
+
+    panel = SystemPanel(gui_app, _bus(gui_app))
+    qtbot.addWidget(panel)
+    check = panel._maintenance._autostart_check
+    assert not check.isChecked()
+
+    gui_app.dispatch(EnableAutostart())
+    qtbot.waitUntil(check.isChecked, timeout=3000)
+    gui_app.dispatch(DisableAutostart())
+    qtbot.waitUntil(lambda: not check.isChecked(), timeout=3000)
+
+
+def test_qtgui_s_dashboard_reloads_a_layout_saved_elsewhere(
+    gui_app: App, qtbot,
+) -> None:
+    """MUTATION CHECK -- MEASURED 2026-10-02: drop the SensorDashboardChanged
+    case → fails."""
+    from trcc.core.commands import SetSensorDashboard
+    from trcc.core.models import PanelConfig
+    from trcc.ui.qtgui.panels.system_panel import SystemPanel
+
+    panel = SystemPanel(gui_app, _bus(gui_app))
+    qtbot.addWidget(panel)
+
+    gui_app.dispatch(SetSensorDashboard(panels=(PanelConfig.custom("Elsewhere"),)))
+
+    qtbot.waitUntil(lambda: [p.name for p in panel._dash._panels] == ["Elsewhere"],
+                    timeout=3000)
+
+
+def test_qtgui_s_dashboard_keeps_unsaved_edits_when_another_ui_saves(
+    gui_app: App, qtbot,
+) -> None:
+    """Reloading would throw away edits the user has not saved -- with no
+    warning, since they are only in this box.  It says so instead.
+
+    MUTATION CHECK -- MEASURED 2026-10-02: reload unconditionally in
+    ``on_layout_saved`` → fails.
+    """
+    from trcc.core.commands import SetSensorDashboard
+    from trcc.core.models import PanelConfig
+    from trcc.ui.qtgui.panels.system_panel import SystemPanel
+
+    panel = SystemPanel(gui_app, _bus(gui_app))
+    qtbot.addWidget(panel)
+    box = panel._dash
+    box._on_add_panel()                                     # unsaved edit
+    mine = [p.name for p in box._panels]
+
+    gui_app.dispatch(SetSensorDashboard(panels=(PanelConfig.custom("Elsewhere"),)))
+
+    qtbot.waitUntil(lambda: "another window" in box._status.text(), timeout=3000)
+    assert [p.name for p in box._panels] == mine
+
+
+def test_qtgui_s_disk_picker_follows_another_ui(gui_app: App, qtbot) -> None:
+    """MUTATION CHECK -- MEASURED 2026-10-02: drop ``LedPanel``'s
+    app_settings_changed hookup → fails."""
+    from trcc.adapters.sensors.aggregator import BaselineSensors
+    from trcc.core.commands import SetDiskDevice
+    from trcc.ui.qtgui.panels.led_panel import LedPanel
+
+    from .conftest import FakeCpu, FakeMemory
+    from .test_sensors import FakeDisk
+
+    gui_app.platform._sensors = BaselineSensors(   # type: ignore[attr-defined]
+        cpu=FakeCpu(), memory=FakeMemory(), gpus=[], fans=[],
+        disks=[FakeDisk("nvme0", 41.0), FakeDisk("nvme1", 58.0)])
+    panel = LedPanel(gui_app, _bus(gui_app))
+    qtbot.addWidget(panel)
+    picker = panel._advanced_tab._disk_selector
+
+    gui_app.dispatch(SetDiskDevice(disk_key="nvme1"))
+
+    qtbot.waitUntil(lambda: picker.currentData() == "nvme1", timeout=3000)
+
+
+def test_qtgui_shows_the_sent_frame_without_rendering_another(gui_app: App) -> None:
+    """qtgui re-rendered on every FrameSent, in-process too; now it shows the
+    frame the panel got -- the live surface, or (across the daemon socket)
+    the App's JPEG of it, which the shared BusBridge turns into a surface.
+
+    MUTATION CHECK: call ``refresh()`` on every FrameSent again and a
+    BuildPreview goes out per frame.
+    """
+    from PySide6.QtGui import QColor, QImage
+    from PySide6.QtWidgets import QApplication
+
+    from trcc.adapters.render.qt import QtRenderer
+    from trcc.core.events import FrameSent
+    from trcc.ui.qtgui.device_selection import DeviceSelection
+    from trcc.ui.qtgui.preview_surface import PreviewSurface
+
+    selection = DeviceSelection()
+    surface = PreviewSurface(gui_app, _bus(gui_app), selection)
+    selection.set_key("0402:3922")
+    surface._label.setFixedSize(320, 320)
+    frame = QImage(320, 320, QImage.Format.Format_RGB888)
+    frame.fill(QColor(0, 64, 128))
+    sizes: list[tuple[int, int]] = []
+    surface.rendered.connect(lambda w, h: sizes.append((w, h)))
+    asked: list[str] = []
+    real = gui_app.dispatch
+    gui_app.dispatch = lambda cmd: (asked.append(type(cmd).__name__), real(cmd))[1]  # type: ignore[method-assign]
+    try:
+        gui_app.events.publish(FrameSent(key="0402:3922", bytes_sent=1,
+                                         image=QtRenderer().encode_jpeg(frame, 95)))
+        gui_app.events.publish(FrameSent(key="0402:3922", bytes_sent=1,
+                                         surface=frame))
+        for _ in range(50):
+            QApplication.processEvents()
+            if len(sizes) == 2:
+                break
+    finally:
+        gui_app.dispatch = real                # type: ignore[method-assign]
+
+    assert asked == []
+    assert sizes == [(320, 320), (320, 320)]
+    assert not surface._label.pixmap().isNull()
+
+
+def test_qtgui_welcomes_a_first_run_once(make_window, qapp: object,
+                                         tmp_path: Path) -> None:
+    """The welcome is for the FIRST launch.  Only the CLI and the API ever
+    marked first run done, so a qtgui-only user opened on System with the
+    welcome text at every launch.
+
+    MUTATION CHECK: drop the MarkFirstRunDone dispatch and the second
+    window opens on System again.
+    """
+    from trcc.core.commands import GetFirstRunStatus
+
+    app = _two_device_app(tmp_path)
+    assert app.dispatch(GetFirstRunStatus()).is_first_run, "precondition"
+
+    first = make_window(app)
+    second = make_window(app)
+
+    assert first._content.currentWidget() is first._panels["system"]
+    assert second._content.currentWidget() is second._panels["devices"]
+    assert not app.dispatch(GetFirstRunStatus()).is_first_run
+
+
+@pytest.mark.parametrize(("style_id", "title", "timer_shown"), [
+    (2, "Select all", False),     # PA120: the switch selects every zone
+    (1, "Carousel", True),        # AX120: a page style circulates
+], ids=["PA120", "AX120"])
+def test_the_qtgui_zone_tab_names_the_switch_as_the_csharp_does(
+    gui_app: App, qapp: object, style_id: int, title: str, timer_shown: bool,
+) -> None:
+    """On PA120/LF10 nothing rotates: the switch makes an edit reach every
+    zone, and the C#'s panel reads "Select all" with its timer hidden
+    (FormLED.cs:1669).  The tab said "Carousel" with a rotation interval.
+
+    MUTATION CHECK: always title it "Carousel" and PA120 fails.
+    """
+    from trcc.ui.qtgui.panels.led import ZoneTab
+
+    tab = ZoneTab(gui_app, _led_key)
+    tab.apply_style(style_id)
+
+    assert tab._sync_box.title() == title
+    assert tab._interval_spin.isHidden() is not timer_shown
+    assert tab._participation.isHidden() is not timer_shown
+
+
+@pytest.mark.parametrize(("style_id", "word"), [
+    (2, "Select all"), (7, "Select all"), (1, "Circulate"),
+], ids=["PA120", "LF10", "AX120"])
+def test_the_gui_led_panel_labels_the_switch_as_the_csharp_does(
+    qapp: object, style_id: int, word: str,
+) -> None:
+    """MUTATION CHECK: always say "Circulate" and PA120/LF10 fail."""
+    from trcc.ui.gui.assets import _PKG_ASSETS_DIR, set_assets_dir
+    from trcc.ui.gui.uc_led_control import UCLedControl
+
+    set_assets_dir(_PKG_ASSETS_DIR)
+    panel = UCLedControl()
+    panel.initialize(style_id, zone_count=4)
+
+    assert panel._circulate_label.text() == word
+
+
+def test_a_grid_cell_shows_a_board_sensor_by_its_id(qtbot) -> None:
+    """A cell for a sensor the DC table cannot name reads its value by id and
+    names its group the way the picker does -- (0, 0) would otherwise show as
+    the CPU, the C#'s main count 0."""
+    from trcc.core.models import OverlayElementConfig, OverlayMode
+    from trcc.ui.gui.overlay_grid import OverlayGridPanel
+    from trcc.ui.presentation.sensor_display import source_label
+
+    grid = OverlayGridPanel()
+    qtbot.addWidget(grid)
+    grid.load_configs([OverlayElementConfig(
+        mode=OverlayMode.HARDWARE, mode_sub=1, main_count=0, sub_count=0,
+        metric="board:nct6798_auxtin1:temp")])
+
+    grid.update_metrics({"board:nct6798_auxtin1:temp": 31.0}, "C")
+
+    cell = grid._cells[0]
+    assert (cell._live_value, cell._live_unit) == ("31", "°C")
+    assert source_label("board:nct6798_auxtin1:temp") == "Board"
+
+
+def test_a_refilled_grid_shows_each_cells_own_reading(qtbot) -> None:
+    """A delete shifts every later cell down one; each must show its NEW
+    occupant's value, not the one it showed before (#301)."""
+    from trcc.core.models import OverlayElementConfig, OverlayMode
+    from trcc.ui.gui.overlay_grid import OverlayGridPanel
+
+    grid = OverlayGridPanel()
+    qtbot.addWidget(grid)
+    grid.load_configs([
+        OverlayElementConfig(mode=OverlayMode.HARDWARE, metric="cpu:temp"),
+        OverlayElementConfig(mode=OverlayMode.HARDWARE, metric="gpu:primary:temp"),
+    ])
+    grid.update_metrics({"cpu:temp": 52.0, "gpu:primary:temp": 61.0}, "C")
+
+    grid.delete_element(0)
+
+    assert grid._cells[0]._live_value == "61"
+    assert grid._cells[1]._live_value == ""

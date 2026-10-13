@@ -305,3 +305,111 @@ def test_queries_are_bounded() -> None:
     for call in source.split("subprocess.run(")[1:]:
         assert "timeout=" in call.split(")")[0] + ")", (
             "a subprocess.run in _packages.py has no timeout")
+
+
+# ── #219: a frozen app runs the tools it ships ──────────────────────────────
+
+
+def _frozen_app(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """A frozen app folder holding only a bundled 7zz, and a bare PATH."""
+    import sys
+
+    app_dir = tmp_path / "TRCC.app" / "Contents" / "MacOS"
+    app_dir.mkdir(parents=True)
+    tool = app_dir / "7zz"
+    tool.write_text("#!/bin/sh\n")
+    tool.chmod(0o755)
+    empty = tmp_path / "empty-path"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(app_dir / "TRCC"))
+    return app_dir
+
+
+def test_a_frozen_app_finds_the_7zip_it_bundles(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Finder hands an app /usr/bin:/bin:/usr/sbin:/sbin; the DMG's own tools
+    were never on it, so they were never run (#219)."""
+    import shutil
+
+    from trcc._entry import put_bundled_tools_on_path
+    from trcc.core import toolchain
+
+    app_dir = _frozen_app(monkeypatch, tmp_path)
+    assert toolchain.resolve("7z") is None, "precondition: nothing on PATH"
+
+    assert put_bundled_tools_on_path() == str(app_dir)
+    assert toolchain.resolve("7z") == "7zz"
+    assert shutil.which("7zz") == str(app_dir / "7zz")
+
+
+def test_a_source_run_leaves_path_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+    import sys
+
+    from trcc._entry import put_bundled_tools_on_path
+
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    before = os.environ.get("PATH")
+    assert put_bundled_tools_on_path() is None
+    assert os.environ.get("PATH") == before
+
+
+#: Every executable name the table knows, logical or alias.
+_TOOL_NAMES = frozenset(TOOL_ALIASES) | {a for names in TOOL_ALIASES.values() for a in names}
+
+
+def test_no_argv_names_a_tool_literally() -> None:
+    """An argv that starts with ``"ffmpeg"`` runs only where that exact name
+    exists; on pkgsrc the binary is ``ffmpeg7`` and the call fails while
+    ``toolchain.present`` says yes.  Eleven of fourteen ffmpeg/ffprobe sites
+    did that, including the decoder's own presence check.  The names come
+    from the table, so a tool added to it is covered here without an edit.
+    """
+    import ast
+
+    src = Path(__file__).resolve().parent.parent / "src" / "trcc"
+    offenders = [
+        f"{path.relative_to(src)}:{node.lineno} {node.elts[0].value!r}"
+        for path in sorted(src.rglob("*.py"))
+        if path != src / "core" / "toolchain.py"  # the table itself: rows, not argv
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, (ast.List, ast.Tuple)) and node.elts
+        and isinstance(node.elts[0], ast.Constant)
+        and node.elts[0].value in _TOOL_NAMES
+    ]
+    assert offenders == [], "use toolchain.executable(...) as argv[0]"
+
+
+@pytest.mark.skipif(not (shutil.which("ffmpeg") and shutil.which("ffprobe")),
+                    reason="needs a real ffmpeg + ffprobe to rename")
+def test_a_machine_with_only_versioned_ffmpeg_plays_and_probes_video(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The real binaries, renamed the way pkgsrc names them, alone on PATH."""
+    from trcc.services.cloud_theme import _generate_animated_gif
+    from trcc.services.media import VideoDecoder, _probe_video_size
+    from trcc.services.video_export import probe_dimensions, probe_duration_ms
+
+    clip = tmp_path / "clip.mp4"
+    subprocess.run(
+        [str(shutil.which("ffmpeg")), "-v", "error", "-f", "lavfi",
+         "-i", "testsrc=size=64x48:rate=8", "-t", "1", "-pix_fmt", "yuv420p",
+         str(clip)],
+        check=True, capture_output=True, timeout=60,
+    )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for tool in ("ffmpeg", "ffprobe"):
+        (bin_dir / f"{tool}7").symlink_to(str(shutil.which(tool)))
+    monkeypatch.setenv("PATH", str(bin_dir))
+
+    assert _probe_video_size(clip) == (64, 48)
+    assert probe_dimensions(clip) == (64, 48)
+    assert probe_duration_ms(clip) == 1000
+    assert len(VideoDecoder(clip, size=None, fps=8).decode()) == 8
+    gif = tmp_path / "clip.gif"
+    _generate_animated_gif(clip, gif)
+    assert gif.is_file()

@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 
-from ...core.logs import per_frame
+from ...core.logs import per_frame, recurring_failure
 from ...core.ports import CpuSource, GpuSource, MemorySource
 
 log = logging.getLogger(__name__)
@@ -171,6 +171,10 @@ class GpuSourceChain(GpuSource):
         frame_log.debug("GpuSourceChain.fan: key=%s", self._sources[0].key)
         return _first_not_none(self._sources, "fan")
 
+    def fan_rpm(self) -> float | None:
+        frame_log.debug("GpuSourceChain.fan_rpm: key=%s", self._sources[0].key)
+        return _first_not_none(self._sources, "fan_rpm")
+
     def vram_used(self) -> float | None:
         frame_log.debug("GpuSourceChain.vram_used: key=%s", self._sources[0].key)
         return _first_not_none(self._sources, "vram_used")
@@ -216,8 +220,8 @@ def _first_not_none(sources: Sequence[object], method: str) -> float | None:
         try:
             value = getattr(source, method)()
         except Exception:
-            log.debug("Chain source %r raised on %s()",
-                      type(source).__name__, method, exc_info=True)
+            recurring_failure(log, "Chain source %r raised on %s()",
+                      type(source).__name__, method)
             continue
         if value is not None:
             return value

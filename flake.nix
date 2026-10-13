@@ -32,6 +32,7 @@
             click
             typer
             fastapi
+            cryptography
             uvicorn
             python-multipart
             prompt-toolkit
@@ -67,6 +68,8 @@
             # modules-load
             install -Dm644 packaging/modprobe/trcc-sg.conf \
               $out/etc/modules-load.d/trcc-sg.conf
+            install -Dm644 packaging/modprobe/trcc-rapl.conf \
+              $out/etc/modules-load.d/trcc-rapl.conf
 
             # desktop entry
             install -Dm644 src/trcc/assets/trcc-linux.desktop \
@@ -76,8 +79,12 @@
             install -Dm644 src/trcc/assets/com.github.lexonight1.trcc.policy \
               $out/share/polkit-1/actions/com.github.lexonight1.trcc.policy
 
-            # privileged MCHBAR timing reader (pkexec target)
+            # privileged helpers (pkexec targets): MCHBAR timings, DRAM slots,
+            # RAM-lighting access
             install -Dm755 src/trcc/assets/trcc-imc $out/bin/trcc-imc
+            install -Dm755 src/trcc/assets/trcc-dmi $out/bin/trcc-dmi
+            install -Dm755 src/trcc/assets/trcc-ram-access $out/bin/trcc-ram-access
+            install -Dm755 src/trcc/assets/trcc-ram-access-off $out/bin/trcc-ram-access-off
           '';
 
           meta = with pkgs.lib; {
@@ -93,7 +100,7 @@
         devShells.default = pkgs.mkShell {
           packages = [
             (python.withPackages (ps: with ps; [
-              pyside6 numpy psutil pyusb pyudev hidapi click typer fastapi uvicorn
+              pyside6 numpy psutil pyusb pyudev hidapi click typer fastapi cryptography uvicorn
               python-multipart prompt-toolkit sounddevice
               pytest pytest-cov pytest-xdist httpx nvidia-ml-py ruff
             ]))

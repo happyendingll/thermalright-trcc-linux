@@ -13,16 +13,17 @@ ThemeError with a user-facing install hint.
 from __future__ import annotations
 
 import logging
-import os
 import struct
 import subprocess
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..core import toolchain
 from ..core.errors import ThemeError
 from ..core.logs import per_frame
 from ..core.models import ZT_MAGIC
+from .media_stream import StreamReader
 
 log = logging.getLogger(__name__)
 frame_log = per_frame(__name__)
@@ -58,7 +59,10 @@ class VideoDecoder:
     def __init__(self, path: Path, size: tuple[int, int] | None,
                  fps: int = _DEFAULT_FPS,
                  rotation_degrees: int = 0,
-                 duration_s: float | None = None) -> None:
+                 duration_s: float | None = None,
+                 install_hint: Callable[[str], str] = toolchain.generic_install_hint,
+                 ) -> None:
+        self._install_hint = install_hint
         # ``size`` is the OUTPUT scale ffmpeg is told to produce.
         # ``None`` → decode at the source's native resolution and let
         # the render pipeline's fit-mode scale at composite time.  Used
@@ -81,11 +85,9 @@ class VideoDecoder:
         """
         if not self.path.exists():
             raise ThemeError(f"Video path does not exist: {self.path}")
-        if not _ffmpeg_available():
-            raise ThemeError(
-                "ffmpeg not found on PATH — install via your package manager "
-                "(e.g. 'dnf install ffmpeg' / 'apt install ffmpeg')"
-            )
+        if not toolchain.present("ffmpeg"):
+            raise ThemeError(toolchain.missing("ffmpeg",
+                                               self._install_hint("ffmpeg")))
 
         if self.size is None:
             native = _probe_video_size(self.path)
@@ -114,7 +116,7 @@ class VideoDecoder:
                 "width and height must both be positive"
             )
 
-        cmd: list[str] = [toolchain.resolve("ffmpeg") or "ffmpeg",
+        cmd: list[str] = [toolchain.executable("ffmpeg"),
                           "-hide_banner", "-loglevel", "error"]
         if self.rotation_degrees:
             cmd += ["-display_rotation", str(self.rotation_degrees)]
@@ -194,17 +196,6 @@ def _split_jpeg_stream(data: bytes) -> list[bytes]:
     return frames
 
 
-def _ffmpeg_available() -> bool:
-    """Quick check whether ffmpeg is on PATH."""
-    log.debug("_ffmpeg_available")
-    for dir_ in os.get_exec_path():
-        if (Path(dir_) / "ffmpeg").exists():
-            return True
-        if (Path(dir_) / "ffmpeg.exe").exists():
-            return True
-    return False
-
-
 def _probe_video_size(path: Path) -> tuple[int, int] | None:
     """Return the video's native ``(width, height)`` or ``None`` on failure.
 
@@ -217,7 +208,7 @@ def _probe_video_size(path: Path) -> tuple[int, int] | None:
         log.warning("_probe_video_size: ffprobe not on PATH")
         return None
     cmd = [
-        "ffprobe", "-v", "error",
+        toolchain.executable("ffprobe"), "-v", "error",
         "-select_streams", "v:0",
         "-show_entries", "stream=width,height",
         "-of", "csv=p=0:s=x",
@@ -261,9 +252,12 @@ class ZtDecoder:
     **Nothing here decodes, and nothing here scales.**  The payloads are
     already JPEG on disk, so :meth:`decode` parses the header and returns
     them unchanged; one is decoded per tick by ``Renderer.decode_image``
-    (``services/display.py``).  It runs **no ffmpeg at all** — it only
-    checks that ffmpeg exists, because :class:`MediaService` may reach
-    :class:`VideoDecoder` for the same theme.
+    (``services/display.py``).  It runs **no ffmpeg at all**, so it does not
+    need one installed.  It used to refuse without one, on the grounds that
+    :class:`MediaService` "may reach :class:`VideoDecoder` for the same
+    theme" — it does not: the ``.zt`` branch of ``load_video`` never falls
+    through, and ``VideoDecoder`` checks for ffmpeg itself.  The C# reads a
+    ``.zt`` with a plain FileStream (``UCVideoCutF.cs:518``).
 
     ``size`` is therefore NOT a scale target.  A ``.zt`` is authored AT the
     canvas by ``UCVideoCut``, and :meth:`MediaService.load_video` refuses one
@@ -286,11 +280,6 @@ class ZtDecoder:
         """Read header + payloads, returning the ENCODED frames unchanged."""
         if not self.path.exists():
             raise ThemeError(f".zt path does not exist: {self.path}")
-        if not _ffmpeg_available():
-            raise ThemeError(
-                "ffmpeg not found on PATH — install via your package manager "
-                "(e.g. 'dnf install ffmpeg' / 'apt install ffmpeg')"
-            )
 
         try:
             data = self.path.read_bytes()
@@ -298,10 +287,11 @@ class ZtDecoder:
             raise ThemeError(f"Cannot read {self.path}: {e}") from e
 
         if not data or data[0] != ZT_MAGIC:
-            raise ThemeError(
-                f"Not a Theme.zt archive (magic 0x{data[0]:02X if data else 0}): "
-                f"{self.path}"
-            )
+            # The format spec used to hold a conditional, which Python reads
+            # as an invalid spec -- so a bad .zt raised ValueError, not this.
+            # A slice needs no branch for the empty file.
+            raise ThemeError(f"Not a Theme.zt archive (starts {data[:4]!r}): "
+                             f"{self.path}")
 
         try:
             (frame_count,) = struct.unpack_from("<i", data, 1)
@@ -377,7 +367,9 @@ class Playback:
     and ``ByteToBitmap`` decodes one per timer tick, disposing the previous
     (FormCZTV.cs:2176).
     """
-    frames: list[bytes]
+    #: Out of the repr — this is the whole animation (45 MB encoded for the
+    #: 897-frame case above), and %s on a Playback is a log record.
+    frames: list[bytes] = field(repr=False)
     fps: int = _DEFAULT_FPS
     cursor: int = 0
     paused: bool = False
@@ -470,9 +462,16 @@ class MediaService:
     never interact with this class.
     """
 
-    def __init__(self) -> None:
+    #: The reader a web source gets.  A class attribute so a test swaps in a
+    #: fake without ffmpeg or a network (``tests/test_media_stream.py``).
+    stream_reader: type[StreamReader] = StreamReader
+
+    def __init__(self, install_hint: Callable[[str], str]
+                 = toolchain.generic_install_hint) -> None:
         log.debug("__init__")
+        self._install_hint = install_hint
         self._playbacks: dict[str, Playback] = {}
+        self._streams: dict[str, StreamReader] = {}
 
     def load_video(self, device_key: str, path: Path,
                    size: tuple[int, int] | None,
@@ -530,6 +529,7 @@ class MediaService:
                 path=path, size=size, fps=fps,
                 rotation_degrees=rotation_degrees,
                 duration_s=duration_s,
+                install_hint=self._install_hint,
             )
             decoder.decode()
             playback = Playback(frames=decoder.frames, fps=fps,
@@ -545,8 +545,39 @@ class MediaService:
         frame_log.debug("playback: key=%s", device_key)
         return self._playbacks.get(device_key)
 
+    def playing(self) -> dict[str, Playback]:
+        """Every playback that should advance now: has frames, not paused.
+
+        A snapshot, so a caller on another thread can iterate it while a
+        Command loads or unloads a video.
+        """
+        live = {key: pb for key, pb in list(self._playbacks.items())
+                if pb.frames and not pb.paused}
+        frame_log.debug("playing: %s", sorted(live))
+        return live
+
+    def open_stream(self, device_key: str, url: str,
+                    size: tuple[int, int], fps: int) -> StreamReader:
+        """Start reading *url* for *device_key*, replacing any stream it had."""
+        log.info("open_stream: %s <- %s (%dx%d @ %d fps)",
+                 device_key, url, *size, fps)
+        self.close_stream(device_key)
+        reader = self._streams[device_key] = self.stream_reader(url, size, fps)
+        return reader
+
+    def stream(self, device_key: str) -> StreamReader | None:
+        frame_log.debug("stream: key=%s", device_key)
+        return self._streams.get(device_key)
+
+    def close_stream(self, device_key: str) -> None:
+        """Stop *device_key*'s web source, if it has one (idempotent)."""
+        if (reader := self._streams.pop(device_key, None)) is not None:
+            log.info("close_stream: %s (%s)", device_key, reader.url)
+            reader.close()
+
     def unload(self, device_key: str) -> None:
-        """Drop a playback, freeing its frame buffers."""
+        """Drop a playback, freeing its frame buffers -- and end a stream."""
+        self.close_stream(device_key)
         had = self._playbacks.pop(device_key, None)
         if had is not None:
             log.info("unload: dropped %d-frame playback for %s",

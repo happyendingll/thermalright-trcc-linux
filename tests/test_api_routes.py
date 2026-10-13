@@ -17,6 +17,7 @@ device fakes get fuller setup.
 """
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, cast
@@ -25,12 +26,14 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from trcc.__version__ import __version__
 from trcc.app import App
-from trcc.core.models import DEFAULT_AUTOSTART_TARGET, RawFrame
+from trcc.core.commands import GetPaths, LoadTheme
+from trcc.core.models import DEFAULT_AUTOSTART_TARGET
 from trcc.core.ports import Renderer
 from trcc.core.protocol import FBL_PROFILES
 
-from .conftest import FakePlatform
+from .conftest import FakePlatform, loopback_client
 
 # Unique resolutions from the canonical FBL profile registry.
 API_TEST_RESOLUTIONS: list[tuple[int, int]] = sorted({
@@ -74,9 +77,6 @@ class _SmokeRenderer(Renderer):
     def rotate(self, surface: Any, degrees: int) -> Any:
         return surface
 
-    def flip_horizontal(self, surface: Any) -> Any:
-        return surface
-
     def apply_brightness(self, surface: Any, percent: int) -> Any:
         return surface
 
@@ -94,13 +94,6 @@ class _SmokeRenderer(Renderer):
 
     def from_raw_rgb24(self, frame: Any) -> Any:
         return _SmokeRenderer._Surface()
-
-    def to_raw_rgb24(self, surface):
-        # The inverse the port now requires.  Test doubles carry no pixels,
-        # so this reports the surface's DIMENSIONS with blank bytes — enough
-        # for a caller that only needs a correctly-sized RawFrame.
-        w, h = self.surface_size(surface)
-        return RawFrame(data=bytes(w * h * 3), width=w, height=h)
 
     def decode_image(self, data: bytes) -> Any:
         return _SmokeRenderer._Surface()
@@ -124,7 +117,7 @@ def api_client(fake_platform: FakePlatform) -> Iterator[TestClient]:
 
     trcc = App(platform=fake_platform, renderer=_SmokeRenderer())
     api = build_app(trcc=trcc)
-    with TestClient(api) as client:
+    with loopback_client(api) as client:
         yield client
 
 
@@ -140,7 +133,7 @@ def test_root_returns_endpoint_directory(api_client: TestClient) -> None:
     assert resp.status_code == 200
     body = resp.json()
     assert body["name"] == "TRCC API"
-    assert body["version"] == "next"
+    assert body["version"] == __version__
     # The endpoint catalog mentions at least the canonical routes
     endpoints = " ".join(body["endpoints"])
     for canonical in (
@@ -376,12 +369,12 @@ def test_devices_connect_unknown_returns_4xx(api_client: TestClient) -> None:
     not a 500.  Proves the dispatch path → result envelope works."""
     resp = api_client.post("/devices/dead:beef/connect")
     # http_error_if_failed maps ok=False → 400 by default
-    assert resp.status_code in (400, 404)
+    assert resp.status_code == 400
 
 
 def test_devices_disconnect_unknown_returns_4xx(api_client: TestClient) -> None:
     resp = api_client.post("/devices/dead:beef/disconnect")
-    assert resp.status_code in (400, 404)
+    assert resp.status_code == 404
 
 
 # =========================================================================
@@ -437,7 +430,7 @@ def test_display_send_color_unknown_device_returns_4xx(
         "/devices/dead:beef/display/color",
         json={"r": 255, "g": 0, "b": 0},
     )
-    assert resp.status_code in (400, 404)
+    assert resp.status_code == 400
 
 
 def test_display_reset_unknown_device_returns_4xx(
@@ -447,7 +440,7 @@ def test_display_reset_unknown_device_returns_4xx(
     an unknown key surfaces a structured error envelope (the StopVideo
     pre-step is best-effort and doesn't mask the send failure)."""
     resp = api_client.post("/devices/dead:beef/display/reset")
-    assert resp.status_code in (400, 404)
+    assert resp.status_code == 400
 
 
 def test_display_load_theme_reaches_lookup_not_attribute_error(
@@ -508,6 +501,21 @@ def test_boot_animation_rejects_path_traversal(
     assert resp.status_code == 400
 
 
+def test_boot_animation_answers_400_on_a_fresh_install(
+    api_client: TestClient, fake_platform: FakePlatform,
+) -> None:
+    """No ~/.trcc-user yet: ``resolve(strict=True)`` raised straight through
+    as a 500 — the test above creates the directory first, which hid it."""
+    assert not fake_platform.paths().user_content_dir().exists()
+    resp = api_client.post(
+        "/devices/0402:3922/display/boot-animation",
+        json={"frames_dir": "myanim", "delay_ds": 5},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == (
+        "frames_dir not found under the user content directory: 'myanim'")
+
+
 def test_boot_animation_valid_subdir_passes_path_barrier(
     api_client: TestClient, fake_platform: FakePlatform,
 ) -> None:
@@ -521,7 +529,7 @@ def test_boot_animation_valid_subdir_passes_path_barrier(
         json={"frames_dir": "myanim", "delay_ds": 5},
     )
     # Path barrier passed; the device dispatch fails (not connected) → 4xx.
-    assert resp.status_code in (400, 404)
+    assert resp.status_code == 400
 
 
 # =========================================================================
@@ -612,17 +620,6 @@ def test_led_select_zone(api_client: TestClient) -> None:
     assert "3" in body["message"]
 
 
-def test_led_toggle_segment(api_client: TestClient) -> None:
-    resp = api_client.post(
-        "/devices/0416:8001/led/toggle-segment",
-        json={"index": 7, "on": False},
-    )
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["ok"] is True
-    assert "Segment 7" in body["message"]
-
-
 def test_led_snapshot(api_client: TestClient) -> None:
     """LedSnapshot returns the persisted LED state."""
     resp = api_client.get("/devices/0416:8001/led/snapshot")
@@ -664,12 +661,41 @@ def test_display_snapshot(api_client: TestClient) -> None:
     assert body["key"] == "0402:3922"
 
 
+@pytest.mark.parametrize("body,expected", [
+    ({"enabled": True, "threshold": 60}, (True, 60)),
+    ({"threshold": 40}, (False, 40)),
+])
+def test_display_game_sets_either_half(
+    api_client: TestClient, body: dict, expected: tuple[bool, int],
+) -> None:
+    resp = api_client.post("/devices/0402:3922/display/game", json=body)
+
+    assert resp.status_code == 200
+    assert (resp.json()["enabled"], resp.json()["threshold"]) == expected
+    snap = api_client.get("/devices/0402:3922/display/snapshot").json()
+    assert (snap["game_enabled"], snap["game_threshold"]) == expected
+
+
+@pytest.mark.parametrize("body,status", [
+    ({"threshold": 100}, 422),       # the schema holds the two digits
+    ({}, 400),                       # the Command refuses an empty change
+])
+def test_display_game_refuses_what_it_cannot_send(
+    api_client: TestClient, body: dict, status: int,
+) -> None:
+    resp = api_client.post("/devices/0402:3922/display/game", json=body)
+
+    assert resp.status_code == status
+    snap = api_client.get("/devices/0402:3922/display/snapshot").json()
+    assert (snap["game_enabled"], snap["game_threshold"]) == (False, 75)
+
+
 def test_display_restore_theme_no_persisted(api_client: TestClient) -> None:
     """RestoreDeviceState with nothing persisted AND no themes installed
     returns a 400 from ``http_error_if_failed`` (Result.ok=False —
     "No theme available")."""
     resp = api_client.post("/devices/0402:3922/display/restore-theme")
-    assert resp.status_code in (400, 404)
+    assert resp.status_code == 400
 
 
 def test_display_restore_theme_autoloads_first_theme(
@@ -812,7 +838,7 @@ def test_display_pause_video_no_playback(api_client: TestClient) -> None:
         "/devices/0402:3922/display/pause-video",
         json={"paused": True},
     )
-    assert resp.status_code in (400, 404)
+    assert resp.status_code == 400
 
 
 def test_display_seek_negative_rejected(api_client: TestClient) -> None:
@@ -828,7 +854,7 @@ def test_display_loop_no_playback(api_client: TestClient) -> None:
         "/devices/0402:3922/display/loop-video",
         json={"loop": False},
     )
-    assert resp.status_code in (400, 404)
+    assert resp.status_code == 400
 
 
 @pytest.mark.parametrize("resolution", API_TEST_RESOLUTIONS)
@@ -850,9 +876,19 @@ def test_display_masks_listing_empty(
 
 
 def test_theme_delete_unknown(api_client: TestClient) -> None:
-    """Deleting a non-existent theme returns a structured error."""
-    resp = api_client.delete("/theme/definitely-not-real-9zq")
-    assert resp.status_code in (400, 404)
+    """Deleting a non-existent theme returns a structured error.
+
+    It sent ``DELETE /theme/<name>``, a route that does not exist, so the
+    router's own 404 passed it and the delete was never reached.
+    """
+    root = api_client.app.state.trcc.dispatch(GetPaths()).user_content_dir
+    Path(root).mkdir(parents=True, exist_ok=True)   # the theme is missing, not the root
+    resp = api_client.request(
+        "DELETE", "/theme",
+        json={"path": str(Path(root) / "definitely-not-real-9zq")},
+    )
+    assert resp.status_code == 400
+    assert "not found" in resp.json()["detail"]
 
 
 def test_system_fonts_listing(api_client: TestClient) -> None:
@@ -896,18 +932,18 @@ def test_overlay_update_unknown(api_client: TestClient) -> None:
         "/devices/0402:3922/display/overlay-elements/el_nope",
         json={"x": 5},
     )
-    assert resp.status_code in (400, 404)
+    assert resp.status_code == 400
 
 
 def test_overlay_delete_unknown(api_client: TestClient) -> None:
     resp = api_client.delete(
         "/devices/0402:3922/display/overlay-elements/el_nope",
     )
-    assert resp.status_code in (400, 404)
+    assert resp.status_code == 400
 
 
 def test_overlay_round_trip(api_client: TestClient) -> None:
-    """Add → update → flash → delete one element via the API."""
+    """Add → update → delete one element via the API."""
     add = api_client.post(
         "/devices/0402:3922/display/overlay-elements",
         json={"type": "text", "text": "hi", "element_id": "el_api"},
@@ -919,11 +955,6 @@ def test_overlay_round_trip(api_client: TestClient) -> None:
         json={"text": "bye"},
     )
     assert upd.status_code == 200
-    flash = api_client.post(
-        f"/devices/0402:3922/display/overlay-elements/{eid}/flash",
-        json={"duration_ms": 500},
-    )
-    assert flash.status_code == 200
     rm = api_client.delete(
         f"/devices/0402:3922/display/overlay-elements/{eid}",
     )
@@ -960,7 +991,7 @@ def test_theme_cloud_list_returns_catalog(api_client: TestClient) -> None:
 def test_theme_cloud_list_unknown_category(api_client: TestClient) -> None:
     resp = api_client.get("/theme/cloud", params={"category": "zzz"})
     # Result.ok = False → http_error_if_failed → 400
-    assert resp.status_code in (400, 404)
+    assert resp.status_code == 400
 
 
 def test_theme_web_gallery_lists_downloaded_previews(
@@ -1052,7 +1083,7 @@ def test_set_language_rejects_unknown_code(api_client: TestClient) -> None:
     resp = api_client.post(
         "/config/language", json={"language": "zz_unknown"},
     )
-    assert resp.status_code in (400, 404)
+    assert resp.status_code == 400
 
 
 # --- Diagnostics ------------------------------------------------------------
@@ -1083,16 +1114,21 @@ def test_system_debug_report_in_memory(api_client: TestClient) -> None:
     assert body["output_path"] == ""
 
 
-def test_system_debug_report_to_path(
+def test_system_debug_report_writes_nothing_where_a_client_says(
     api_client: TestClient, tmp_path,
 ) -> None:
-    out = tmp_path / "bundle.txt"
+    """It wrote to any server path in ``output_path`` — over an existing file
+    included, measured — so the field is gone and the text comes back instead.
+    A client that still sends it gets the report and no file."""
+    victim = tmp_path / "precious.txt"
+    victim.write_text("USER DATA\n", encoding="utf-8")
     resp = api_client.post(
         "/system/debug-report",
-        json={"output_path": str(out), "log_tail_lines": 10},
+        json={"output_path": str(victim), "log_tail_lines": 10},
     )
     assert resp.status_code == 200
-    assert out.is_file()
+    assert resp.json()["rendered_text"]
+    assert victim.read_text(encoding="utf-8") == "USER DATA\n"
 
 
 # =========================================================================
@@ -1220,29 +1256,23 @@ def test_config_set_date_format_round_trips(api_client: TestClient) -> None:
     assert body["fmt"] == "dd.MM.yyyy"
 
 
-def test_theme_config_export_import_round_trips(api_client: TestClient) -> None:
-    # Download the device's settings snapshot as JSON.
-    resp = api_client.get("/theme/0402:3922/config-download")
-    assert resp.status_code == 200
-    assert resp.headers["content-type"].startswith("application/json")
-    payload = resp.content
-    assert payload  # non-empty JSON snapshot
+def test_no_route_restores_a_whole_device_config(api_client: TestClient) -> None:
+    """``POST /theme/config/import-upload`` restored an entire DeviceSettings
+    with no path confinement: a mask_path aimed at any readable file came back
+    inside the next ``GET /theme/{key}/download`` .tr -- a local file read,
+    re-driven 2026-10-06.  Deleted with ExportConfig/ImportConfig; it must not
+    come back."""
+    from trcc.core import commands
 
-    # Re-import it via multipart upload (key as query param, file as multipart).
-    resp2 = api_client.post(
-        "/theme/config/import-upload",
-        params={"key": "0402:3922"},
-        files={"config": ("device-config.json", payload, "application/json")},
-    )
-    assert resp2.status_code == 200
-    body = resp2.json()
-    assert body["ok"] is True
-    assert body["key"] == "0402:3922"
+    upload = api_client.post(
+        "/theme/config/import-upload", params={"key": "0402:3922"},
+        files={"config": ("x.json", b"{}", "application/json")})
+    download = api_client.get("/theme/0402:3922/config-download")
 
-
-# =========================================================================
-# theme router — listing only (save/export/import need real fixtures)
-# =========================================================================
+    assert upload.status_code in (404, 405)
+    assert download.status_code in (404, 405)
+    assert not hasattr(commands, "ImportConfig")
+    assert not hasattr(commands, "ExportConfig")
 
 
 def test_theme_save_requires_key(api_client: TestClient) -> None:
@@ -1256,29 +1286,43 @@ def test_theme_save_requires_key(api_client: TestClient) -> None:
 
 
 def test_theme_list_returns_empty_under_empty_dir(
-    api_client: TestClient, tmp_path: Path,
+    api_client: TestClient, fake_platform: FakePlatform,
 ) -> None:
     """ListThemes against an empty directory returns ok with an empty
     list — proves the route reaches Command dispatch + Result
     serialization end-to-end."""
-    resp = api_client.get("/theme/list", params={"directory": str(tmp_path)})
+    library = fake_platform.paths().user_content_dir() / "library"
+    library.mkdir(parents=True)
+    resp = api_client.get("/theme/list", params={"directory": str(library)})
     assert resp.status_code == 200
     body = resp.json()
     assert body["ok"] is True
     assert body["themes"] == []
-    assert body["directory"] == str(tmp_path)
+    assert body["directory"] == str(library.resolve())
+
+
+def test_theme_list_refuses_a_directory_outside_trcc(
+    api_client: TestClient, tmp_path: Path,
+) -> None:
+    """``?directory=`` listed any directory the process could read."""
+    resp = api_client.get("/theme/list", params={"directory": str(tmp_path)})
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == (
+        "path must name an existing file inside TRCC's data directories "
+        "(~/.trcc or ~/.trcc-user)")
 
 
 def test_theme_list_finds_themes_in_dir(
-    api_client: TestClient, tmp_path: Path,
+    api_client: TestClient, fake_platform: FakePlatform,
 ) -> None:
     """ListThemes returns each theme directory containing config.json."""
-    theme_dir = tmp_path / "MyTheme"
-    theme_dir.mkdir()
+    library = fake_platform.paths().user_content_dir() / "library"
+    theme_dir = library / "MyTheme"
+    theme_dir.mkdir(parents=True)
     (theme_dir / "trcc.json").write_text(
         '{"width": 480, "height": 480, "elements": []}',
     )
-    resp = api_client.get("/theme/list", params={"directory": str(tmp_path)})
+    resp = api_client.get("/theme/list", params={"directory": str(library)})
     assert resp.status_code == 200
     body = resp.json()
     assert body["ok"] is True
@@ -1292,19 +1336,18 @@ def test_theme_list_finds_themes_in_dir(
 # =========================================================================
 
 
-def test_display_tick_restores_then_ticks(api_client: TestClient) -> None:
-    """``POST /display/tick`` self-primes, then dispatches the ANIMATION tick.
+def test_display_tick_dispatches_only_the_animation_tick(
+        api_client: TestClient) -> None:
+    """``POST /display/tick`` dispatches ``TickDisplay`` and nothing else.
 
-    The route had no coverage at all until the tick became a Command.  Two
-    things matter and both are easy to break:
-
-    * ``RestoreDeviceState`` stays HERE rather than inside ``TickDisplay`` — a
-      stateless poller may arrive with no theme loaded, but the GUI's animation
-      timer would otherwise pay a restore 15-30 times a second.
+    * No restore: it used to self-prime with ``RestoreDeviceState`` on EVERY
+      poll — a push lasted one poll, and a failing restore cost 22 log records
+      per request.  The API runs a session now, and the session primes a panel
+      on connect (``App._prime``), once.
     * the tick itself must be ``TickDisplay``; with ``RenderAndSend`` the
       cursor never moves and a polled video sits on frame 0 (#239).
     """
-    from trcc.core.commands import RestoreDeviceState, TickDisplay
+    from trcc.core.commands import TickDisplay
 
     trcc = api_client.app.state.trcc          # type: ignore[attr-defined]
     # Depth-tracked: a Command may dispatch others, and this pins what the
@@ -1333,9 +1376,8 @@ def test_display_tick_restores_then_ticks(api_client: TestClient) -> None:
     finally:
         trcc.dispatch = real_dispatch         # type: ignore[method-assign]
 
-    assert route_dispatched == [
-        RestoreDeviceState.__name__, TickDisplay.__name__,
-    ], f"expected restore-then-animation-tick, got {route_dispatched}"
+    assert route_dispatched == [TickDisplay.__name__], (
+        f"expected only the animation tick, got {route_dispatched}")
     # #239: RenderAndSend may be TickDisplay's child, but the route must not
     # choose it — with it the cursor never advances and a video sits on frame 0.
     assert "RenderAndSend" not in route_dispatched
@@ -1377,6 +1419,7 @@ def _attach_sku_device(
     )
     trcc.devices[key] = SimpleNamespace(   # type: ignore[assignment]
         profile=profile,
+        needs_keepalive=False,             # every Device answers it (#228)
         # The REAL dataclass, not a namespace carrying two bytes.  The stub
         # version omitted ``fbl`` — a field every HandshakeResult has — and got
         # away with it only while nothing read it.  The moment ``DeviceState``
@@ -1545,17 +1588,121 @@ def test_device_reset_route_exists(api_client: TestClient) -> None:
     assert "Not Found" not in resp.text or resp.status_code == 404
 
 
-def test_push_image_is_distinct_from_send_image(api_client: TestClient) -> None:
-    """``/push-image`` (ephemeral) must not have replaced ``/send-image``.
+def test_send_image_keeps_nothing_on_disk(tmp_path: Path) -> None:
+    """#306: every upload became a saved theme and left two files behind —
+    ``uploads/<uuid>.png`` and ``single-image/<uuid>/`` — forever.  A status
+    dashboard pushing on every change wrote 305,810 pairs (26 GB) in 11 days.
 
-    ``/send-image`` takes a multipart upload and dispatches ``LoadImage``,
-    which STAGES a theme; ``/push-image`` dispatches ``SendImage``, which does
-    not.  Both must exist — collapsing them would silently change what a
-    client's existing call does.
+    Driven through the real route against a real panel, three times, because
+    a leak only shows across calls.  ``/push-image`` went in the same change:
+    the same job from a server path nothing confined.
     """
-    schema = api_client.get("/openapi.json").json()["paths"]
-    assert "/devices/{key}/display/send-image" in schema
-    assert "/devices/{key}/display/push-image" in schema
+    from trcc.adapters.render.qt import QtRenderer
+    from trcc.ui.api.main import build_app
+
+    from .mock_platform import MockPlatform
+
+    renderer = QtRenderer()
+    png = renderer.encode_png(renderer.create_surface(64, 64, color=(0, 0, 255, 255)))
+    trcc = App(MockPlatform([{"vid": "0402", "pid": "3922"}], tmp_path),
+               renderer=renderer)
+    with loopback_client(build_app(trcc=trcc)) as client:
+        for _ in range(3):
+            resp = client.post("/devices/0402:3922/display/send-image",
+                               files={"image": ("frame.png", png, "image/png")})
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["ok"] is True
+        schema = client.get("/openapi.json").json()["paths"]
+
+    content = trcc.platform.paths().user_content_dir()
+    assert list((content / "uploads").iterdir()) == []
+    assert not (content / "single-image").exists()
+    assert trcc.settings.for_device("0402:3922").current_theme is None
+    assert "/devices/{key}/display/push-image" not in schema
+
+
+def test_create_theme_keeps_only_what_a_command_still_reads(tmp_path: Path) -> None:
+    """``create-theme`` staged every upload in ``uploads/`` and never removed
+    one.  An image background is COPIED by LoadImage, so its staged file is
+    debris at once; a refused request left everything it had staged.  A mask
+    stays: ApplyMask persists the path it was given.
+    MUTATION CHECK: drop the ``finally`` cleanup -> both halves fail.
+    """
+    from trcc.adapters.render.qt import QtRenderer
+    from trcc.ui.api.main import build_app
+
+    from .mock_platform import MockPlatform
+
+    renderer = QtRenderer()
+    png = renderer.encode_png(renderer.create_surface(64, 64, color=(0, 0, 255, 255)))
+    trcc = App(MockPlatform([{"vid": "0402", "pid": "3922"}], tmp_path),
+               renderer=renderer)
+    route = "/devices/0402:3922/display/create-theme"
+    with loopback_client(build_app(trcc=trcc)) as client:
+        for _ in range(3):
+            resp = client.post(route, files={"background": ("bg.png", png, "image/png")})
+            assert resp.status_code == 200, resp.text
+        refused = client.post(route, files={
+            "background": ("bg.png", png, "image/png"),
+            "mask": ("mask.txt", b"not an image", "text/plain")})
+        assert refused.status_code == 400
+        with_mask = client.post(route, files={
+            "background": ("bg.png", png, "image/png"),
+            "mask": ("mask.png", png, "image/png")})
+        assert with_mask.status_code == 200, with_mask.text
+
+    uploads = trcc.platform.paths().user_content_dir() / "uploads"
+    mask = trcc.settings.for_device("0402:3922").mask_path
+    assert [p.name for p in uploads.iterdir()] == [Path(mask).name]
+
+
+
+def test_create_theme_reports_the_panels_size_not_the_catalogs(
+    tmp_path: Path,
+) -> None:
+    """The route re-derived the canvas from DeviceState itself; it asks the
+    one ladder now (DeviceCanvas).  A Mjolnir answers 320x240 on a USB id
+    the catalog calls 480x480."""
+    from trcc.adapters.render.qt import QtRenderer
+    from trcc.core.commands import ConnectDevice
+    from trcc.ui.api.main import build_app
+
+    from .mock_platform import MockPlatform
+
+    renderer = QtRenderer()
+    png = renderer.encode_png(renderer.create_surface(64, 64, color=(0, 0, 255, 255)))
+    trcc = App(MockPlatform([{"vid": "87ad", "pid": "70db", "pm": 5, "sub": 1}],
+                            tmp_path), renderer=renderer)
+    assert trcc.dispatch(ConnectDevice(key="87ad:70db")).ok
+    with loopback_client(build_app(trcc=trcc)) as client:
+        resp = client.post("/devices/87ad:70db/display/create-theme",
+                           files={"background": ("bg.png", png, "image/png")})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["resolution"] == "320x240"
+
+
+def test_device_state_names_the_cooler_and_the_catalogs_guess(
+    tmp_path: Path,
+) -> None:
+    """``/devices/{key}`` is the catalog row -- one name for every cooler on
+    the USB id.  ``/state`` is what the handshake found (#272)."""
+    from trcc.core.commands import ConnectDevice
+    from trcc.ui.api.main import build_app
+
+    from .mock_platform import MockPlatform
+
+    trcc = App(MockPlatform([{"vid": "87ad", "pid": "70db", "pm": 5, "sub": 1}],
+                            tmp_path), renderer=_SmokeRenderer())
+    with loopback_client(build_app(trcc=trcc)) as client:
+        missing = client.get("/devices/87ad:70db/state")
+        assert trcc.dispatch(ConnectDevice(key="87ad:70db")).ok
+        body = client.get("/devices/87ad:70db/state").json()
+
+    assert missing.status_code == 404
+    assert (body["product"], body["resolution"]) == ("Mjolnir Vision", [320, 240])
+    assert (body["catalog_product"], body["catalog_resolution"]) == (
+        "GrandVision 360 AIO", [480, 480])
 
 
 def test_new_capability_routes_are_registered(api_client: TestClient) -> None:
@@ -1563,9 +1710,7 @@ def test_new_capability_routes_are_registered(api_client: TestClient) -> None:
     schema = api_client.get("/openapi.json").json()["paths"]
     for route in (
         "/devices/{key}/display/background",        # SetBackground
-        "/devices/{key}/display/push-image",        # SendImage
         "/devices/{key}/display/render-dc",         # RenderDcStandalone
-        "/devices/{key}/display/slideshow/drive",   # Start/StopSlideshowDriver
         "/devices/{key}/led/zone-sync-zones",       # SetLedZoneSyncZones
         "/devices/{key}/reset",                     # ResetDevice
         "/theme/export-overlay",                    # ExportOverlay
@@ -1663,3 +1808,329 @@ def test_settings_routes_do_NOT_force_an_attach(
         "a settings route forced an attach — it works fine unattached, and "
         f"requiring hardware for it is a regression.  saw: {seen}"
     )
+
+
+# ── The trust boundary: no server paths, no browsers (2026-09-26) ─────────
+#
+# Measured before this pass: 14 of 18 routes that took a server path opened or
+# wrote any file the process could reach — debug-report overwrote one — and a
+# token-less server answered any web page in the user's browser, streaming the
+# live preview to it.
+
+_BOUNDARY = ("path must name an existing file inside TRCC's data directories "
+             "(~/.trcc or ~/.trcc-user)")
+_KEY = "0402:3922"
+_ROUTES_THAT_READ = [
+    ("POST", f"/devices/{_KEY}/display/background", "json", "path"),
+    ("POST", f"/devices/{_KEY}/display/play-video", "json", "path"),
+    ("POST", f"/devices/{_KEY}/display/load-video", "json", "path"),
+    ("POST", f"/devices/{_KEY}/display/export-video", "json", "path"),
+    ("POST", f"/devices/{_KEY}/display/media-player", "json", "uri"),
+    ("POST", f"/devices/{_KEY}/display/upload-mask", "json", "source"),
+    ("POST", f"/devices/{_KEY}/display/render-dc", "json", "dc_path"),
+    ("GET", "/display/video-duration", "params", "path"),
+]
+
+
+@pytest.fixture
+def panel_api(tmp_path: Path) -> Iterator[tuple[TestClient, App]]:
+    """A real 320x320 panel behind the API, with one theme and one image."""
+    from trcc.adapters.render.qt import QtRenderer
+    from trcc.ui.api.main import build_app
+
+    from .mock_platform import MockPlatform
+
+    renderer = QtRenderer()
+    app = App(MockPlatform([{"vid": "0402", "pid": "3922"}], tmp_path / "root"),
+              renderer=renderer)
+    paths = app.platform.paths()
+    theme = paths.user_data_dir() / "theme320320" / "demo"
+    theme.mkdir(parents=True)
+    (theme / "trcc.json").write_text(json.dumps({
+        "name": "demo", "width": 320, "height": 320, "elements": [{
+            "type": "clock", "x": 10, "y": 10, "color": "#ffffff", "size": 24,
+            "bold": False, "italic": False, "source": "time"}],
+    }), encoding="utf-8")
+    image = renderer.encode_png(renderer.create_surface(32, 32, color=(0, 0, 255, 255)))
+    (theme / "00.png").write_bytes(image)
+    (paths.user_content_dir() / "inside.png").write_bytes(image)
+    with loopback_client(build_app(trcc=app)) as client:
+        assert client.post(f"/devices/{_KEY}/connect").status_code == 200
+        yield client, app
+
+
+def _read(client: TestClient, verb: str, url: str, where: str, field: str,
+          path: str) -> Any:
+    body = {field: path, "width": 320, "height": 320}
+    return client.request(verb, url, **{where: body})
+
+
+@pytest.mark.parametrize("verb,url,where,field", _ROUTES_THAT_READ)
+def test_a_route_refuses_a_path_outside_trcc(
+    panel_api: tuple[TestClient, App], tmp_path: Path,
+    verb: str, url: str, where: str, field: str,
+) -> None:
+    client, _ = panel_api
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    resp = _read(client, verb, url, where, field, str(outside))
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == _BOUNDARY
+
+
+@pytest.mark.parametrize("verb,url,where,field", _ROUTES_THAT_READ)
+def test_a_route_accepts_a_path_inside_trcc(
+    panel_api: tuple[TestClient, App],
+    verb: str, url: str, where: str, field: str,
+) -> None:
+    """Past the boundary; whatever the Command then says about a PNG it
+    expected to be a video is its own answer, not the boundary's.  FastAPI's
+    own "Not Found" is excluded by name: a route that does not exist is not
+    past anything, and this assertion passed on one until it said so."""
+    client, app = panel_api
+    inside = app.platform.paths().user_content_dir() / "inside.png"
+
+    resp = _read(client, verb, url, where, field, str(inside))
+
+    assert resp.json().get("detail") not in (_BOUNDARY, "Not Found")
+
+
+def test_a_web_url_is_not_a_path(panel_api: tuple[TestClient, App]) -> None:
+    client, app = panel_api
+    resp = client.post(f"/devices/{_KEY}/display/media-player",
+                       json={"uri": "https://example.com/stream.m3u8"})
+    assert resp.status_code == 200
+    assert app.settings.for_device(_KEY).media_player_uri == (
+        "https://example.com/stream.m3u8")
+
+
+@pytest.fixture
+def private_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The system temp dir, made private to this test so a leak is countable."""
+    import tempfile
+    private = tmp_path / "systmp"
+    private.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(private))
+    return private
+
+
+def test_the_exports_come_back_as_bytes_and_leave_nothing(
+    panel_api: tuple[TestClient, App], private_tmp: Path,
+) -> None:
+    client, app = panel_api
+    body = {"key": _KEY, "theme_name": "demo"}
+    demo = app.platform.paths().user_data_dir() / "theme320320" / "demo"
+    assert app.dispatch(LoadTheme(key=_KEY, path=demo)).ok
+
+    overlay = client.post("/theme/export-overlay", json=body)
+    dc = client.post("/theme/demo/export-dc", json={"key": _KEY})
+    archive = client.get(f"/theme/{_KEY}/demo/download")
+    shown = client.get(f"/theme/{_KEY}/download")
+    (app.platform.paths().user_content_dir() / "demo.dc").write_bytes(dc.content)
+    png = client.post(f"/devices/{_KEY}/display/render-dc", json={
+        "dc_path": str(app.platform.paths().user_content_dir() / "demo.dc"),
+        "width": 320, "height": 320})
+
+    assert [r.status_code for r in (overlay, dc, archive, shown, png)
+            ] == [200] * 5
+    assert shown.content[:4] == b"\xdd\xdc\xdd\xdc"     # a Windows .tr
+    assert json.loads(overlay.content)["elements"][0]["type"] == "clock"
+    assert overlay.headers["content-disposition"] == (
+        'attachment; filename="demo-overlay.json"')
+    assert dc.headers["content-disposition"] == (
+        'attachment; filename="config1.dc"')
+    reimported = client.post(
+        "/theme/import-upload", params={"key": _KEY, "name": "roundtrip"},
+        files={"archive": ("demo.tr", archive.content, "application/octet-stream")})
+    assert reimported.status_code == 200, reimported.text
+    assert png.content[:8] == b"\x89PNG\r\n\x1a\n"
+    assert list(private_tmp.iterdir()) == []
+
+
+def test_a_malformed_range_leaves_no_temp_file(
+    panel_api: tuple[TestClient, App], private_tmp: Path,
+) -> None:
+    """``FileResponse`` skipped its cleanup task on a bad ``Range`` header:
+    3 of 3 requests leaked their tempfile.  Bytes in a plain Response do not."""
+    client, _ = panel_api
+    for bad in ("bytes=abc", "bytes=99999999-"):
+        client.get(f"/theme/{_KEY}/demo/download", headers={"range": bad})
+        client.get(f"/theme/{_KEY}/download", headers={"range": bad})
+    assert list(private_tmp.iterdir()) == []
+
+
+@pytest.mark.parametrize("headers", [
+    {"host": "evil.example"},
+    {"origin": "https://evil.example"},
+    {"origin": "null"},
+])
+def test_a_tokenless_server_refuses_a_browser(
+    panel_api: tuple[TestClient, App], headers: dict[str, str],
+) -> None:
+    client, _ = panel_api
+    resp = client.get("/devices", headers=headers)
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "Refused: not a loopback client"
+
+
+def test_a_tokenless_server_answers_its_own_origin(
+    panel_api: tuple[TestClient, App],
+) -> None:
+    client, _ = panel_api
+    resp = client.get("/devices", headers={"origin": "http://localhost:8080"})
+    assert resp.status_code == 200
+
+
+@pytest.mark.parametrize("path", [
+    f"/devices/{_KEY}/display/preview/stream", "/events"])
+def test_a_websocket_refuses_a_foreign_origin(
+    panel_api: tuple[TestClient, App], path: str,
+) -> None:
+    from starlette.websockets import WebSocketDisconnect
+
+    client, _ = panel_api
+    # Refused at the handshake, so the body never runs: reaching it means the
+    # socket was admitted, and ``raises`` fails at once instead of waiting on
+    # a stream that would never end.
+    with pytest.raises(WebSocketDisconnect) as refused:
+        with client.websocket_connect(
+                path, headers={"origin": "https://evil.example"}):
+            pass
+    assert refused.value.code == 1008
+
+
+def test_with_a_token_the_token_governs(
+    panel_api: tuple[TestClient, App],
+) -> None:
+    """A LAN bind needs a token, and then any Host is fine — the token is the
+    credential a page cannot forge."""
+    from trcc.ui.api.main import configure_auth
+
+    client, _ = panel_api
+    configure_auth("secret-token")
+    try:
+        resp = client.get("/devices", headers={
+            "host": "192.168.1.20:8080", "X-API-Token": "secret-token"})
+    finally:
+        configure_auth(None)
+    assert resp.status_code == 200
+
+
+def test_keepalive_cannot_run_until_interrupted_over_http(
+    panel_api: tuple[TestClient, App],
+) -> None:
+    """``count=0`` loops until Ctrl-C, which no HTTP request can send — the
+    default body held a server worker forever."""
+    client, _ = panel_api
+    resp = client.post(f"/devices/{_KEY}/display/keepalive", json={"count": 0})
+    assert resp.status_code == 422
+
+
+def test_a_tick_poller_leaves_a_pushed_image_on_the_panel(
+    panel_api: tuple[TestClient, App],
+) -> None:
+    """``/tick`` self-primes with a restore on every poll, which reloaded the
+    saved theme over ``/send-image`` one poll later (#306's second hole)."""
+    client, app = panel_api
+    image = (app.platform.paths().user_content_dir() / "inside.png").read_bytes()
+    assert client.post(f"/devices/{_KEY}/display/send-image",
+                       files={"image": ("x.png", image, "image/png")}).json()["ok"]
+
+    tick = client.post(f"/devices/{_KEY}/display/tick")
+
+    assert tick.status_code == 200
+    assert tick.json()["message"] == "held by a pushed frame"
+    assert _KEY not in app.active_themes
+
+
+def test_a_route_connects_the_device_itself(tmp_path: Path) -> None:
+    """The API decided "connect first" per route, and 6 routes did not -- so
+    ``/sleep`` and ``/media-player`` failed "Not attached" where the CLI
+    worked.  Now the Command connects, whichever face dispatched it."""
+    from trcc.adapters.render.qt import QtRenderer
+    from trcc.ui.api.main import build_app
+
+    from .mock_platform import MockPlatform
+
+    app = App(MockPlatform([{"vid": "0402", "pid": "3922"},
+                            {"type": "led", "vid": "0416", "pid": "8001",
+                             "pm": 208}], tmp_path), renderer=QtRenderer())
+    with loopback_client(build_app(trcc=app)) as client:
+        sleep = client.post("/devices/0402:3922/display/sleep")
+        led = client.post("/devices/0416:8001/led/render", json={"phase": 0})
+
+    assert (sleep.status_code, led.status_code) == (200, 200)
+    assert app.devices["0402:3922"].is_connected
+    assert app.devices["0416:8001"].is_connected
+
+
+def test_screencast_stop_is_one_command(
+        api_client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``POST /screencast/stop`` sends StopScreencast alone -- which ends the
+    capture driver too.  Every UI used to pair a StopScreencastDriver with it by
+    hand, and the CLI's ``stop-screencast`` did not."""
+    seen: list[str] = []
+    original = _bus_of(api_client).dispatch
+    monkeypatch.setattr(_bus_of(api_client), "dispatch",
+                        lambda cmd: (seen.append(type(cmd).__name__),
+                                     original(cmd))[1])
+
+    response = api_client.post("/devices/0402:3922/display/screencast/stop")
+
+    assert response.status_code == 200, response.text
+    assert seen == ["StopScreencast"]
+
+
+def test_system_rgb_follow_status_and_off(api_client: TestClient) -> None:
+    """#160: nothing follows by default; off needs no OpenRGB."""
+    status = api_client.get("/system/rgb-follow").json()
+    assert (status["mode"], status["host"], status["port"]) == (
+        "off", "127.0.0.1", 6742)
+    resp = api_client.post("/system/rgb-follow",
+                           json={"mode": "off", "port": 6800})
+    assert resp.status_code == 200
+    assert (resp.json()["mode"], resp.json()["port"]) == ("off", 6800)
+    assert resp.json()["message"] == (
+        "Nothing follows -- TRCC sends no colours to other lights")
+
+
+def test_system_rgb_follow_takes_a_host_not_a_url(api_client: TestClient) -> None:
+    for host in ("http://evil", "a/b", "x y"):
+        resp = api_client.post("/system/rgb-follow",
+                               json={"mode": "off", "host": host})
+        assert resp.status_code == 422, host
+    for bad in ({"mode": "off", "port": 70000}, {"mode": "rainbow"}):
+        assert api_client.post("/system/rgb-follow", json=bad
+                               ).status_code == 422, bad
+
+
+def test_system_ram_lighting_on_an_os_without_it(api_client: TestClient) -> None:
+    status = api_client.get("/system/ram-lighting").json()
+    assert (status["state"], status["message"]) == (
+        "unsupported", "RAM lighting is not available on FakePlatform yet")
+    resp = api_client.post("/system/ram-lighting", json={"enabled": True})
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "RAM lighting is not available on FakePlatform yet"
+    assert api_client.post("/system/ram-lighting", json={}).status_code == 422
+
+
+def test_system_rgb_routes_on_an_os_without_the_bus(api_client: TestClient) -> None:
+    listed = api_client.get("/system/rgb").json()
+    assert (listed["scanned"], listed["lights"]) == (False, [])
+    scan = api_client.post("/system/rgb/scan")
+    assert scan.status_code == 400
+    assert scan.json()["detail"].startswith("RAM: no SMBus access on FakePlatform")
+    moved = api_client.post("/system/rgb/scan",
+                            json={"host": "10.0.0.2", "port": 6800})
+    assert moved.status_code == 400   # still no SMBus -- but the address moved
+    assert api_client.get("/system/rgb-follow").json()["host"] == "10.0.0.2"
+    assert api_client.post("/system/rgb/scan",
+                           json={"host": "http://x/"}).status_code == 422
+    effect = api_client.post("/system/ram-effect", json={"effect": "rainbow"})
+    assert effect.status_code == 400
+    assert api_client.post("/system/ram-effect",
+                           json={"effect": "disco"}).status_code == 422
+    assert api_client.post("/system/ram-effect", json={
+        "effect": "static", "brightness": 999}).status_code == 422

@@ -1,6 +1,10 @@
 """Commands — UI contract dispatched through App.dispatch."""
 from __future__ import annotations
 
+from pathlib import Path
+
+import pytest
+
 from trcc.app import App
 from trcc.core.commands import (
     DisableAutostart,
@@ -72,6 +76,31 @@ def test_autostart_refresh_never_enables(fake_platform) -> None:
     assert r.ok is True
     assert r.enabled is False, "refresh installed an entry that was not there"
     assert app.dispatch(GetAutostartStatus()).enabled is False
+
+
+def test_an_autostart_choice_is_recorded_and_survives_a_restart(
+    fake_platform,
+) -> None:
+    """Enable AND Disable record that autostart was chosen — read back from
+    disk by a second App, because a write nobody reads back proves nothing."""
+    app = App(fake_platform)
+    assert app.dispatch(GetAutostartStatus()).configured is False
+
+    app.dispatch(DisableAutostart())
+
+    assert App(fake_platform).dispatch(GetAutostartStatus()).configured is True
+
+
+def test_enable_records_the_choice(fake_platform) -> None:
+    app = App(fake_platform)
+    assert app.dispatch(EnableAutostart()).configured is True
+    assert App(fake_platform).dispatch(GetAutostartStatus()).configured is True
+
+
+def test_a_rejected_enable_records_nothing(fake_platform) -> None:
+    app = App(fake_platform)
+    assert app.dispatch(EnableAutostart(target="nonsense")).ok is False
+    assert app.dispatch(GetAutostartStatus()).configured is False
 
 
 def test_autostart_refresh_keeps_an_existing_entry(fake_platform) -> None:
@@ -268,18 +297,19 @@ def test_advance_slideshow_reads_the_persisted_config(fake_platform) -> None:
     The gui used to build a SlideshowConfig from its own panel, making the
     panel a second source for a fact ``ConfigureSlideshow`` already persists.
     """
+    # Held still: SetSlideshow starts the real driver, whose first tick
+    # would take the "first advance" this test is about.
+    from trcc.adapters.infra.send_scheduler import SyncSendScheduler
     from trcc.core.commands import (
         AdvanceSlideshow,
         ConfigureSlideshow,
         SetSlideshow,
     )
-
-    app = App(fake_platform)
+    app = App(fake_platform, send_scheduler=SyncSendScheduler())
     key = "0402:3922"
     # Two Commands, deliberately: ConfigureSlideshow owns the list + interval,
-    # SetSlideshow owns the on/off.  The gui dispatches both, and starts its
-    # timer only when enabled — so reading ``slideshow_enabled`` here matches
-    # exactly when that timer would have been ticking.
+    # SetSlideshow owns the on/off -- and with it the driver that dispatches
+    # this Command.
     app.dispatch(ConfigureSlideshow(
         key=key, themes=("a", "b", "c"), interval_s=1.0,
     ))
@@ -313,13 +343,15 @@ def test_advance_slideshow_says_nothing_is_running(fake_platform) -> None:
 def test_advance_slideshow_holds_inside_the_interval(fake_platform) -> None:
     """A second tick inside the window does not rotate — ``due`` distinguishes
     "not yet" from "nothing configured", which a timer-driver needs."""
+    # Held still: SetSlideshow starts the real driver, whose first tick
+    # would take the "first advance" this test is about.
+    from trcc.adapters.infra.send_scheduler import SyncSendScheduler
     from trcc.core.commands import (
         AdvanceSlideshow,
         ConfigureSlideshow,
         SetSlideshow,
     )
-
-    app = App(fake_platform)
+    app = App(fake_platform, send_scheduler=SyncSendScheduler())
     key = "0402:3922"
     app.dispatch(ConfigureSlideshow(
         key=key, themes=("a", "b"), interval_s=3600.0,
@@ -385,18 +417,24 @@ def _led_key() -> str:
     return f"{p.vid:04x}:{p.pid:04x}"
 
 
-def test_start_screencast_refuses_an_led_controller(fake_platform) -> None:
-    """ok=False, and — the point — nothing persisted."""
+def test_start_screencast_refuses_an_led_controller(tmp_path) -> None:
+    """ok=False, and — the point — nothing persisted.
+
+    A connectable LED: ``StartScreencast`` uses its device, so dispatch
+    connects it first and the refusal comes after — as on real hardware.  A
+    fake that cannot handshake would fail at the connect instead.
+    """
+    from tests.mock_platform import MockPlatform
     from trcc.core.commands import StartScreencast
 
-    app = App(fake_platform)
-    key = _led_key()
-    app.attach(int(key[:4], 16), int(key[5:], 16))
+    app = App(MockPlatform([{"type": "led", "vid": "0416", "pid": "8001",
+                             "pm": 208}], tmp_path))
+    key = "0416:8001"
 
     result = app.dispatch(StartScreencast(key=key, x=0, y=0, w=320, h=320))
 
     assert result.ok is False
-    assert "no panel" in result.message
+    assert result.message == f"{key} (LED) has no frame_render capability"
     assert app.settings.for_device(key).screencast_region is None, (
         "refused, but the region was written anyway — the driver reads this"
     )
@@ -417,6 +455,241 @@ def test_start_screencast_still_accepts_an_lcd(fake_platform) -> None:
 
     assert result.ok is True, result.message
     assert app.settings.for_device(key).screencast_region == (1, 2, 64, 48, False)
+
+
+# ── Frame Commands refuse a device that draws no frames ─────────────
+#
+# The LED Commands refused a non-LED in one voice (``_not_an_led``, #252); the
+# frame Commands had no mirror.  Measured on the mock 2026-10-06: ``SendColor``
+# at an LED rendered a 320x320 frame, had it refused at the wire, and left the
+# LED in ``App.held`` — its animation and sensor refresh both stopped until an
+# LED setting changed.
+
+
+def _frame_commands(tmp_path):
+    """One of every Command whose whole job is a frame, aimed at the LED."""
+    from trcc.core.commands import (
+        BuildPreview,
+        PlayVideo,
+        RenderAndSend,
+        SendColor,
+        SendFrame,
+        SendImage,
+        SendScreencastFrame,
+        SetScreencastRegion,
+    )
+    from trcc.core.models import RawFrame
+
+    key = _led_key()
+    image = tmp_path / "x.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n")
+    video = tmp_path / "x.mp4"
+    video.write_bytes(b"\0")
+    return [
+        SendFrame(key=key, data=b"\0" * 64),
+        SendColor(key=key, r=255, g=0, b=0),
+        SendImage(key=key, path=image),
+        RenderAndSend(key=key),
+        BuildPreview(key=key),
+        PlayVideo(key=key, path=video),
+        SetScreencastRegion(key=key, x=0, y=0, w=64, h=48),
+        SendScreencastFrame(key=key, frame=RawFrame(data=b"\0" * 12,
+                                                    width=2, height=2)),
+    ]
+
+
+@pytest.mark.parametrize("index", range(8))
+def test_a_frame_command_refuses_an_led_and_leaves_it_running(
+    tmp_path, index: int,
+) -> None:
+    """Refused by capability, and — the point — the LED is not held.
+
+    MUTATION CHECK: delete the ``_lacks`` guard from any one of these Commands
+    and its row fails.
+    """
+    from tests.mock_platform import MockPlatform
+    from trcc.adapters.infra.send_scheduler import SyncSendScheduler
+    from trcc.adapters.render.qt import QtRenderer
+    from trcc.core.commands import ConnectDevice
+
+    key = _led_key()
+    # A real renderer and sender, as in the App: without them an unguarded
+    # Command dies on "no renderer" before it can hold anything.
+    app = App(MockPlatform([{"type": "led", "vid": key[:4], "pid": key[5:],
+                             "pm": 16}], tmp_path),
+              renderer=QtRenderer(), send_scheduler=SyncSendScheduler())
+    try:
+        assert app.dispatch(ConnectDevice(key=key)).ok
+        cmd = _frame_commands(tmp_path)[index]
+
+        result = app.dispatch(cmd)
+
+        assert key not in app.held, (
+            f"{type(cmd).__name__} held the LED — its animation and sensor "
+            "refresh stop until an LED setting changes"
+        )
+        assert result.ok is False
+        assert result.message == f"{key} (LED) has no frame_render capability"
+    finally:
+        app.close()
+
+
+def test_lacks_answers_from_the_registry_when_nothing_is_attached(
+    fake_platform,
+) -> None:
+    """The ternary's other two arms: registry, and "cannot tell" is allowed."""
+    from trcc.core.commands._helpers import _lacks
+    from trcc.core.models import Capability
+
+    app = App(fake_platform)
+    key = _led_key()
+    assert key not in app.devices
+
+    assert _lacks(app, key, Capability.FRAME_RENDER) == (
+        f"{key} (LED) has no frame_render capability")
+    assert _lacks(app, key, Capability.EFFECTS) is None
+    assert _lacks(app, "ffff:ffff", Capability.FRAME_RENDER) is None
+    assert _lacks(app, "not-a-key", Capability.FRAME_RENDER) is None
+
+
+def test_a_device_that_draws_no_frames_is_neither_primed_nor_rendered(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shape of a self-rendering device: not an LED, and no frames.
+
+    ``_prime`` and the render observer used to read "not an LED" as "a frame
+    LCD", so such a device would have been restored and rendered to.  An LCD
+    with ``FRAME_RENDER`` taken out of its kind's set stands in for it; the
+    control half proves the same App DOES prime and render with it in.
+
+    MUTATION CHECK: drop the ``FRAME_RENDER`` test from ``_prime`` or from
+    ``_DeviceRenderObserver``'s per-key loop and this fails.  The loop is the
+    only gate the observer needs: the sensor sweep's keys go through it too.
+    """
+    from tests.mock_platform import MockPlatform
+    from trcc.adapters.render.qt import QtRenderer
+    from trcc.core.commands import (
+        ConnectDevice,
+        RenderAndSend,
+        RestoreDeviceState,
+    )
+    from trcc.core.events import OverlayChanged, SensorsUpdated
+    from trcc.core.models import (
+        CAPABILITIES_BY_KIND,
+        Capability,
+        Kind,
+        Theme,
+    )
+
+    key = "0402:3922"
+    # A renderer, or the observer returns before it reads a single device.
+    app = App(MockPlatform([{"type": "lcd", "vid": "0402", "pid": "3922",
+                             "fbl": 100}], tmp_path), renderer=QtRenderer())
+    try:
+        assert app.dispatch(ConnectDevice(key=key)).ok
+        rendered: list[str] = []
+        restored: list[str] = []
+        real_dispatch = app.dispatch
+
+        def recording_dispatch(cmd):
+            for kind, seen in ((RestoreDeviceState, restored),
+                               (RenderAndSend, rendered)):
+                if isinstance(cmd, kind):
+                    seen.append(cmd.key)
+                    return None
+            return real_dispatch(cmd)
+
+        monkeypatch.setattr(app, "dispatch", recording_dispatch)
+
+        def drive() -> None:
+            app.active_themes.pop(key, None)
+            app._prime(key)
+            app.active_themes[key] = Theme(name="T", path=Path("/nonexistent"),
+                                           resolution=(320, 320))
+            app.events.publish(SensorsUpdated(readings={}, metrics=None))
+            app.events.publish(OverlayChanged(key=key, enabled=True))
+
+        drive()
+        assert (restored, rendered) == ([key], [key, key]), "control"
+
+        restored.clear()
+        rendered.clear()
+        monkeypatch.setitem(
+            CAPABILITIES_BY_KIND, Kind.LCD,
+            CAPABILITIES_BY_KIND[Kind.LCD] - {Capability.FRAME_RENDER})
+        drive()
+        assert (restored, rendered) == ([], [])
+    finally:
+        app.close()
+
+
+def test_keepalive_says_why_the_device_is_missing(fake_platform) -> None:
+    """A failed connect leaves no cached frame either, and the cache was
+    checked FIRST — so ``keepalive`` answered "No cached frame" and hid the
+    reason, which for hardware we do not own is the whole diagnosis."""
+    from trcc.core.commands import KeepAliveLoop
+
+    fake_platform.scsi.open = lambda: False
+    app = App(fake_platform)
+
+    result = app.dispatch(KeepAliveLoop(key="0402:3922", count=1))
+
+    assert result.ok is False
+    assert result.message == ("Not attached: 0402:3922 — Failed to open scsi "
+                              "transport for 0402:3922")
+
+
+def _keepalive_app(fake_platform) -> App:
+    from trcc.adapters.render.qt import QtRenderer
+    return App(fake_platform, renderer=QtRenderer())
+
+
+def test_keepalive_keeps_a_pushed_frame(fake_platform) -> None:
+    """``trcc display keepalive`` after ``display color`` threw the colour away
+    in daemon mode: the CLI restored the saved theme first, unconditionally
+    (#267).  A panel with a frame to resend keeps it -- and its hold.
+    MUTATION CHECK: restore in KeepAliveLoop whatever is cached → this fails.
+    """
+    from trcc.core.commands import KeepAliveLoop, SendColor
+
+    app = _keepalive_app(fake_platform)
+    assert app.dispatch(SendColor(key="0402:3922", r=255, g=0, b=0)).ok
+    pushed = app.senders["0402:3922"].last()
+
+    result = app.dispatch(KeepAliveLoop(key="0402:3922", count=1))
+
+    assert result.ok, result.message
+    assert "0402:3922" in app.held
+    assert app.senders["0402:3922"].last() == pushed
+
+
+def test_keepalive_shows_the_saved_display_when_nothing_is_cached(
+        fake_platform) -> None:
+    """A fresh process has nothing to resend: the saved display (here the
+    Theme1 fallback) is shown once and becomes the frame.
+    MUTATION CHECK: drop the restore from KeepAliveLoop → this fails."""
+    from tests.conftest import renderable_theme
+    from trcc.core.commands import KeepAliveLoop
+
+    app = _keepalive_app(fake_platform)
+    renderable_theme(app.platform.paths().theme_dir(320, 320), "Theme1")
+
+    result = app.dispatch(KeepAliveLoop(key="0402:3922", count=1))
+
+    assert result.ok, result.message
+    assert app.active_themes["0402:3922"].name == "Theme1"
+    assert app.senders["0402:3922"].last() is not None
+
+
+def test_keepalive_with_nothing_installed_says_so(fake_platform) -> None:
+    from trcc.core.commands import KeepAliveLoop
+
+    result = _keepalive_app(fake_platform).dispatch(
+        KeepAliveLoop(key="0402:3922", count=1))
+
+    assert (result.ok, result.message) == (
+        False, "No theme available for this device — install themes or load "
+               "a theme first")
 
 
 def test_list_memory_slots_maps_absent_fields_to_empty(fake_platform) -> None:
@@ -652,3 +925,80 @@ def test_read_sensors_declares_the_unit_its_values_are_in(fake_platform) -> None
     by_id = {r.sensor_id: r for r in app.dispatch(ReadSensors()).readings}
     assert by_id["cpu:temp"].value == 42.0
     assert by_id["cpu:temp"].unit == "°C"
+
+
+
+def test_split_mode_starts_at_style_2_and_a_chosen_off_survives_a_restart(
+    fake_platform,
+) -> None:
+    """The C# starts at style 2 (``FormLCD.cs:232``).  The App used to start at
+    0, and only the gui made it 2 -- by writing it on open.  0 stays "off"."""
+    from trcc.core.commands import SetSplitMode
+
+    key = "87ad:70db"
+    assert App(fake_platform).settings.for_device(key).split_mode == 2
+
+    App(fake_platform).dispatch(SetSplitMode(key=key, mode=0))
+
+    assert App(fake_platform).settings.for_device(key).split_mode == 0
+
+
+# ── App-wide settings announce themselves (2026-10-02) ──────────────────────
+
+def test_each_app_wide_setting_announces_its_change(fake_platform) -> None:
+    """Disk, dashboard and autostart changed in silence, so a window showed
+    only what IT had last sent -- a change from the CLI, the API or the other
+    window reached no open UI until it was reopened.
+
+    MUTATION CHECK -- MEASURED 2026-10-02: drop any one publish → fails.
+    """
+    from trcc.core.commands import (
+        DisableAutostart,
+        EnableAutostart,
+        SetDiskDevice,
+        SetSensorDashboard,
+    )
+    from trcc.core.events import (
+        AutostartChanged,
+        DiskDeviceChanged,
+        SensorDashboardChanged,
+    )
+    from trcc.core.models import PanelConfig
+
+    app = App(platform=fake_platform)
+    seen: list[object] = []
+    for kind in (AutostartChanged, DiskDeviceChanged, SensorDashboardChanged):
+        app.events.subscribe(kind, seen.append)  # type: ignore[arg-type]
+
+    for command in (SetDiskDevice(disk_key="nvme1"), SetDiskDevice(disk_key=""),
+                    SetSensorDashboard(panels=(PanelConfig.custom(),)),
+                    SetSensorDashboard(panels=()),          # refused: no event
+                    EnableAutostart(), DisableAutostart()):
+        app.dispatch(command)
+
+    assert seen == [
+        DiskDeviceChanged(disk_key="nvme1"), DiskDeviceChanged(disk_key=None),
+        SensorDashboardChanged(panels=1),
+        AutostartChanged(enabled=True), AutostartChanged(enabled=False),
+    ]
+
+
+def test_run_upgrade_runs_nothing_and_says_what_to_run(fake_platform, monkeypatch) -> None:
+    """It spawned a root package-manager upgrade (through the API too, from an
+    HTTP POST); it now answers with the command for this install, and runs
+    nothing.  MUTATION CHECK: subprocess.run again -> the sentinel raises."""
+    import subprocess
+
+    from trcc.app import App
+    from trcc.core.commands import RunUpgrade
+
+    def no_spawn(*a, **k):
+        raise AssertionError("RunUpgrade spawned a process")
+
+    monkeypatch.setattr(subprocess, "run", no_spawn)
+    monkeypatch.setattr(fake_platform, "upgrade_hint", lambda: "pipx upgrade trcc-linux")
+
+    result = App(fake_platform).dispatch(RunUpgrade())
+
+    assert result.ok
+    assert "pipx upgrade trcc-linux" in result.message

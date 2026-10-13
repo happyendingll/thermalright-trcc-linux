@@ -88,6 +88,7 @@ BACKGROUND_LOAD_VIDEO_POS = (230, 73, 80, 16, 9)
 # Media Player panel (P01播放器) — 351x100
 MEDIA_PLAYER_TITLE_POS = (7, 73, 140, 22, 12)
 MEDIA_PLAYER_LOAD_POS = (150, 73, 80, 16, 9)
+MEDIA_PLAYER_URL_POS = (230, 73, 80, 16, 9)
 
 # Screencast panel (P01投屏显示xy) — 351x100
 SCREENCAST_TITLE_POS = (7, 67, 120, 22, 12)
@@ -102,6 +103,11 @@ PARAM_COLOUR_POS = (13, 124, 80, 16, 10)
 
 # Local Theme browser (P0本地主题) — 732x652
 LOCAL_THEME_POS = (23, 28, 140, 18, 12)
+# Game mode's threshold caption, left of textBoxCPU (336, 29).  Printed the
+# same in all ten P0本地主题 variants, so it is never translated: x 276-330,
+# y 31-44, #b3b3b3 -- 10 pt YaHei is the width that matches.
+LOCAL_GAME_CPU_POS = (276, 29, 60, 18, 10)
+LOCAL_GAME_CPU_TEXT = "CPU(%)>"
 
 # Online Theme browser (P0云端主题) — 732x652
 ONLINE_THEME_POS = (23, 28, 160, 18, 12)
@@ -114,8 +120,7 @@ GALLERY_TAB_FONT = 9
 
 # Main view (P0CZTV) — 1274x800
 DISPLAY_ANGLE_POS = (50, 664, 120, 16, 9)
-SAVE_AS_POS = (286, 664, 70, 16, 9)
-EXPORT_IMPORT_POS = (407, 664, 100, 16, 9)
+SAVE_AS_POS = (386, 664, 70, 16, 9)       # over textBoxCMM (378, 684), 2.1.8
 
 # Shortcuts panel (shortcuts_panel) — 230x430
 SHORTCUTS_COORDINATE_POS = (8, 5, 110, 16, 10)
@@ -147,6 +152,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': '背景编辑',
         'Load Image': '载入图片',
         'Load Video': '载入视频',
+        'Web Video': '网络视频',
         'Media Player': '视频播放器',
         'Screencast': '投屏显示',
         'Double-click to delete card': '双击删除卡片',
@@ -189,6 +195,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': '负载联动',
         'Display Selection': '功能选择',
         'Circulate': '轮播',
+        'Select all': '全选',
     },
     'zh_TW': {
         'Layer Mask': '佈局蒙板',
@@ -198,6 +205,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': '背景顯示',
         'Load Image': '載入圖片',
         'Load Video': '載入視頻',
+        'Web Video': '網絡視頻',
         'Media Player': '媒體播放機',
         'Screencast': '投屏顯示',
         'Double-click to delete card': '按兩下滑鼠刪除卡片',
@@ -240,6 +248,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': '負載聯動',
         'Display Selection': '功能選擇',
         'Circulate': '輪播',
+        'Select all': '全選',
     },
     'en': {
         'Layer Mask': 'Layer Mask',
@@ -249,6 +258,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'Background',
         'Load Image': 'Load Image',
         'Load Video': 'Load Video',
+        'Web Video': 'Web Video',
         'Media Player': 'Media Player',
         'Screencast': 'Screencast',
         'Double-click to delete card': 'Double-click to delete card',
@@ -291,6 +301,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'Load Linked',
         'Display Selection': 'Display Selection',
         'Circulate': 'Circulate',
+        'Select all': 'Select all',
         # LED info-panel field labels (sourced from the C# en resx panels:
         # D0LC1en memory, D0LF11en disk, D0LC2en clock).  Rendered as tr()
         # overlays since our panel backgrounds are label-less here.
@@ -328,6 +339,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'Hintergrund',
         'Load Image': 'Bild laden',
         'Load Video': 'Video laden',
+        'Web Video': 'Webvideo',
         'Media Player': 'Mediaplayer',
         'Screencast': 'Bildschirmübertragung',
         'Double-click to delete card': 'Doppelklick zum Löschen',
@@ -370,6 +382,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'Last-Modus',
         'Display Selection': 'Funktion',
         'Circulate': 'Wechselnd',
+        'Select all': 'Alle auswählen',
     },
     'ru': {
         'Layer Mask': 'Покрытие',
@@ -379,6 +392,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'Фон',
         'Load Image': 'Загрузить',
         'Load Video': 'Загрузить видео',
+        'Web Video': 'Веб-видео',
         'Media Player': 'Медиаплеер',
         'Screencast': 'Трансляция',
         'Double-click to delete card': 'Двойной щелчок для удаления',
@@ -421,6 +435,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'По нагр.',
         'Display Selection': 'Функции',
         'Circulate': 'По очереди',
+        'Select all': 'Выбрать все',
     },
     'fr': {
         'Layer Mask': 'Masque de couche',
@@ -430,6 +445,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'Arrière-plan',
         'Load Image': 'Charger image',
         'Load Video': 'Charger vidéo',
+        'Web Video': 'Vidéo web',
         'Media Player': 'Lecteur média',
         'Screencast': 'Diffusion d\'écran',
         'Double-click to delete card': 'Double-cliquez pour supprimer',
@@ -472,6 +488,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'Lié charge',
         'Display Selection': 'Sélection',
         'Circulate': 'Alterner',
+        'Select all': 'Tout sélectionner',
     },
     'pt': {
         'Layer Mask': 'Máscara de camada',
@@ -481,6 +498,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'Fundo',
         'Load Image': 'Carregar imagem',
         'Load Video': 'Carregar vídeo',
+        'Web Video': 'Vídeo da web',
         'Media Player': 'Leitor multimédia',
         'Screencast': 'Transmissão de ecrã',
         'Double-click to delete card': 'Duplo clique para apagar',
@@ -523,6 +541,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'Vínc. carga',
         'Display Selection': 'Seleção',
         'Circulate': 'Circular',
+        'Select all': 'Selecionar tudo',
     },
     'ja': {
         'Layer Mask': 'レイヤーマスク',
@@ -532,6 +551,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': '背景',
         'Load Image': '画像読み込み',
         'Load Video': '動画読み込み',
+        'Web Video': 'ウェブ動画',
         'Media Player': 'メディアプレーヤー',
         'Screencast': 'スクリーンキャスト',
         'Double-click to delete card': 'ダブルクリックで削除',
@@ -574,6 +594,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': '負荷連動',
         'Display Selection': '機能',
         'Circulate': 'かわるがわる',
+        'Select all': 'すべて選択',
     },
     'es': {
         'Layer Mask': 'Mascarilla de capa',
@@ -583,6 +604,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'Fondo',
         'Load Image': 'Cargar imagen',
         'Load Video': 'Cargar vídeo',
+        'Web Video': 'Vídeo web',
         'Media Player': 'Reproductor',
         'Screencast': 'Transmisión',
         'Double-click to delete card': 'Doble clic para eliminar',
@@ -625,6 +647,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'Vínc. carga',
         'Display Selection': 'Selección',
         'Circulate': 'Alternar',
+        'Select all': 'Seleccionar todo',
     },
     'ko': {
         'Layer Mask': '레이어 마스크',
@@ -634,6 +657,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': '배경',
         'Load Image': '이미지 로드',
         'Load Video': '동영상 로드',
+        'Web Video': '웹 동영상',
         'Media Player': '미디어 플레이어',
         'Screencast': '화면 전송',
         'Double-click to delete card': '더블클릭으로 삭제',
@@ -676,6 +700,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': '부하 연동',
         'Display Selection': '기능 선택',
         'Circulate': '순환',
+        'Select all': '모두 선택',
     },
     'it': {
         'Layer Mask': 'Maschera livello',
@@ -685,6 +710,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'Sfondo',
         'Load Image': 'Carica immagine',
         'Load Video': 'Carica video',
+        'Web Video': 'Video web',
         'Media Player': 'Lettore multimediale',
         'Screencast': 'Trasmissione schermo',
         'Double-click to delete card': 'Doppio clic per eliminare',
@@ -727,6 +753,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'Lega carico',
         'Display Selection': 'Selezione',
         'Circulate': 'Alternare',
+        'Select all': 'Seleziona tutto',
     },
     'nl': {
         'Layer Mask': 'Laagmasker',
@@ -736,6 +763,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'Achtergrond',
         'Load Image': 'Afbeelding laden',
         'Load Video': 'Video laden',
+        'Web Video': 'Webvideo',
         'Media Player': 'Mediaspeler',
         'Screencast': 'Schermoverdracht',
         'Double-click to delete card': 'Dubbelklik om te verwijderen',
@@ -778,6 +806,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'Belast-link',
         'Display Selection': 'Selectie',
         'Circulate': 'Wisselen',
+        'Select all': 'Alles selecteren',
     },
     'pl': {
         'Layer Mask': 'Maska warstwy',
@@ -787,6 +816,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'Tło',
         'Load Image': 'Wczytaj obraz',
         'Load Video': 'Wczytaj wideo',
+        'Web Video': 'Wideo z sieci',
         'Media Player': 'Odtwarzacz',
         'Screencast': 'Udostępnianie ekranu',
         'Double-click to delete card': 'Kliknij dwukrotnie, aby usunąć',
@@ -829,6 +859,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'Wg obciąż.',
         'Display Selection': 'Wybór',
         'Circulate': 'Cyklicznie',
+        'Select all': 'Zaznacz wszystko',
     },
     'tr': {
         'Layer Mask': 'Katman maskesi',
@@ -838,6 +869,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'Arka plan',
         'Load Image': 'Resim yükle',
         'Load Video': 'Video yükle',
+        'Web Video': 'Web videosu',
         'Media Player': 'Medya oynatıcı',
         'Screencast': 'Ekran yayını',
         'Double-click to delete card': 'Silmek için çift tıklayın',
@@ -880,6 +912,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'Yük bağlı',
         'Display Selection': 'Seçim',
         'Circulate': 'Döndür',
+        'Select all': 'Tümünü seç',
     },
     'ar': {
         'Layer Mask': 'قناع الطبقة',
@@ -889,6 +922,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'الخلفية',
         'Load Image': 'تحميل صورة',
         'Load Video': 'تحميل فيديو',
+        'Web Video': 'فيديو ويب',
         'Media Player': 'مشغل الوسائط',
         'Screencast': 'بث الشاشة',
         'Double-click to delete card': 'انقر مرتين للحذف',
@@ -931,6 +965,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'ربط حمل',
         'Display Selection': 'اختيار',
         'Circulate': 'تدوير',
+        'Select all': 'تحديد الكل',
     },
     'hi': {
         'Layer Mask': 'लेयर मास्क',
@@ -940,6 +975,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'पृष्ठभूमि',
         'Load Image': 'छवि लोड करें',
         'Load Video': 'वीडियो लोड करें',
+        'Web Video': 'वेब वीडियो',
         'Media Player': 'मीडिया प्लेयर',
         'Screencast': 'स्क्रीनकास्ट',
         'Double-click to delete card': 'हटाने के लिए डबल-क्लिक करें',
@@ -982,6 +1018,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'लोड लिंक',
         'Display Selection': 'चयन',
         'Circulate': 'चक्रण',
+        'Select all': 'सभी चुनें',
     },
     'th': {
         'Layer Mask': 'มาสก์เลเยอร์',
@@ -991,6 +1028,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'พื้นหลัง',
         'Load Image': 'โหลดภาพ',
         'Load Video': 'โหลดวิดีโอ',
+        'Web Video': 'วิดีโอเว็บ',
         'Media Player': 'เครื่องเล่นสื่อ',
         'Screencast': 'แคสต์หน้าจอ',
         'Double-click to delete card': 'ดับเบิลคลิกเพื่อลบ',
@@ -1033,6 +1071,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'ตามโหลด',
         'Display Selection': 'เลือก',
         'Circulate': 'สลับ',
+        'Select all': 'เลือกทั้งหมด',
     },
     'vi': {
         'Layer Mask': 'Mặt nạ lớp',
@@ -1042,6 +1081,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'Nền',
         'Load Image': 'Tải ảnh',
         'Load Video': 'Tải video',
+        'Web Video': 'Video web',
         'Media Player': 'Trình phát',
         'Screencast': 'Truyền màn hình',
         'Double-click to delete card': 'Nhấp đúp để xóa',
@@ -1084,6 +1124,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'Theo tải',
         'Display Selection': 'Chọn',
         'Circulate': 'Luân phiên',
+        'Select all': 'Chọn tất cả',
     },
     'id': {
         'Layer Mask': 'Masker lapisan',
@@ -1093,6 +1134,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'Latar belakang',
         'Load Image': 'Muat gambar',
         'Load Video': 'Muat video',
+        'Web Video': 'Video web',
         'Media Player': 'Pemutar media',
         'Screencast': 'Siaran layar',
         'Double-click to delete card': 'Klik dua kali untuk menghapus',
@@ -1135,6 +1177,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'Ikut beban',
         'Display Selection': 'Pilihan',
         'Circulate': 'Bergantian',
+        'Select all': 'Pilih semua',
     },
     'cs': {
         'Layer Mask': 'Maska vrstvy',
@@ -1144,6 +1187,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'Pozadí',
         'Load Image': 'Načíst obrázek',
         'Load Video': 'Načíst video',
+        'Web Video': 'Webové video',
         'Media Player': 'Přehrávač',
         'Screencast': 'Sdílení obrazovky',
         'Double-click to delete card': 'Dvojklikem smažete',
@@ -1186,6 +1230,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'Dle zátěže',
         'Display Selection': 'Výběr',
         'Circulate': 'Střídat',
+        'Select all': 'Vybrat vše',
     },
     'sv': {
         'Layer Mask': 'Lagermask',
@@ -1195,6 +1240,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'Bakgrund',
         'Load Image': 'Ladda bild',
         'Load Video': 'Ladda video',
+        'Web Video': 'Webbvideo',
         'Media Player': 'Mediaspelare',
         'Screencast': 'Skärmdelning',
         'Double-click to delete card': 'Dubbelklicka för att radera',
@@ -1237,6 +1283,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'Last-länk',
         'Display Selection': 'Val',
         'Circulate': 'Växla',
+        'Select all': 'Markera alla',
     },
     'da': {
         'Layer Mask': 'Lagmaske',
@@ -1246,6 +1293,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'Baggrund',
         'Load Image': 'Indlæs billede',
         'Load Video': 'Indlæs video',
+        'Web Video': 'Webvideo',
         'Media Player': 'Medieafspiller',
         'Screencast': 'Skærmdeling',
         'Double-click to delete card': 'Dobbeltklik for at slette',
@@ -1288,6 +1336,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'Last-link',
         'Display Selection': 'Valg',
         'Circulate': 'Skiftevis',
+        'Select all': 'Vælg alle',
     },
     'no': {
         'Layer Mask': 'Lagmaske',
@@ -1297,6 +1346,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'Bakgrunn',
         'Load Image': 'Last bilde',
         'Load Video': 'Last video',
+        'Web Video': 'Nettvideo',
         'Media Player': 'Mediespiller',
         'Screencast': 'Skjermdeling',
         'Double-click to delete card': 'Dobbeltklikk for å slette',
@@ -1339,6 +1389,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'Last-link',
         'Display Selection': 'Valg',
         'Circulate': 'Veksle',
+        'Select all': 'Velg alle',
     },
     'fi': {
         'Layer Mask': 'Tasomaski',
@@ -1348,6 +1399,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'Tausta',
         'Load Image': 'Lataa kuva',
         'Load Video': 'Lataa video',
+        'Web Video': 'Verkkovideo',
         'Media Player': 'Mediasoitin',
         'Screencast': 'Näytön jako',
         'Double-click to delete card': 'Kaksoisnapsauta poistaaksesi',
@@ -1390,6 +1442,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'Kuormalinkki',
         'Display Selection': 'Valinta',
         'Circulate': 'Kiertää',
+        'Select all': 'Valitse kaikki',
     },
     'hu': {
         'Layer Mask': 'Rétegmaszk',
@@ -1399,6 +1452,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'Háttér',
         'Load Image': 'Kép betöltése',
         'Load Video': 'Videó betöltése',
+        'Web Video': 'Webes videó',
         'Media Player': 'Médialejátszó',
         'Screencast': 'Képernyőmegosztás',
         'Double-click to delete card': 'Dupla kattintás a törléshez',
@@ -1441,6 +1495,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'Terh. kötés',
         'Display Selection': 'Választás',
         'Circulate': 'Váltakozó',
+        'Select all': 'Összes kijelölése',
     },
     'ro': {
         'Layer Mask': 'Mască strat',
@@ -1450,6 +1505,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'Fundal',
         'Load Image': 'Încarcă imagine',
         'Load Video': 'Încarcă video',
+        'Web Video': 'Video web',
         'Media Player': 'Player media',
         'Screencast': 'Transmisie ecran',
         'Double-click to delete card': 'Dublu clic pentru a șterge',
@@ -1492,6 +1548,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'Legat sarcină',
         'Display Selection': 'Selecție',
         'Circulate': 'Alternare',
+        'Select all': 'Selectează tot',
     },
     'uk': {
         'Layer Mask': 'Маска шару',
@@ -1501,6 +1558,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'Фон',
         'Load Image': 'Завантажити зображення',
         'Load Video': 'Завантажити відео',
+        'Web Video': 'Веб-відео',
         'Media Player': 'Медіаплеєр',
         'Screencast': 'Трансляція екрана',
         'Double-click to delete card': 'Подвійний клік для видалення',
@@ -1543,6 +1601,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'За навант.',
         'Display Selection': 'Функції',
         'Circulate': 'По черзі',
+        'Select all': 'Вибрати все',
     },
     'el': {
         'Layer Mask': 'Μάσκα στρώματος',
@@ -1552,6 +1611,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'Φόντο',
         'Load Image': 'Φόρτωση εικόνας',
         'Load Video': 'Φόρτωση βίντεο',
+        'Web Video': 'Βίντεο web',
         'Media Player': 'Αναπαραγωγή',
         'Screencast': 'Μετάδοση οθόνης',
         'Double-click to delete card': 'Διπλό κλικ για διαγραφή',
@@ -1594,6 +1654,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'Σύνδ. φορτ.',
         'Display Selection': 'Επιλογή',
         'Circulate': 'Εναλλαγή',
+        'Select all': 'Επιλογή όλων',
     },
     'he': {
         'Layer Mask': 'מסכת שכבה',
@@ -1603,6 +1664,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'רקע',
         'Load Image': 'טען תמונה',
         'Load Video': 'טען סרטון',
+        'Web Video': 'וידאו מהרשת',
         'Media Player': 'נגן מדיה',
         'Screencast': 'שידור מסך',
         'Double-click to delete card': 'לחץ פעמיים למחיקה',
@@ -1645,6 +1707,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'קישור עומס',
         'Display Selection': 'בחירה',
         'Circulate': 'סיבוב',
+        'Select all': 'בחר הכל',
     },
     'ms': {
         'Layer Mask': 'Topeng lapisan',
@@ -1654,6 +1717,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'Latar belakang',
         'Load Image': 'Muat gambar',
         'Load Video': 'Muat video',
+        'Web Video': 'Video web',
         'Media Player': 'Pemain media',
         'Screencast': 'Siaran skrin',
         'Double-click to delete card': 'Klik dua kali untuk padam',
@@ -1696,6 +1760,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'Ikut beban',
         'Display Selection': 'Pilihan',
         'Circulate': 'Bergilir',
+        'Select all': 'Pilih semua',
     },
     # --- New languages (v8.3.9) ---
     'bn': {
@@ -1706,6 +1771,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'পটভূমি',
         'Load Image': 'ছবি লোড করুন',
         'Load Video': 'ভিডিও লোড করুন',
+        'Web Video': 'ওয়েব ভিডিও',
         'Media Player': 'মিডিয়া প্লেয়ার',
         'Screencast': 'স্ক্রিনকাস্ট',
         'Double-click to delete card': 'মুছতে ডাবল-ক্লিক করুন',
@@ -1748,6 +1814,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'লোড সংযুক্ত',
         'Display Selection': 'নির্বাচন',
         'Circulate': 'ঘোরানো',
+        'Select all': 'সব নির্বাচন করুন',
     },
     'ur': {
         'Layer Mask': 'لیئر ماسک',
@@ -1757,6 +1824,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'پس منظر',
         'Load Image': 'تصویر لوڈ کریں',
         'Load Video': 'ویڈیو لوڈ کریں',
+        'Web Video': 'ویب ویڈیو',
         'Media Player': 'میڈیا پلیئر',
         'Screencast': 'اسکرین کاسٹ',
         'Double-click to delete card': 'حذف کرنے کے لیے ڈبل کلک کریں',
@@ -1799,6 +1867,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'لوڈ لنک',
         'Display Selection': 'انتخاب',
         'Circulate': 'گردش',
+        'Select all': 'سب منتخب کریں',
     },
     'fa': {
         'Layer Mask': 'ماسک لایه',
@@ -1808,6 +1877,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'پس‌زمینه',
         'Load Image': 'بارگذاری تصویر',
         'Load Video': 'بارگذاری ویدیو',
+        'Web Video': 'ویدیوی وب',
         'Media Player': 'پخش‌کننده رسانه',
         'Screencast': 'اشتراک صفحه',
         'Double-click to delete card': 'برای حذف دوبار کلیک کنید',
@@ -1850,6 +1920,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'اتصال بار',
         'Display Selection': 'انتخاب',
         'Circulate': 'چرخش',
+        'Select all': 'انتخاب همه',
     },
     'tl': {
         'Layer Mask': 'Layer Mask',
@@ -1859,6 +1930,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'Background',
         'Load Image': 'Mag-load ng larawan',
         'Load Video': 'Mag-load ng video',
+        'Web Video': 'Web na video',
         'Media Player': 'Media Player',
         'Screencast': 'Screencast',
         'Double-click to delete card': 'I-double click para burahin',
@@ -1901,6 +1973,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'Load link',
         'Display Selection': 'Pagpili',
         'Circulate': 'Pag-ikot',
+        'Select all': 'Piliin lahat',
     },
     'ta': {
         'Layer Mask': 'லேயர் மாஸ்க்',
@@ -1910,6 +1983,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'பின்னணி',
         'Load Image': 'படத்தை ஏற்றவும்',
         'Load Video': 'வீடியோவை ஏற்றவும்',
+        'Web Video': 'இணைய வீடியோ',
         'Media Player': 'மீடியா பிளேயர்',
         'Screencast': 'திரை ஒளிபரப்பு',
         'Double-click to delete card': 'நீக்க இரட்டை-கிளிக் செய்யவும்',
@@ -1952,6 +2026,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'சுமை இணைப்பு',
         'Display Selection': 'தேர்வு',
         'Circulate': 'சுழற்று',
+        'Select all': 'அனைத்தையும் தேர்ந்தெடு',
     },
     'pa': {
         'Layer Mask': 'ਲੇਅਰ ਮਾਸਕ',
@@ -1961,6 +2036,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'ਪਿਛੋਕੜ',
         'Load Image': 'ਤਸਵੀਰ ਲੋਡ ਕਰੋ',
         'Load Video': 'ਵੀਡੀਓ ਲੋਡ ਕਰੋ',
+        'Web Video': 'ਵੈੱਬ ਵੀਡੀਓ',
         'Media Player': 'ਮੀਡੀਆ ਪਲੇਅਰ',
         'Screencast': 'ਸਕ੍ਰੀਨਕਾਸਟ',
         'Double-click to delete card': 'ਮਿਟਾਉਣ ਲਈ ਡਬਲ-ਕਲਿੱਕ ਕਰੋ',
@@ -2003,6 +2079,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'ਲੋਡ ਲਿੰਕ',
         'Display Selection': 'ਚੋਣ',
         'Circulate': 'ਘੁੰਮਾਓ',
+        'Select all': 'ਸਭ ਚੁਣੋ',
     },
     'sw': {
         'Layer Mask': 'Mask ya Tabaka',
@@ -2012,6 +2089,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'Mandharinyuma',
         'Load Image': 'Pakia picha',
         'Load Video': 'Pakia video',
+        'Web Video': 'Video ya wavuti',
         'Media Player': 'Kicheza media',
         'Screencast': 'Utangazaji wa skrini',
         'Double-click to delete card': 'Bofya mara mbili kufuta',
@@ -2054,6 +2132,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'Mzigo-link',
         'Display Selection': 'Uchaguzi',
         'Circulate': 'Zungusha',
+        'Select all': 'Chagua zote',
     },
     'my': {
         'Layer Mask': 'အလွှာမျက်နှာဖုံး',
@@ -2063,6 +2142,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Background': 'နောက်ခံ',
         'Load Image': 'ပုံတင်ရန်',
         'Load Video': 'ဗီဒီယိုတင်ရန်',
+        'Web Video': 'ဝဘ်ဗီဒီယို',
         'Media Player': 'မီဒီယာဖွင့်စက်',
         'Screencast': 'မျက်နှာပြင်ထုတ်လွှင့်',
         'Double-click to delete card': 'ဖျက်ရန် နှစ်ချက်နှိပ်ပါ',
@@ -2105,6 +2185,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Load Linked': 'ဝန်ချိတ်',
         'Display Selection': 'ရွေးချယ်',
         'Circulate': 'လည်ပတ်',
+        'Select all': 'အားလုံးရွေးပါ',
     },
 }
 
@@ -2189,17 +2270,3 @@ LEGACY_TO_ISO: dict[str, str] = {
     "en": "en",
 }
 ISO_TO_LEGACY: dict[str, str] = {v: k for k, v in LEGACY_TO_ISO.items()}
-
-
-def locale_to_lang(locale_prefix: str, default: str = "en") -> str:
-    """``getlocale()`` prefix → ISO 639-1 code, falling back to *default*."""
-    log.info("locale_to_lang: locale_prefix=%s default=%s",
-             locale_prefix, default)
-    return LOCALE_TO_LANG.get(locale_prefix, default)
-
-
-def iso_to_legacy_suffix(lang: str) -> str:
-    """ISO code → legacy C# asset suffix.  Unknown languages map to
-    themselves so callers always get a string back."""
-    log.debug("iso_to_legacy_suffix: lang=%s", lang)
-    return ISO_TO_LEGACY.get(lang, lang)

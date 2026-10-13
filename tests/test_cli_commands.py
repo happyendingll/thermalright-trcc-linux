@@ -19,6 +19,7 @@ their own files with thread or timeout wrappers.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
@@ -54,11 +55,66 @@ def test_help_lists_every_sub_app(cli_runner: CliRunner, cli_app) -> None:
         assert sub in result.stdout
 
 
-def test_status_smoke(cli_runner: CliRunner, cli_app) -> None:
-    """Exits 1 when no daemon listening (typical Linux dev box)."""
-    del cli_app
+class _Watched:
+    """The CLI's bus, recording what it dispatches; *remote* says whose App."""
+
+    def __init__(self, app, remote: bool) -> None:
+        self._app, self.remote, self.sent = app, remote, []
+
+    def dispatch(self, cmd):
+        self.sent.append(type(cmd).__name__)
+        return self._app.dispatch(cmd)
+
+
+@pytest.mark.parametrize(("remote", "asks"), [
+    (True, "ListDevices"), (False, "DiscoverDevices"),
+], ids=["shared_app", "in_process"])
+def test_status_reads_the_shared_app_and_scans_only_in_process(
+    cli_runner: CliRunner, cli_app, monkeypatch: pytest.MonkeyPatch,
+    remote: bool, asks: str,
+) -> None:
+    """Under the shared App, ``status`` discovered: a USB scan (a control
+    transfer to every panel the App was streaming to) and a DeviceDiscovered
+    to every open window, to print what the App already had attached.
+
+    MUTATION CHECK: always discover and the shared-App case scans.
+    """
+    from trcc.ui.cli import main as cli_main
+    bus = _Watched(cli_app, remote)
+    monkeypatch.setattr(cli_main, "get_app", lambda: bus)
+
     result = cli_runner.invoke(_app(), ["status"])
-    assert result.exit_code in (0, 1)
+
+    assert result.exit_code == 0, result.output
+    other = "DiscoverDevices" if asks == "ListDevices" else "ListDevices"
+    assert asks in bus.sent
+    assert other not in bus.sent
+
+
+@pytest.mark.parametrize("remote", [True, False], ids=["shared_app", "in_process"])
+def test_status_names_each_device(
+    cli_runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    remote: bool,
+) -> None:
+    """The API's status named each device; the CLI's named none.  The shared
+    App knows the cooler its handshake identified; in-process nothing has
+    handshaken, so the catalog's guess is shown and labelled as one."""
+    from trcc.app import App
+    from trcc.core.commands import ConnectDevice
+    from trcc.ui.cli import main as cli_main
+
+    from .mock_platform import MockPlatform
+
+    app = App(MockPlatform([{"vid": "87ad", "pid": "70db", "pm": 5, "sub": 1}],
+                           tmp_path))
+    if remote:
+        assert app.dispatch(ConnectDevice(key="87ad:70db")).ok
+    monkeypatch.setattr(cli_main, "get_app", lambda: _Watched(app, remote))
+
+    out = cli_runner.invoke(_app(), ["status"]).output
+
+    name = "Mjolnir Vision" if remote else "GrandVision 360 AIO (catalog)"
+    assert f"  device:           {name}" in out.splitlines(), out
 
 
 def test_gui_help(cli_runner: CliRunner, cli_app) -> None:
@@ -273,33 +329,28 @@ def test_display_load_image_auto_connects_then_sends(
 def test_theme_cloud_load_attaches_before_load(
     cli_runner: CliRunner, cli_app, monkeypatch,
 ) -> None:
-    """``theme cloud-load`` dispatches EnsureConnected before the wire load (#150).
+    """The device is attached by the time ``LoadCloudTheme`` runs (#150).
 
     The reporter's "Not attached: 0402:3922" was cloud-load skipping the
-    attach that display commands already do.  We spy the App's dispatch to
-    assert the attach lands first, short-circuiting the actual network
-    download at the LoadCloudTheme boundary.
+    attach that display commands did.  Connecting is now the dispatcher's job
+    for every UI (``USES_DEVICE``), so this asserts the OUTCOME at the
+    Command's boundary rather than which UI helper ran; the network download
+    is short-circuited there.
     """
     from trcc.core.commands import LoadCloudTheme
     from trcc.core.commands.theme import CloudThemeLoadResult
 
-    seen: list[str] = []
-    real_dispatch = cli_app.dispatch
+    attached_when_run: list[bool] = []
 
-    def spy(cmd):
-        seen.append(type(cmd).__name__)
-        if isinstance(cmd, LoadCloudTheme):
-            return CloudThemeLoadResult(
-                ok=True, key=cmd.key, theme_id=cmd.theme_id,
-                theme_path="", message="ok",
-            )
-        return real_dispatch(cmd)
+    def fake_execute(self, app):  # type: ignore[no-untyped-def]
+        attached_when_run.append(self.key in app.devices)
+        return CloudThemeLoadResult(ok=True, key=self.key,
+                                    theme_id=self.theme_id, theme_path="",
+                                    message="ok")
 
-    monkeypatch.setattr(cli_app, "dispatch", spy)
+    monkeypatch.setattr(LoadCloudTheme, "execute", fake_execute)
     cli_runner.invoke(_app(), ["theme", "cloud-load", "0402:3922", "a001"])
-
-    assert "EnsureConnected" in seen
-    assert seen.index("EnsureConnected") < seen.index("LoadCloudTheme")
+    assert attached_when_run == [True]
 
 
 def test_display_color_unknown_device_fails(cli_runner: CliRunner, cli_app) -> None:
@@ -350,6 +401,95 @@ def test_display_split_mode_persists(cli_runner: CliRunner, cli_app) -> None:
         _app(), ["display", "split-mode", "0402:3922", "1"],
     )
     assert result.exit_code == 0
+
+
+@pytest.mark.parametrize("args,expected", [
+    (["on", "--threshold", "60"], (True, 60)),
+    (["--threshold", "40"], (False, 40)),
+    (["on"], (True, 75)),
+])
+def test_display_game_sets_either_half(
+    cli_runner: CliRunner, cli_app, args: list[str],
+    expected: tuple[bool, int],
+) -> None:
+    """The switch and the threshold are separate controls in the C#; the
+    CLI can send either alone, and the snapshot prints what was saved."""
+    result = cli_runner.invoke(_app(), ["display", "game", "0402:3922", *args])
+    assert result.exit_code == 0, result.output
+    s = cli_app.settings.for_device("0402:3922")
+    assert (s.game_enabled, s.game_threshold) == expected
+
+    shown = cli_runner.invoke(_app(), ["display", "snapshot", "0402:3922"])
+    on, threshold = expected
+    phrase = f"on (CPU > {threshold}%)" if on else "off"
+    assert f"  game_mode        {phrase}" in shown.output.splitlines()
+
+
+@pytest.mark.parametrize("key, ok", [("0402:3922", True), ("0416:5302", False)])
+def test_cloud_downloaded_sizes_a_device_from_the_one_ladder(
+    tmp_path: Path, cli_runner: CliRunner, key: str, ok: bool,
+) -> None:
+    """Asked of a panel not connected yet, it said "connect it first" even
+    where the catalog knows the size; it asks DeviceCanvas now.  0416:5302
+    covers several panels, so only a handshake can say -- and it says so."""
+    from trcc.ui.cli import _ctx
+
+    from .conftest import _CliRenderer, _reset_cli_ctx
+    from .mock_platform import MockPlatform
+
+    _ctx.set_platform(MockPlatform([{"vid": "0402", "pid": "3922", "fbl": 100}],
+                                   tmp_path))
+    _ctx.set_renderer(_CliRenderer())          # type: ignore[arg-type]
+    try:
+        result = cli_runner.invoke(_app(), ["theme", "cloud-downloaded", key])
+    finally:
+        _reset_cli_ctx()
+
+    assert (result.exit_code == 0) is ok, result.output
+    if not ok:
+        assert "handshake" in result.output and "--resolution" in result.output
+
+
+def test_status_says_whether_game_mode_is_on(
+    tmp_path: Path, cli_runner: CliRunner, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``trcc status`` lists each panel's game mode: a panel that blacks out
+    under load is otherwise a mystery in a pasted status."""
+    from trcc.app import App
+    from trcc.ui.cli import _ctx
+
+    from .conftest import _CliRenderer, _reset_cli_ctx
+    from .mock_platform import MockPlatform
+
+    monkeypatch.setattr(App, "add_task", lambda self, task: None)
+    _ctx.set_platform(MockPlatform(
+        [{"vid": "0402", "pid": "3922", "fbl": 100}], tmp_path))
+    _ctx.set_renderer(_CliRenderer())          # type: ignore[arg-type]
+    try:
+        assert cli_runner.invoke(_app(), [
+            "display", "game", "0402:3922", "on", "--threshold", "60",
+        ]).exit_code == 0
+        status = cli_runner.invoke(_app(), ["status"]).output
+    finally:
+        _reset_cli_ctx()
+
+    assert "  game mode:        on (CPU > 60%)" in status.splitlines()
+
+
+@pytest.mark.parametrize("args,code", [
+    ([], 1),                         # the Command: nothing to set
+    (["maybe"], 2),                  # usage: not on/off
+    (["--threshold", "100"], 2),     # usage: the C#'s box holds two digits
+])
+def test_display_game_refuses_what_it_cannot_send(
+    cli_runner: CliRunner, cli_app, args: list[str], code: int,
+) -> None:
+    """Refused, nothing saved -- a malformed line as a usage error, before
+    anything is dispatched."""
+    result = cli_runner.invoke(_app(), ["display", "game", "0402:3922", *args])
+    assert result.exit_code == code, result.output
+    s = cli_app.settings.for_device("0402:3922")
+    assert (s.game_enabled, s.game_threshold) == (False, 75)
 
 
 def test_display_stop_video_idempotent(cli_runner: CliRunner, cli_app) -> None:
@@ -537,16 +677,6 @@ def test_led_select_zone(cli_runner: CliRunner, cli_app) -> None:
     assert "Selected zone 2" in result.output
 
 
-def test_led_toggle_segment(cli_runner: CliRunner, cli_app) -> None:
-    del cli_app
-    result = cli_runner.invoke(
-        _app(), ["led", "toggle-segment", "0416:8001", "5", "off"],
-    )
-    assert result.exit_code == 0
-    assert "Segment 5" in result.output
-    assert "off" in result.output
-
-
 def test_led_list_styles(cli_runner: CliRunner, cli_app) -> None:
     """``led list-styles`` emits the PM registry."""
     del cli_app
@@ -587,13 +717,16 @@ def test_display_snapshot(cli_runner: CliRunner, cli_app) -> None:
 def test_display_restore_theme_no_persisted(
     cli_runner: CliRunner, cli_app,
 ) -> None:
-    """``display restore-theme`` with nothing persisted exits non-zero."""
+    """``display restore-theme`` with nothing persisted AND nothing installed
+    exits non-zero — the Theme1 fallback has nothing to fall back to."""
     del cli_app
     result = cli_runner.invoke(
         _app(), ["display", "restore-theme", "0402:3922"],
     )
-    assert result.exit_code != 0
-    assert "No persisted theme" in result.output
+    assert result.exit_code == 1
+    assert result.output.splitlines()[-1] == (
+        "No theme available for this device — install themes or load a "
+        "theme first")
 
 
 def test_system_snapshot(cli_runner: CliRunner, cli_app) -> None:
@@ -837,7 +970,7 @@ def test_theme_delete_round_trip(
     would have used), delete via CLI."""
     del cli_app
     from trcc.ui.cli import _ctx
-    paths = _ctx.get_app().platform.paths()
+    paths = _ctx.compose_app().platform.paths()
     # Mirror what SaveTheme writes: per-resolution sub-tree under
     # user_content_dir.  CLI ``theme delete`` takes an absolute path
     # to match legacy's ``delete_theme(lcd, path)`` shape.
@@ -1038,14 +1171,14 @@ def test_system_debug_report_to_file(
 # --- Final backend batch ----------------------------------------------------
 
 
-def test_system_upgrade_refuses_without_yes(
+def test_system_upgrade_prints_the_command(
     cli_runner: CliRunner, cli_app,
 ) -> None:
-    """Upgrade is a sudo subprocess — refuses to run without --yes."""
+    """Nothing runs, so nothing needs --yes: it prints the command."""
     del cli_app
     result = cli_runner.invoke(_app(), ["system", "upgrade"])
-    assert result.exit_code == 2
-    assert "Refusing" in result.output
+    assert result.exit_code == 0
+    assert "To upgrade TRCC" in result.output
 
 
 def test_system_upgrade_dry_run_emits_command(
@@ -1083,12 +1216,20 @@ def test_display_configure_slideshow(
 def test_display_keepalive_no_cached_frame(
     cli_runner: CliRunner, cli_app,
 ) -> None:
-    """``display keepalive --count 1`` exits non-zero when no frame cached."""
-    del cli_app
+    """With nothing cached and no theme installed, keepalive says so and exits
+    non-zero -- and the CLI sends ONE Command for it, like ``POST /keepalive``.
+
+    It used to send ``RestoreDeviceState`` first, which in daemon mode threw a
+    pushed image away (#267).  MUTATION CHECK: put that restore back → fails.
+    """
+    sent: list[str] = []
+    real = cli_app.dispatch
+    cli_app.dispatch = lambda cmd: (sent.append(type(cmd).__name__), real(cmd))[1]
     result = cli_runner.invoke(_app(), [
         "display", "keepalive", "0402:3922", "--count", "1",
     ])
-    assert result.exit_code != 0
+    assert result.exit_code == 1
+    assert sent[0] == "KeepAliveLoop"
 
 
 # =========================================================================
@@ -1179,6 +1320,34 @@ def test_theme_export_help(cli_runner: CliRunner, cli_app) -> None:
     del cli_app
     result = cli_runner.invoke(_app(), ["theme", "export", "--help"])
     assert result.exit_code == 0
+
+
+def test_theme_export_current_writes_the_panels_theme(
+    cli_runner: CliRunner, tmp_path: Path,
+) -> None:
+    """``trcc theme export-current`` -- the Windows app's export: what the
+    panel shows goes to a .tr, without saving it first."""
+    from trcc.adapters.render.qt import QtRenderer
+    from trcc.core.commands import ConnectDevice, LoadTheme
+    from trcc.ui.cli import _ctx
+
+    from .conftest import renderable_theme
+    from .mock_platform import MockPlatform
+
+    _ctx.set_platform(MockPlatform([{"vid": "0402", "pid": "3922", "fbl": 100}],
+                                   tmp_path / "root"))
+    _ctx.set_renderer(QtRenderer())
+    app = _ctx.compose_app()
+    assert app.dispatch(ConnectDevice(key="0402:3922")).ok
+    theme = renderable_theme(app.platform.paths().theme_dir(320, 320), "Theme1")
+    assert app.dispatch(LoadTheme(key="0402:3922", path=theme)).ok
+    archive = tmp_path / "Party.tr"
+
+    result = cli_runner.invoke(
+        _app(), ["theme", "export-current", "0402:3922", str(archive)])
+
+    assert result.exit_code == 0, result.output
+    assert archive.read_bytes()[:4] == b"\xdd\xdc\xdd\xdc"
 
 
 def test_theme_import_help(cli_runner: CliRunner, cli_app) -> None:
@@ -1524,3 +1693,576 @@ def test_metric_spec_still_rejects_garbage(spec: str) -> None:
 
     with pytest.raises(typer.BadParameter):
         _parse_metric_spec(spec)
+
+
+# ── #228 / #267: a one-shot command on a panel that blanks when frames stop ──
+
+
+def _cli_on(tmp_path, cli_runner, spec: dict, args: list[str]) -> str:
+    """Run the real CLI on one mock device; return stdout + stderr."""
+    from trcc.ui.cli import _ctx
+    from trcc.ui.cli.main import app as cli
+
+    from .conftest import _CliRenderer
+    from .mock_platform import MockPlatform
+
+    _ctx.set_platform(MockPlatform([spec], tmp_path))
+    _ctx.set_renderer(_CliRenderer())  # type: ignore[arg-type]
+    try:
+        result = cli_runner.invoke(cli, args)
+        return result.output + (result.stderr if result.stderr_bytes else "")
+    finally:
+        _ctx.get_app.cache_clear()
+        _ctx._platform_override = None
+        _ctx._renderer_override = None
+
+
+_WARFRAME_SE = {"type": "lcd", "name": "Warframe SE", "vid": "0416",
+                "pid": "5302", "pm": 58, "bcd": "0407"}
+
+
+def test_a_one_shot_on_a_blanking_panel_says_how_to_keep_it_lit(
+    tmp_path, cli_runner,
+) -> None:
+    out = _cli_on(tmp_path, cli_runner, _WARFRAME_SE,
+                  ["display", "color", "0416:5302", "ff0000"])
+    assert "0416:5302 goes blank when frames stop" in out, out
+    # The background App, not `display keepalive`: a new keepalive process
+    # holds the saved theme, not the frame this command sent (#267).  The suite
+    # runs with TRCC_DAEMON=0, so the advice is to unset it.
+    assert "run `unset TRCC_DAEMON`" in out, out
+    assert "display keepalive" not in out, out
+
+
+@pytest.mark.parametrize("reason, advice", [
+    ("TRCC_DAEMON=0",
+     "TRCC_DAEMON=0 keeps trcc commands off the background App that keeps "
+     "panels showing: run `unset TRCC_DAEMON` and they hand the panel to it. "
+     "Or use the GUI."),
+    ("elevated by SUDO_UID — the shared App is the invoking user's",
+     "Run it without sudo: an elevated trcc command does not use the "
+     "background App that keeps panels showing. Or use the GUI."),
+    ("no AF_UNIX on this platform",
+     "This system cannot run the background App that keeps panels showing, "
+     "so use the GUI to keep it on screen."),
+    (None,
+     "The background App that keeps panels showing did not start; "
+     "`trcc report` has the reason. Or use the GUI."),
+])
+def test_the_blanking_note_names_what_actually_keeps_the_panel_lit(
+    reason: str | None, advice: str,
+) -> None:
+    """It said "export TRCC_DAEMON=1" for every reason: a no-op under sudo and
+    on Windows, and 1 is the default anyway."""
+    from trcc.ui.cli._ctx import keep_it_lit
+
+    assert keep_it_lit(reason) == advice
+
+
+def test_a_panel_that_holds_its_image_gets_no_note(tmp_path, cli_runner) -> None:
+    spec = {"type": "lcd", "name": "LCD", "vid": "0402", "pid": "3922",
+            "pm": 32, "fbl": 100}
+    out = _cli_on(tmp_path, cli_runner, spec,
+                  ["display", "color", "0402:3922", "ff0000"])
+    assert "goes blank when frames stop" not in out, out
+
+
+@pytest.mark.parametrize("remote", [False, True])
+def test_the_cli_sees_a_daemon_through_its_ui(
+        tmp_path, monkeypatch, remote: bool) -> None:
+    """``get_app()`` hands the command bodies the CLI's UserInterface, which is
+    never an ``AppProxy`` — even when its App is.  ``isinstance(app, AppProxy)``
+    answered False there, and ``play`` would have ticked a daemon's panel a
+    second time (#249).  The UI forwards its App's ``remote`` instead.
+    MUTATION CHECK: restore the ``isinstance`` check → the True case fails.
+    """
+    from tests.conftest import FakePlatform
+    from trcc.app import App
+    from trcc.proxy import AppProxy
+    from trcc.ui._uis import CliUI
+    from trcc.ui.cli._ctx import daemon_owns_the_panels
+
+    bus = AppProxy() if remote else App(platform=FakePlatform(tmp_path))
+    monkeypatch.setattr(CliUI, "compose", lambda self, platform: bus)
+
+    assert daemon_owns_the_panels(CliUI()) is remote
+
+
+def test_stop_screencast_is_one_command(cli_runner: CliRunner, cli_app) -> None:
+    """The same one Command as ``POST /screencast/stop``.  It used to leave the
+    daemon's capture driver ticking -- a WARNING at 16 Hz, forever."""
+    sent: list[str] = []
+    real = cli_app.dispatch
+    cli_app.dispatch = lambda cmd: (sent.append(type(cmd).__name__), real(cmd))[1]
+
+    result = cli_runner.invoke(_app(), ["display", "stop-screencast", "0402:3922"])
+
+    assert result.exit_code == 0, result.output
+    # ListDevices / DeviceState are the exit hook's blanking-panel check.
+    assert [c for c in sent if c not in {"ListDevices", "DeviceState"}] == [
+        "StopScreencast"]
+
+
+@pytest.mark.parametrize(("flag", "hide"), [
+    ([], None), (["--hide-border"], True), (["--show-border"], False)])
+def test_screencast_region_is_one_command(cli_runner: CliRunner, cli_app,
+                                          flag: list[str], hide: bool | None) -> None:
+    """No flag leaves the border as it is -- the C# button is a toggle."""
+    from trcc.core.commands import SetScreencastRegion
+
+    sent: list[object] = []
+    real = cli_app.dispatch
+    cli_app.dispatch = lambda cmd: (sent.append(cmd), real(cmd))[1]
+
+    cli_runner.invoke(_app(), ["display", "screencast-region", "0402:3922",
+                               "1", "2", "300", "400", *flag])
+
+    assert [c for c in sent if isinstance(c, SetScreencastRegion)] == [
+        SetScreencastRegion(key="0402:3922", x=1, y=2, w=300, h=400, hide_border=hide)]
+
+
+def test_screencast_without_a_region_asks_for_the_stored_one(
+        cli_runner: CliRunner, cli_app) -> None:
+    """``screencast KEY`` sends 0x0, which the App reads as the stored region.
+    The refusal keeps the test from entering the Ctrl-C wait."""
+    from trcc.core.commands import StartScreencast
+    from trcc.core.results import ScreencastResult
+
+    sent: list[object] = []
+    real = cli_app.dispatch
+
+    def _dispatch(cmd: object) -> object:
+        sent.append(cmd)
+        if isinstance(cmd, StartScreencast):
+            return ScreencastResult(ok=False, key=cmd.key, message="refused")
+        return real(cmd)
+
+    cli_app.dispatch = _dispatch
+    result = cli_runner.invoke(_app(), ["display", "screencast", "0402:3922"])
+
+    assert result.exit_code == 1, result.output
+    assert [c for c in sent if isinstance(c, StartScreencast)] == [
+        StartScreencast(key="0402:3922")]
+
+
+def test_the_note_never_builds_an_app_a_command_did_not(capsys) -> None:
+    """``trcc --version`` must not open USB just to decide it has nothing to say."""
+    from trcc.ui.cli import _ctx
+
+    _ctx.get_app.cache_clear()
+    _ctx.compose_app.cache_clear()
+    _ctx.warn_blanking_panels()
+    assert _ctx.compose_app.cache_info().currsize == 0   # no App — no USB
+    assert _ctx.get_app.cache_info().currsize == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_the_note_is_silent_in_daemon_mode(monkeypatch, capsys) -> None:
+    """The daemon owns the panel and keeps streaming after the CLI exits."""
+    from functools import lru_cache
+    from unittest.mock import MagicMock
+
+    from trcc.proxy import AppProxy
+    from trcc.ui.cli import _ctx
+
+    proxy = MagicMock(spec=AppProxy)
+
+    @lru_cache(maxsize=1)
+    def fake_get_app():
+        return proxy
+
+    fake_get_app()                                  # "a command built it"
+    monkeypatch.setattr(_ctx, "get_app", fake_get_app)
+    _ctx.warn_blanking_panels()
+    proxy.dispatch.assert_not_called()
+    assert capsys.readouterr().err == ""
+
+
+def test_display_play_leaves_the_video_to_the_daemon(monkeypatch, cli_runner) -> None:
+    """Under TRCC_DAEMON=1 the daemon's VideoLoop ticks; ticking here too would
+    advance every frame twice (#249)."""
+    from functools import lru_cache
+    from unittest.mock import MagicMock
+
+    from trcc.proxy import AppProxy
+    from trcc.ui.cli import _ctx
+    from trcc.ui.cli.main import app as cli
+
+    proxy = MagicMock(spec=AppProxy)
+    sent: list[str] = []
+
+    def dispatch(cmd):
+        sent.append(type(cmd).__name__)
+        return MagicMock(ok=True, message="ok")
+
+    proxy.dispatch.side_effect = dispatch
+
+    @lru_cache(maxsize=1)
+    def fake_get_app():
+        return proxy
+
+    monkeypatch.setattr(_ctx, "get_app", fake_get_app)
+    import trcc.ui.cli.display as display_mod
+    monkeypatch.setattr(display_mod, "get_app", fake_get_app)
+
+    result = cli_runner.invoke(cli, ["display", "play", "0402:3922"])
+
+    assert result.exit_code == 0, result.output
+    assert "daemon is playing 0402:3922" in result.output
+    assert "TickDisplay" not in sent
+
+
+# ── #270: a play loop that loses its panel reconnects instead of exiting ────
+
+
+class _ScriptedApp:
+    """Answers each Command by name from a script; records what it was sent."""
+
+    #: An in-process bus (the ``CommandBus`` port): no daemon drives the panel.
+    remote = False
+
+    def __init__(self, script: dict) -> None:
+        self.script = {k: list(v) for k, v in script.items()}
+        self.sent: list[str] = []
+
+    def dispatch(self, cmd):
+        from unittest.mock import MagicMock
+        name = type(cmd).__name__
+        self.sent.append(name)
+        answers = self.script.get(name)
+        answer = answers.pop(0) if answers and len(answers) > 1 else (
+            answers[0] if answers else MagicMock(ok=True, message="ok"))
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+
+def _run_led_play(monkeypatch, cli_runner, app, ticks_before_stop: int = 1):
+    """Run `trcc led play` on *app*; stop after N successful tick sleeps."""
+    import time as time_mod
+    from functools import lru_cache
+
+    from trcc.ui.cli import _ctx
+    from trcc.ui.cli import led as led_mod
+    from trcc.ui.cli.main import app as cli
+
+    @lru_cache(maxsize=1)
+    def fake_get_app():
+        return app
+
+    monkeypatch.setattr(_ctx, "get_app", fake_get_app)
+    monkeypatch.setattr(led_mod, "get_app", fake_get_app)
+    sleeps: list[float] = []
+
+    def sleep(s):
+        sleeps.append(s)
+        if s == 0.5 and sleeps.count(0.5) >= ticks_before_stop:
+            raise KeyboardInterrupt
+    monkeypatch.setattr(time_mod, "sleep", sleep)
+    result = cli_runner.invoke(cli, ["led", "play", "0416:8001", "-i", "0.5"])
+    return result, sleeps
+
+
+def test_led_play_reconnects_a_lost_panel_and_keeps_going(monkeypatch, cli_runner) -> None:
+    from unittest.mock import MagicMock
+
+    from trcc.core.errors import DeviceNotConnectedError
+
+    app = _ScriptedApp({
+        "RenderLed": [DeviceNotConnectedError("0416:8001 not connected"),
+                      MagicMock(ok=True, message="ok")],
+        "DeviceState": [MagicMock(ok=True, connected=False)],
+        "ResetDevice": [MagicMock(ok=True, message="reset")],
+    })
+    result, _ = _run_led_play(monkeypatch, cli_runner, app)
+    assert result.exit_code == 0, result.output
+    assert "reconnected" in result.output
+    assert app.sent.count("RenderLed") == 2 and "ResetDevice" in app.sent
+
+
+def test_led_play_still_exits_on_a_real_error(monkeypatch, cli_runner) -> None:
+    """A failure while the panel is still connected is not a lost panel."""
+    from unittest.mock import MagicMock
+
+    app = _ScriptedApp({
+        # A second tick ends the loop, so a build that wrongly reconnects
+        # FAILS here (exit 0) instead of spinning forever.
+        "RenderLed": [MagicMock(ok=False, message="not an LED device"),
+                      KeyboardInterrupt()],
+        "DeviceState": [MagicMock(ok=True, connected=True)],
+    })
+    result, _ = _run_led_play(monkeypatch, cli_runner, app)
+    assert result.exit_code == 1
+    assert "ResetDevice" not in app.sent
+
+
+def test_led_play_exits_with_the_reason_when_the_first_frame_fails(
+        monkeypatch, cli_runner) -> None:
+    """The one-shot ``InitializeLed`` connects the device and carries the
+    connect reason; the loop never starts against an LED that is not there."""
+    from unittest.mock import MagicMock
+
+    app = _ScriptedApp({"InitializeLed": [MagicMock(
+        ok=False, message="Not attached: 0416:8001 — permission denied")]})
+    result, _ = _run_led_play(monkeypatch, cli_runner, app)
+    assert result.exit_code == 1
+    assert result.output.splitlines()[-1] == (
+        "Not attached: 0416:8001 — permission denied")
+    # ListDevices is the exit hook's blanking-panel check, not the loop.
+    assert app.sent[0] == "InitializeLed" and "RenderLed" not in app.sent
+
+
+def test_reconnect_backs_off_and_caps(monkeypatch) -> None:
+    import time as time_mod
+    from unittest.mock import MagicMock
+
+    from trcc.ui.cli import _ctx
+
+    down = MagicMock(ok=False, message="no device")
+    app = _ScriptedApp({"ResetDevice": [down] * 7 + [MagicMock(ok=True)],
+                        "ConnectDevice": [down]})
+    sleeps: list[float] = []
+    monkeypatch.setattr(time_mod, "sleep", sleeps.append)
+    _ctx.reconnect_until_back(app, "0416:8001")
+    assert sleeps == [2.0, 4.0, 8.0, 16.0, 30.0, 30.0, 30.0]
+
+
+def test_led_play_leaves_the_leds_to_the_daemon(monkeypatch, cli_runner) -> None:
+    """The daemon's LedAnimationLoop animates them; a second ticker doubles
+    every effect's speed (the #249 shape, for LEDs)."""
+    from functools import lru_cache
+    from unittest.mock import MagicMock
+
+    from trcc.proxy import AppProxy
+    from trcc.ui.cli import _ctx
+    from trcc.ui.cli import led as led_mod
+    from trcc.ui.cli.main import app as cli
+
+    proxy = MagicMock(spec=AppProxy)
+    proxy.dispatch.return_value = MagicMock(ok=True, message="ok")
+
+    @lru_cache(maxsize=1)
+    def fake_get_app():
+        return proxy
+
+    monkeypatch.setattr(_ctx, "get_app", fake_get_app)
+    monkeypatch.setattr(led_mod, "get_app", fake_get_app)
+    result = cli_runner.invoke(cli, ["led", "play", "0416:8001"])
+    assert result.exit_code == 0 and "daemon is animating 0416:8001" in result.output
+    assert "RenderLed" not in {type(c.args[0]).__name__ for c in proxy.dispatch.call_args_list}
+
+
+def test_display_play_reconnects_a_lost_panel_too(monkeypatch, cli_runner) -> None:
+    import time as time_mod
+    from functools import lru_cache
+    from unittest.mock import MagicMock
+
+    from trcc.ui.cli import _ctx
+    from trcc.ui.cli import display as display_mod
+    from trcc.ui.cli.main import app as cli
+
+    app = _ScriptedApp({
+        "TickDisplay": [MagicMock(ok=False, message="device gone"),
+                        MagicMock(ok=True, frame_count=None, bytes_sent=1,
+                                  theme_name="t", message="ok")],
+        "DeviceState": [MagicMock(ok=True, connected=False)],
+        "ResetDevice": [MagicMock(ok=True, message="reset")],
+    })
+
+    @lru_cache(maxsize=1)
+    def fake_get_app():
+        return app
+
+    monkeypatch.setattr(_ctx, "get_app", fake_get_app)
+    monkeypatch.setattr(display_mod, "get_app", fake_get_app)
+    ticks: list[float] = []
+
+    def sleep(sec):
+        ticks.append(sec)
+        if sec == 0.5:
+            raise KeyboardInterrupt
+    monkeypatch.setattr(time_mod, "sleep", sleep)
+
+    result = cli_runner.invoke(cli, ["display", "play", "0402:3922", "-i", "0.5"])
+    assert result.exit_code == 0, result.output
+    assert "reconnected" in result.output and app.sent.count("TickDisplay") == 2
+
+
+# =========================================================================
+# trcc api --tls
+# =========================================================================
+
+
+def test_api_tls_serves_the_self_signed_pair_and_prints_its_fingerprint(
+    cli_runner: CliRunner, cli_app, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trcc.ui.api import main as api_main
+
+    del cli_app
+    served: dict = {}
+    monkeypatch.setattr(api_main, "serve", lambda **kw: served.update(kw))
+
+    result = cli_runner.invoke(_app(), ["api", "--tls", "--port", "9443"])
+
+    assert result.exit_code == 0, result.output
+    files = served["tls"]
+    assert files is not None
+    assert Path(files.cert).is_file() and Path(files.key).is_file()
+    assert f"TLS certificate SHA-256: {files.fingerprint}" in result.output
+    assert "Serving on https://127.0.0.1:9443" in result.output
+
+
+def test_api_without_tls_is_plain_http(
+    cli_runner: CliRunner, cli_app, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trcc.ui.api import main as api_main
+
+    del cli_app
+    served: dict = {}
+    monkeypatch.setattr(api_main, "serve", lambda **kw: served.update(kw))
+
+    result = cli_runner.invoke(_app(), ["api", "--port", "9080"])
+
+    assert result.exit_code == 0, result.output
+    assert served["tls"] is None
+    assert "Serving on http://127.0.0.1:9080" in result.output
+
+
+def test_api_refuses_a_certificate_without_its_key(
+    cli_runner: CliRunner, cli_app, tmp_path,
+) -> None:
+    del cli_app
+    result = cli_runner.invoke(_app(), ["api", "--tls-cert", str(tmp_path / "c.pem")])
+
+    assert result.exit_code == 2
+    assert "--tls-cert and --tls-key go together" in result.output
+
+
+def test_the_api_face_hands_its_tls_files_to_uvicorn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    import uvicorn
+
+    from trcc.core.results import ApiTlsResult
+    from trcc.ui._uis import ApiUI
+    from trcc.ui.api import main as api_main
+
+    ran: dict = {}
+
+    def serve(self: uvicorn.Server, sockets: object = None) -> None:
+        ran.update(ssl_certfile=self.config.ssl_certfile,
+                   ssl_keyfile=self.config.ssl_keyfile)
+        self.started = True
+
+    monkeypatch.setattr(uvicorn.Server, "run", serve)
+    monkeypatch.setattr(api_main, "build_app", lambda trcc: object())
+
+    assert ApiUI(port=9443, tls=ApiTlsResult(
+        ok=True, cert=str(tmp_path / "c.pem"), key=str(tmp_path / "k.pem"),
+        fingerprint="AA")).run() == 0
+
+    assert (ran["ssl_certfile"], ran["ssl_keyfile"]) == (
+        str(tmp_path / "c.pem"), str(tmp_path / "k.pem"))
+
+
+def test_system_follow_status_and_off(cli_runner: CliRunner, cli_app) -> None:
+    """#160: `trcc system follow` -- status by default, and off."""
+    del cli_app
+    status = cli_runner.invoke(_app(), ["system", "follow"])
+    assert status.exit_code == 0, status.output
+    assert status.output == (
+        "Nothing follows -- TRCC sends no colours to other lights\n"
+        "  following: off (OpenRGB at 127.0.0.1:6742)\n"
+        "  source   : the first LED cooler\n"
+        "  lights   : all\n")
+    off = cli_runner.invoke(_app(), ["system", "follow", "off",
+                                     "--port", "6800"])
+    assert off.exit_code == 0, off.output
+    assert off.output == (
+        "Nothing follows -- TRCC sends no colours to other lights\n"
+        "  following: off (OpenRGB at 127.0.0.1:6800)\n"
+        "  source   : the first LED cooler\n"
+        "  lights   : all\n")
+    bad = cli_runner.invoke(_app(), ["system", "follow", "maybe"])
+    assert bad.exit_code != 0
+
+
+def test_system_follow_an_lcd_on_chosen_lights(cli_runner: CliRunner, cli_app) -> None:
+    """An LCD's picture as the source, on the lights the user picked -- kept
+    until changed; '--target all' gives every light back."""
+    del cli_app
+    picked = cli_runner.invoke(_app(), [
+        "system", "follow", "off", "--source", "0402:3922",
+        "--mapping", "single", "--target", "i2c-3/0x19",
+        "--target", "ASUS Aura Motherboard"])
+    assert picked.exit_code == 0, picked.output
+    assert picked.output.endswith(
+        "  source   : 0402:3922 (single, vivid)\n"
+        "  lights   : i2c-3/0x19, ASUS Aura Motherboard\n")
+    kept = cli_runner.invoke(_app(), ["system", "follow"])
+    assert kept.output.endswith("  lights   : i2c-3/0x19, ASUS Aura Motherboard\n")
+    every = cli_runner.invoke(_app(), ["system", "follow", "off", "--target", "all"])
+    assert every.output.endswith("  lights   : all\n")
+    bad = cli_runner.invoke(_app(), ["system", "follow", "off", "--source", "not-a-key"])
+    assert bad.exit_code == 1
+
+
+def test_listing_the_api_routes_starts_no_app(
+    cli_runner: CliRunner, cli_app, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``list-endpoints`` built the API app with no App, which in the default
+    mode found or STARTED the shared App -- USB and all -- to print a list of
+    routes.  MUTATION CHECK: call build_app() bare again -> the sentinel raises."""
+    from trcc import daemon
+
+    del cli_app
+
+    def no_app(**kw):
+        raise AssertionError("listing routes started the shared App")
+
+    monkeypatch.setenv("TRCC_DAEMON", "1")
+    monkeypatch.setattr(daemon, "ensure_daemon", no_app)
+
+    result = cli_runner.invoke(_app(), ["system", "list-endpoints"])
+
+    assert result.exit_code == 0, result.output
+    assert "endpoint(s)." in result.output
+    assert int(result.output.rsplit("\n", 2)[-2].split()[0]) > 100
+
+
+def test_system_ram_lighting_on_an_os_without_it(cli_runner: CliRunner, cli_app) -> None:
+    """The opt-in RAM grant: status by default; enable fails plainly where the
+    OS has none (the test platform), never pretending it worked."""
+    del cli_app
+    status = cli_runner.invoke(_app(), ["system", "ram-lighting"])
+    assert status.exit_code == 0, status.output
+    assert status.output == ("RAM lighting is not available on FakePlatform yet\n"
+                             "  state: unsupported\n")
+    enable = cli_runner.invoke(_app(), ["system", "ram-lighting", "enable"])
+    assert enable.exit_code == 1, enable.output
+    bad = cli_runner.invoke(_app(), ["system", "ram-lighting", "maybe"])
+    assert bad.exit_code != 0
+
+
+def test_system_rgb_and_ram_effect_on_an_os_without_the_bus(cli_runner: CliRunner, cli_app) -> None:
+    """The test platform has no SMBus: the scan says so and fails; listing
+    without a scan touches nothing; a bad colour is refused by the CLI."""
+    del cli_app
+    listed = cli_runner.invoke(_app(), ["system", "rgb"])
+    assert listed.exit_code == 0, listed.output
+    assert "(not searched yet -- `trcc system rgb --scan`)" in listed.output
+    scanned = cli_runner.invoke(_app(), ["system", "rgb", "--scan"])
+    assert scanned.exit_code == 1
+    assert "\nRAM: no SMBus access on FakePlatform" in scanned.output
+    lone = cli_runner.invoke(_app(), ["system", "rgb", "--host", "10.0.0.2"])
+    assert lone.exit_code != 0        # an address only means something to a scan
+    moved = cli_runner.invoke(_app(), ["system", "rgb", "--scan", "--host",
+                                       "10.0.0.2", "--port", "6800"])
+    assert "; OpenRGB: not reachable" in moved.output
+    follow = cli_runner.invoke(_app(), ["system", "follow", "status"])
+    assert "(OpenRGB at 10.0.0.2:6800)" in follow.output
+    effect = cli_runner.invoke(_app(), ["system", "ram-effect", "rainbow"])
+    assert effect.exit_code == 1
+    bad = cli_runner.invoke(_app(), ["system", "ram-effect", "static",
+                                     "--color", "300,0"])
+    assert bad.exit_code != 0

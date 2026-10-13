@@ -8,7 +8,7 @@ import pytest
 
 from trcc.adapters.sensors import hwmon
 from trcc.adapters.sensors.aggregator import BaselineSensors
-from trcc.core.models import MIN_REFRESH_INTERVAL_S
+from trcc.core.models import MIN_REFRESH_INTERVAL_S, percent_only
 from trcc.core.ports import CpuSource, DiskSource, DramSource, FanSource, GpuSource
 
 from .conftest import FakeCpu, FakeGpu, FakeMemory
@@ -196,30 +196,157 @@ def test_fans_absent_leaves_slots_zero() -> None:
 
 
 def test_gpu_fan_slot_follows_picked_gpu() -> None:
-    """The GPU fan slot reads the picked GPU's fan (a duty-cycle percent),
-    not a motherboard fan — it follows the GPU picker (#145/#207)."""
+    """GPUFAN is the picked GPU's fan in RPM, like the Windows app -- never a
+    motherboard fan, never its duty percent under "RPM" (#145/#207)."""
     s = BaselineSensors(
         cpu=FakeCpu(), memory=FakeMemory(), gpus=[FakeGpu(0)],
         fans=[FakeFan("fan1", 1200), FakeFan("fan2", 800)],
     )
     m = s.snapshot()
-    assert m.fan_gpu == 42.0                       # FakeGpu.fan() percent
+    assert m.fan_gpu == 1500.0                     # FakeGpu.fan_rpm()
     # motherboard fans fill cpu/ssd/sys2, never the gpu slot
     assert (m.fan_cpu, m.fan_ssd, m.fan_sys2) == (1200, 800, 0)
 
 
-def test_gpu_hwmon_fan_excluded_from_device_pool() -> None:
-    """A GPU's own hwmon fan (amdgpu) is never double-counted as a case fan:
-    the gpu slot comes from the GPU source, so 'gpu'-keyed headers are skipped
-    from the CPU/SSD/SYS2 pool."""
+def test_fan_slots_reach_the_overlay_readings() -> None:
+    """The LCD draws from ``read_all``, which had no fan slot keys at all: a
+    CPUFAN or GPUFAN element was blank on every host, every tick (#145)."""
     s = BaselineSensors(
-        cpu=FakeCpu(), memory=FakeMemory(), gpus=[],
-        fans=[FakeFan("hwmon:amdgpu:fan1", 1500),
-              FakeFan("hwmon:nct6798:fan1", 1000)],
+        cpu=FakeCpu(), memory=FakeMemory(), gpus=[FakeGpu(0)],
+        fans=[FakeFan("fan1", 1200), FakeFan("fan2", 800)],
     )
+    r = s.read_all()
+    assert {k: r[k] for k in ("fan:cpu", "fan:gpu", "fan:ssd", "fan:sys2")} == {
+        "fan:cpu": 1200, "fan:gpu": 1500.0, "fan:ssd": 800, "fan:sys2": 0.0}
+    assert "fan:gpu:percent" not in r
+
+
+def test_gpu_fan_without_rpm_is_offered_as_a_percent() -> None:
+    """A driver with a duty cycle only (old NVIDIA, some amdgpu) fills the
+    percent slot; the RPM slot stays absent so nothing draws "42 RPM"."""
+    gpu = FakeGpu(0)
+    gpu.values["fan_rpm"] = None
+    s = BaselineSensors(cpu=FakeCpu(), memory=FakeMemory(), gpus=[gpu], fans=[])
+    r = s.read_all()
+    assert "fan:gpu" not in r
+    assert r["fan:gpu:percent"] == 42.0
+    assert s.snapshot().fan_gpu == 0.0
+
+
+@pytest.mark.parametrize(("readings", "expected"), [
+    ({"fan:gpu:percent": 30.0}, 30.0),                       # percent only
+    ({"fan:gpu": 999.0, "fan:gpu:percent": 30.0}, None),     # RPM wins
+    ({}, None),                                              # nothing
+])
+def test_percent_only(readings: dict[str, float], expected: float | None) -> None:
+    assert percent_only(readings, "fan:gpu") == expected
+
+
+def test_amdgpu_fan_reads_rpm_and_duty_separately(tmp_path: Path) -> None:
+    """``fan()`` used to return None whenever an RPM existed and the RPM was
+    never read at all; now each quantity comes from its own file."""
+    d = tmp_path / "hwmon3"
+    d.mkdir()
+    (d / "name").write_text("amdgpu\n")
+    (d / "fan1_input").write_text("1650")
+    (d / "pwm1").write_text("51")
+    gpu = hwmon.AmdGpu(0, hwmon.HwmonDevice(d), None)
+    assert gpu.fan_rpm() == 1650.0
+    assert gpu.fan() == 20.0                       # 51/255
+    (d / "fan1_input").unlink()
+    assert gpu.fan_rpm() is None
+    assert gpu.fan() == 20.0
+
+
+@pytest.mark.parametrize("files, expected", [
+    ({"product_name": "Radeon Pro W7800"}, "Radeon Pro W7800"),
+    ({}, "AMD Radeon RX 6800 XT"),                       # amdgpu.ids row
+    ({"revision": "0x99\n"}, "AMD Navi 21 [Radeon RX 6800/6800 XT / 6900 XT]"),
+    ({"device": "0x1234\n"}, "AMD GPU 0"),                # in neither table
+], ids=["product_name", "amdgpu_ids", "pci_ids", "unknown"])
+def test_an_amd_card_is_named_not_numbered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    files: dict[str, str], expected: str,
+) -> None:
+    """#301: a card without ``product_name`` was named by its vbios part
+    number ("113-D7070100-101").  libdrm's amdgpu.ids names it, then pci.ids."""
+    ids = tmp_path / "amdgpu.ids"
+    ids.write_text("1.0.0\n73BF,\tC1,\tAMD Radeon RX 6800 XT\n", encoding="utf-8")
+    pci = tmp_path / "pci.ids"
+    pci.write_text("10de  NVIDIA Corporation\n\t73bf  not this one\n"
+                   "1002  Advanced Micro Devices, Inc. [AMD/ATI]\n"
+                   "\t73bf  Navi 21 [Radeon RX 6800/6800 XT / 6900 XT]\n"
+                   "\t\t1234 0e3a  a subsystem\n", encoding="utf-8")  # 1234 = [unknown]
+    monkeypatch.setattr(hwmon, "AMDGPU_IDS", ids)
+    monkeypatch.setattr(hwmon, "PCI_IDS", pci)
+    card = tmp_path / "card0"
+    device = card / "device"
+    device.mkdir(parents=True)
+    contents = {"device": "0x73bf\n", "revision": "0xc1\n",
+                "vbios_version": "113-D7070100-101\n", **files}
+    for name, text in contents.items():
+        (device / name).write_text(text)
+    hw = tmp_path / "hwmon0"
+    hw.mkdir()
+    (hw / "name").write_text("amdgpu\n")
+
+    assert hwmon.AmdGpu(0, hwmon.HwmonDevice(hw), card).name == expected
+
+
+def _fan_node(root: Path, name: str, driver: str, rpm: int) -> hwmon.HwmonDevice:
+    d = root / name
+    d.mkdir()
+    (d / "name").write_text(f"{driver}\n")
+    (d / "fan1_input").write_text(str(rpm))
+    return hwmon.HwmonDevice(d)
+
+
+def test_gpu_hwmon_fans_excluded_from_device_pool(tmp_path: Path) -> None:
+    """A graphics card's own fan is never counted as a case fan.  The pool
+    skipped keys containing "gpu", which caught amdgpu and let nouveau's and
+    Intel Arc's (xe) fans fill CPUFAN; now each fan declares ``on_gpu``."""
+    devices = [
+        _fan_node(tmp_path, "hwmon1", "amdgpu", 1500),
+        _fan_node(tmp_path, "hwmon2", "nouveau", 1400),
+        _fan_node(tmp_path, "hwmon3", "xe", 1300),
+        _fan_node(tmp_path, "hwmon4", "nct6798", 1000),
+    ]
+    fans = hwmon.discover_fans(devices)
+    assert [f.on_gpu for f in fans] == [True, True, True, False]
+    s = BaselineSensors(cpu=FakeCpu(), memory=FakeMemory(), gpus=[], fans=fans)
     m = s.snapshot()
-    # amdgpu header skipped; only the nct header fills the first device slot.
     assert (m.fan_cpu, m.fan_ssd, m.fan_sys2) == (1000, 0, 0)
+
+
+def _nouveau_node(root: Path, **files: str) -> hwmon.HwmonDevice:
+    d = root / "hwmon5"
+    d.mkdir()
+    (d / "name").write_text("nouveau\n")
+    for name, value in files.items():
+        (d / name).write_text(value)
+    return hwmon.HwmonDevice(d)
+
+
+def test_nouveau_gpu_reads_the_drivers_own_units(tmp_path: Path) -> None:
+    """nouveau_hwmon.c: temp1 m°C, fan1 RPM, pwm1 ALREADY a percent (nvkm
+    clamps to 0-100 -- the shared /255 reader would show 30% as 12%), power1
+    µW in ``power1_input`` (there is no ``power1_average``)."""
+    node = _nouveau_node(tmp_path, temp1_input="61000", fan1_input="1320",
+                         pwm1="30", power1_input="87500000")
+    (gpu,) = hwmon.discover_nouveau_gpus([node])
+    assert (gpu.key, gpu.is_discrete) == ("nouveau:0", True)
+    assert (gpu.temp(), gpu.fan_rpm(), gpu.fan(), gpu.power()) == (61.0, 1320.0, 30.0, 87.5)
+
+
+def test_nouveau_gpu_declines_what_nouveau_never_exposes(tmp_path: Path) -> None:
+    """No usage, clock or VRAM -- declared, so ``unsupported()`` names them
+    rather than a 0 being shown; missing files read as None, never raise."""
+    (gpu,) = hwmon.discover_nouveau_gpus([_nouveau_node(tmp_path, temp1_input="50000")])
+    assert [q for q in ("usage", "clock", "vram_used", "vram_total") if gpu.provides(q)] == []
+    assert (gpu.temp(), gpu.fan_rpm(), gpu.fan(), gpu.power()) == (50.0, None, None, None)
+    s = BaselineSensors(cpu=FakeCpu(), memory=FakeMemory(), gpus=[gpu], fans=[])
+    assert {"gpu:primary:usage", "gpu:nouveau:0:clock"} <= s.unsupported()
+    assert s.read_all()["gpu:primary:temp"] == 50.0
 
 
 # ── Disk temperature — DiskSource → disk:temp → snapshot.disk_temp ───
@@ -429,12 +556,11 @@ def test_discover_dram_temp_matches_spd5118_and_jc42(tmp_path: Path) -> None:
 
     dram = hwmon.discover_dram_temp(devices)
 
-    assert {d.key for d in dram} == {
-        "hwmon:spd5118:hwmon1:temp1", "hwmon:jc42:hwmon2:temp1",
-    }
+    # No i2c parent in this fixture, so the key falls back to the hwmon dir.
+    assert {d.key for d in dram} == {"dimm:hwmon1", "dimm:hwmon2"}
     by_key = {d.key: d for d in dram}
-    assert by_key["hwmon:spd5118:hwmon1:temp1"].temp() == 27.25
-    assert by_key["hwmon:jc42:hwmon2:temp1"].temp() == 33.0
+    assert by_key["dimm:hwmon1"].temp() == 27.25
+    assert by_key["dimm:hwmon2"].temp() == 33.0
 
 
 def test_discover_dram_temp_distinct_keys_for_matched_dimms(tmp_path: Path) -> None:
@@ -447,9 +573,34 @@ def test_discover_dram_temp_distinct_keys_for_matched_dimms(tmp_path: Path) -> N
 
     keys = {d.key for d in hwmon.discover_dram_temp(devices)}
 
-    assert keys == {
-        "hwmon:spd5118:hwmon2:temp1", "hwmon:spd5118:hwmon3:temp1",
-    }
+    assert keys == {"dimm:hwmon2", "dimm:hwmon3"}
+
+
+@pytest.mark.parametrize("renumbered", [False, True])
+def test_each_dimm_is_its_own_reading_keyed_by_its_i2c_address(
+    tmp_path: Path, renumbered: bool,
+) -> None:
+    """#310: only the hottest DIMM was kept, every module was "spd5118 DRAM",
+    and the key carried ``hwmonN``, which renumbers between boots.  Keyed by
+    the i2c client; named by the address's low three bits."""
+    nodes = []
+    for hw, addr, milli in (("hwmon2", "0050", 27250), ("hwmon3", "0051", 31000)):
+        name = {"hwmon2": "hwmon7", "hwmon3": "hwmon4"}[hw] if renumbered else hw
+        node = _hwmon_dir(tmp_path, name, "spd5118", temp1_milli=milli)
+        client = tmp_path / "i2c" / f"1-{addr}"
+        client.mkdir(parents=True)
+        (node.path / "device").symlink_to(client)
+        nodes.append(node)
+    s = BaselineSensors(cpu=FakeCpu(), memory=FakeMemory(), gpus=[], fans=[],
+                        dram=hwmon.discover_dram_temp(nodes))
+
+    values = s.read_all()
+    labels = {r.sensor_id: r.label for r in s.discover()}
+
+    assert (values["memory:dimm:1-0050:temp"], values["memory:dimm:1-0051:temp"],
+            values["memory:temp"]) == (27.25, 31.0, 31.0)
+    assert (labels["memory:dimm:1-0050:temp"], labels["memory:dimm:1-0051:temp"]) == (
+        "DIMM 0 Temperature", "DIMM 1 Temperature")
 
 
 def test_discover_dram_temp_skips_node_without_temp1(tmp_path: Path) -> None:
@@ -457,6 +608,46 @@ def test_discover_dram_temp_skips_node_without_temp1(tmp_path: Path) -> None:
     devices = [_hwmon_dir(tmp_path, "hwmon0", "spd5118")]   # no temp1_input
 
     assert hwmon.discover_dram_temp(devices) == []
+
+
+# ── Board voltages (#259) ─────────────────────────────────────────────
+
+
+def _volt_chip(root: Path, dirname: str, driver: str,
+               inputs: dict[int, tuple[int, str | None]]) -> hwmon.HwmonDevice:
+    d = root / dirname
+    d.mkdir()
+    (d / "name").write_text(f"{driver}\n")
+    for idx, (milli, label) in inputs.items():
+        (d / f"in{idx}_input").write_text(str(milli))
+        if label is not None:
+            (d / f"in{idx}_label").write_text(f"{label}\n")
+    return hwmon.HwmonDevice(d)
+
+
+def test_board_voltages_are_read_named_and_offered(tmp_path: Path) -> None:
+    """#259: nothing read ``inN_input``.  Millivolts become volts, a wired-off
+    input (exactly 0) is not offered, a driver label names the row, channels
+    keep their numeric order, and two chips never share a key."""
+    nct = _volt_chip(tmp_path, "hwmon6", "nct6798",
+                     {0: (1216, None), 1: (0, None), 2: (3344, None), 10: (1120, None)})
+    labelled = _volt_chip(tmp_path, "hwmon7", "nct6686",
+                          {0: (1216, "CPU Vcore"), 1: (1012, "+12V")})
+    volts = hwmon.discover_voltages([nct, labelled])
+    s = BaselineSensors(cpu=FakeCpu(), memory=FakeMemory(), gpus=[], fans=[],
+                        voltages=volts)
+
+    values = s.read_all()
+    rows = {r.sensor_id: (r.label, r.unit, r.category) for r in s.discover()
+            if r.sensor_id.startswith("volt:")}
+
+    assert [v.key for v in volts] == [
+        "nct6798_in0", "nct6798_in2", "nct6798_in10",
+        "nct6686_cpu_vcore", "nct6686_12v"]
+    assert values["volt:nct6798_in0"] == 1.216
+    assert rows["volt:nct6798_in2"] == ("in2 (nct6798)", "V", "voltage")
+    assert rows["volt:nct6686_cpu_vcore"] == ("CPU Vcore", "V", "voltage")
+    assert "volt:nct6798_in1" not in rows
 
 
 # ── Label-based GPU temperature resolution (Intel xe / Arc) ──────────
@@ -551,11 +742,11 @@ def test_intel_gpu_temp_none_without_hwmon(tmp_path: Path) -> None:
     assert gpu.temp() is None
 
 
-# ── Memory channel clock — SpdClock → memory:clock → mem_clock ───────
+# ── Memory channel clock — MemoryClock → memory:clock → mem_clock ────
 
 
-class _FakeSpdClock:
-    """Stub for the cached SPD clock source (mhz)."""
+class _FakeMemoryClock:
+    """Stub for the cached memory clock source (mhz)."""
 
     def __init__(self, mhz: float | None) -> None:
         self._mhz = mhz
@@ -567,14 +758,14 @@ class _FakeSpdClock:
 def test_memory_clock_flows_to_snapshot() -> None:
     s = BaselineSensors(
         cpu=FakeCpu(), memory=FakeMemory(), gpus=[], fans=[],
-        spd_clock=_FakeSpdClock(2404.0),
+        memory_clock=_FakeMemoryClock(2404.0),
     )
 
     assert s.read_all()["memory:clock"] == 2404.0
     assert s.snapshot().mem_clock == 2404.0
 
 
-def test_memory_clock_absent_without_spd_clock() -> None:
+def test_memory_clock_absent_without_a_clock_source() -> None:
     s = BaselineSensors(cpu=FakeCpu(), memory=FakeMemory(), gpus=[], fans=[])
 
     assert "memory:clock" not in s.read_all()
@@ -665,11 +856,87 @@ def test_discover_contains_one_reading_per_declared_key() -> None:
     expected = {
         "cpu:temp", "cpu:usage", "cpu:freq", "cpu:power",
         "memory:used", "memory:percent",
-        "gpu:0:temp", "gpu:nvidia:0:temp", "gpu:primary:temp",
+        "gpu:primary:temp",
         "time:hour", "date:year",
     }
     missing = expected - ids
     assert not missing, f"missing normalized keys: {missing}"
+
+
+@pytest.mark.parametrize("count", [1, 2])
+def test_each_gpu_is_offered_once(count: int) -> None:
+    """#301: one card was offered as ``gpu:0``, ``gpu:<vendor>:0`` and
+    ``gpu:primary`` -- 24 picker rows for 8 readings.  The primary alias
+    always; the vendor key (the canonical per-card id) only when there is a
+    choice; ``gpu:N`` never.  ``read_all`` still serves every spelling, so
+    a saved binding keeps its value."""
+    s = _sensors_with(gpus=[FakeGpu(i, vendor="amd") for i in range(count)])
+
+    gpu_ids = {r.sensor_id.removesuffix(":usage") for r in s.discover()
+               if r.sensor_id.startswith("gpu:") and r.sensor_id.endswith(":usage")}
+    values = s.read_all()
+
+    assert gpu_ids == ({"gpu:primary"} if count == 1
+                       else {"gpu:primary", "gpu:amd:0", "gpu:amd:1"})
+    assert {"gpu:0:temp", "gpu:amd:0:temp", "gpu:primary:temp"} <= values.keys()
+
+
+def test_a_reading_is_named_for_what_it_measures() -> None:
+    """#301: every reading was labelled with its DEVICE alone -- a GPU's eight
+    rows all read "113-D7070100-101", the CPU's four the CPU's name -- so a
+    picker could not tell temperature from power."""
+    s = _sensors_with(gpus=[FakeGpu(0, vendor="amd"), FakeGpu(1, vendor="amd")])
+
+    labels = {r.sensor_id: r.label for r in s.discover()}
+
+    assert labels["cpu:temp"] == "Fake CPU Temperature"
+    assert labels["gpu:amd:1:power"] == "Fake AMD GPU 1 Power"
+    assert labels["memory:percent"] == "Memory Usage"
+    assert labels["net:down"] == "Download"
+    for prefix in ("cpu:", "gpu:amd:0:", "gpu:amd:1:", "memory:"):
+        family = [v for k, v in labels.items() if k.startswith(prefix)]
+        assert len(set(family)) == len(family), f"{prefix} rows share a name: {family}"
+
+
+def test_a_gpu_reports_its_hot_spot_and_memory_temperature(
+    tmp_path: Path,
+) -> None:
+    """#301: only the edge sensor (temp1) was read.  amdgpu labels junction
+    and mem on SOC15 cards; they are served as ``...:hotspot:temp`` and
+    ``...:mem:temp`` -- ending in ``:temp`` so °F converts them -- and a card
+    without the label has no hot spot rather than the edge value twice."""
+    from trcc.services.metrics_personalize import personalize_readings
+
+    d = tmp_path / "hwmon0"
+    d.mkdir()
+    (d / "name").write_text("amdgpu\n")
+    for idx, (label, milli) in enumerate((("edge", 50000), ("junction", 71000),
+                                          ("mem", 62000)), start=1):
+        (d / f"temp{idx}_label").write_text(f"{label}\n")
+        (d / f"temp{idx}_input").write_text(str(milli))
+    card = hwmon.AmdGpu(0, hwmon.HwmonDevice(d), None)
+    s = _sensors_with(gpus=[card])
+
+    values = s.read_all()
+
+    assert (values["gpu:primary:temp"], values["gpu:primary:hotspot:temp"],
+            values["gpu:amd:0:mem:temp"]) == (50.0, 71.0, 62.0)
+    assert personalize_readings(values, temp_unit="F")[
+        "gpu:primary:hotspot:temp"] == pytest.approx(159.8)
+    (d / "temp2_label").write_text("other\n")
+    assert hwmon.AmdGpu(0, hwmon.HwmonDevice(d), None).hotspot() is None
+
+
+def test_nvml_offers_no_hot_spot_it_cannot_read() -> None:
+    """``provides`` derives support from the override, so a backend that
+    never implemented the new quantities withholds them unprompted."""
+    from trcc.adapters.sensors.nvml import NvidiaGpu
+
+    # provides() reads only the class, so no NVML handle is needed.
+    nvidia, amd = object.__new__(NvidiaGpu), object.__new__(hwmon.AmdGpu)
+    assert [nvidia.provides(q) for q in ("temp", "hotspot", "mem_temp")] == [
+        True, False, False]
+    assert [amd.provides(q) for q in ("hotspot", "mem_temp")] == [True, True]
 
 
 def test_none_values_omitted_from_flat_dict() -> None:
@@ -710,7 +977,7 @@ def _rapl_with(paths: list[Path]) -> hwmon._RaplCpuPower:
     """A _RaplCpuPower with discovery stubbed to *paths* (no sysfs)."""
     r = hwmon._RaplCpuPower.__new__(hwmon._RaplCpuPower)
     r._paths = paths
-    r._last = None
+    r._rate = hwmon._EnergyRate()
     r._lock = threading.Lock()
     # These tests pin a fixed path set — disable lazy re-discovery so an
     # empty stub stays empty regardless of the host's real RAPL nodes (#194).
@@ -911,6 +1178,77 @@ def test_read_one_polls_instead_of_returning_none_forever() -> None:
     s, _ = _counting_sensors()
 
     assert s.read_one("cpu:temp") == 42.0
+
+
+def test_an_inline_sweep_runs_inside_the_threads_os_setup() -> None:
+    """With no poll thread, ``read_all`` sweeps on whoever asked -- the gui's
+    splash worker, a CLI command, a daemon request.  The sources hold
+    thread-local WMI handles that need a COM apartment on THAT thread, which
+    only ``_poll_loop`` used to open (the #131 shape, on the inline path)."""
+    from contextlib import contextmanager
+
+    state = {"inside": False}
+    seen: list[bool] = []
+
+    @contextmanager
+    def os_setup():
+        state["inside"] = True
+        try:
+            yield
+        finally:
+            state["inside"] = False
+
+    class RecordingCpu(FakeCpu):
+        def temp(self) -> float | None:
+            seen.append(state["inside"])
+            return super().temp()
+
+    s = BaselineSensors(cpu=RecordingCpu(), memory=FakeMemory(), gpus=[],
+                        fans=[], thread_context=os_setup)
+    s.read_all()
+
+    assert seen and all(seen), f"the inline sweep read outside the setup: {seen}"
+
+
+def test_the_platform_builds_one_enumerator_for_threads_that_race() -> None:
+    """The first ask is no longer the App's constructor on the main thread,
+    so two threads can ask at once -- and on Windows a second build is a
+    second LibreHardwareMonitor.  It is also built INSIDE the thread's OS
+    setup, because the asking thread may have no COM apartment."""
+    import time
+    from contextlib import contextmanager
+
+    from trcc.adapters.system.linux import LinuxOS
+
+    platform = LinuxOS()
+    builds: list[bool] = []
+    state = {"inside": False}
+
+    @contextmanager
+    def os_setup():
+        state["inside"] = True
+        try:
+            yield
+        finally:
+            state["inside"] = False
+
+    def slow_build():
+        builds.append(state["inside"])
+        time.sleep(0.05)              # wide enough for the race to land
+        return BaselineSensors(cpu=FakeCpu(), memory=FakeMemory(), gpus=[], fans=[])
+
+    platform._build_sensors = slow_build          # type: ignore[method-assign]
+    platform.worker_thread_context = os_setup     # type: ignore[method-assign]
+    got: list[object] = []
+    threads = [threading.Thread(target=lambda: got.append(platform.sensors()))
+               for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(5.0)
+
+    assert builds == [True], f"built {len(builds)} time(s), inside setup: {builds}"
+    assert len(got) == 8 and len({id(g) for g in got}) == 1
 
 
 # ── Disk SELECTION — the feature `disk_index` never delivered ────────
@@ -1235,3 +1573,203 @@ def test_set_interval_clamps_to_the_floor_like_start_polling_does() -> None:
     s.set_interval(0.001)
 
     assert s._interval_s == MIN_REFRESH_INTERVAL_S
+
+
+# ── #279: the MC-3 shows the speed the memory RUNS, not its nameplate ──────
+
+
+def _memory_clock(monkeypatch, *, configured, spd_mhz=2404):
+    """A MemoryClock whose two sources are scripted; returns (clock, calls)."""
+    from types import SimpleNamespace
+
+    from trcc.adapters.sensors.hwmon import MemoryClock
+
+    calls: list[str] = []
+
+    def dmi():
+        calls.append("dmi")
+        return configured
+
+    monkeypatch.setattr("trcc.adapters.system.linux.configured_memory_mts", dmi)
+    monkeypatch.setattr("trcc.adapters.system.spd.read_spd_timings",
+                        lambda: SimpleNamespace(mhz=spd_mhz))
+    return MemoryClock(), calls
+
+
+def test_memory_clock_prefers_the_configured_speed(monkeypatch) -> None:
+    clock, _ = _memory_clock(monkeypatch, configured=8000)
+    assert clock.clock() == 4000.0              # 8000 MT/s, DDR -> 4000 MHz
+
+
+def test_memory_clock_falls_back_to_the_spd_nameplate(monkeypatch) -> None:
+    clock, _ = _memory_clock(monkeypatch, configured=None, spd_mhz=2404)
+    assert clock.clock() == 2404.0
+
+
+def test_memory_clock_reads_once_and_only_when_asked(monkeypatch) -> None:
+    """dmidecode goes through pkexec — not at construction, and not per tick."""
+    clock, calls = _memory_clock(monkeypatch, configured=8000)
+    assert calls == []
+    clock.clock()
+    clock.clock()
+    assert calls == ["dmi"]
+
+
+def test_the_mc3_panel_shows_the_configured_speed(monkeypatch) -> None:
+    """The number the reporter reads: LC1 phase 1 is mem_clock x memory_ratio."""
+    from trcc.core.models import HardwareMetrics
+    from trcc.services.led_segment import LC1Display
+
+    clock, _ = _memory_clock(monkeypatch, configured=8000)
+    shown = LC1Display().compute_mask(
+        HardwareMetrics(mem_clock=clock.clock() or 0.0), phase=1)
+
+    expected = [False] * LC1Display.mask_size
+    expected[LC1Display.MTNO] = True
+    LC1Display()._encode_4digit(8000, LC1Display.ALL_DIGITS, expected)
+    assert shown == expected
+
+
+# ── #282: drivers that keep their sensor files on hwmonN/device/ ────────────
+#
+# The reporter's sch5636 registers /sys/class/hwmon/hwmonN but leaves every
+# *_input -- and `name` -- on the platform device, i.e. hwmonN/device/.
+# `sensors` (and psutil) look there; our scanner did not, so the chip showed no
+# fans and was named "hwmon1".
+
+
+def _legacy_node(root: Path, name: str = "hwmon1") -> Path:
+    """A node shaped like the reporter's: bare, with everything under device/."""
+    node = root / name
+    dev = node / "device"
+    dev.mkdir(parents=True)
+    (dev / "name").write_text("sch5636\n")
+    (dev / "fan1_input").write_text("1514\n")
+    (dev / "fan3_input").write_text("1836\n")
+    (dev / "temp1_input").write_text("50000\n")
+    return node
+
+
+def test_a_legacy_node_reads_its_name_and_fans_from_device(tmp_path: Path) -> None:
+    dev = hwmon.HwmonDevice(_legacy_node(tmp_path))
+
+    assert dev.driver == "sch5636"
+    fans = hwmon.discover_fans([dev])
+    assert [f.rpm() for f in fans] == [1514, 1836]
+    assert dev.read_temp(1) == 50.0
+
+
+def test_a_modern_node_keeps_reading_itself_even_with_a_device_dir(
+    tmp_path: Path,
+) -> None:
+    """NVMe publishes inputs on the node AND device/serial -- stay on the node.
+
+    Pinned with a conflicting reading under device/ too: whenever the node has
+    its own inputs, the node wins.  (A mutation preferring device/ survived
+    until this line was added.)
+    """
+    node = tmp_path / "hwmon2"
+    (node / "device").mkdir(parents=True)
+    (node / "name").write_text("nvme\n")
+    (node / "temp1_input").write_text("41000\n")
+    (node / "device" / "serial").write_text("S123\n")
+    (node / "device" / "temp1_input").write_text("99000\n")
+
+    dev = hwmon.HwmonDevice(node)
+    assert (dev.attrs, dev.driver, dev.read_temp(1)) == (node, "nvme", 41.0)
+
+
+def test_a_node_with_no_inputs_anywhere_is_wrapped_as_before(tmp_path: Path) -> None:
+    node = tmp_path / "hwmon3"
+    node.mkdir()
+    dev = hwmon.HwmonDevice(node)
+    assert (dev.attrs, dev.driver) == (node, "hwmon3")
+
+
+def test_build_linux_sensors_offers_a_nouveau_gpu(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The factory wires nouveau beside amdgpu and i915/xe.  Before, no backend
+    read it AND the board reader skipped the chip as GPU-owned, so a nouveau
+    card's temperature was shown nowhere."""
+    from trcc.adapters.sensors import aggregator
+
+    node = _nouveau_node(tmp_path, temp1_input="58000")
+    monkeypatch.setattr(aggregator, "scan_hwmon_devices", lambda: [node])
+    monkeypatch.setattr(aggregator, "discover_nvidia_gpus", lambda: [])
+    # read_all reads the memory clock, whose configured speed is dmidecode's.
+    monkeypatch.setattr("trcc.adapters.system.linux.configured_memory_mts",
+                        lambda: None)
+    s = aggregator.build_linux_sensors()
+    assert [g.key for g in s.gpus()] == ["nouveau:0"]
+    assert s.read_all()["gpu:primary:temp"] == 58.0
+
+
+# ── Intel GPU on xe (Arc) and i915: fan, clock, power (#236) ──────────
+
+
+def _intel_gpu(root: Path, driver: str, *, hwmon_files: dict[str, str],
+               card_files: dict[str, str]) -> hwmon.IntelGpu:
+    """An IntelGpu over a fake hwmon node and DRM card, laid out per the
+    kernel ABI docs (sysfs-driver-intel-{xe,i915}-hwmon, xe_gt_freq.c)."""
+    node, card = root / "hwmon8", root / "card0"
+    node.mkdir()
+    (node / "name").write_text(f"{driver}\n")
+    for name, value in {**hwmon_files, **card_files}.items():
+        path = (node if name in hwmon_files else card) / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(value)
+    return hwmon.IntelGpu(0, hwmon.HwmonDevice(node), card, driver)
+
+
+def test_arc_fan_is_rpm_from_fan1_input(tmp_path: Path) -> None:
+    """xe has fan1_input and no pwm, so fan() was None on the reporter's
+    Arc Pro B70 while `sensors` read 796 RPM."""
+    gpu = _intel_gpu(tmp_path, "xe", hwmon_files={"fan1_input": "796"}, card_files={})
+    assert (gpu.fan_rpm(), gpu.fan()) == (796.0, None)
+
+
+@pytest.mark.parametrize(("driver", "path"), [
+    ("xe", "device/tile0/gt0/freq0/act_freq"),
+    ("i915", "gt_cur_freq_mhz"),
+])
+def test_intel_clock_reads_the_drivers_own_file(
+        tmp_path: Path, driver: str, path: str) -> None:
+    gpu = _intel_gpu(tmp_path, driver, hwmon_files={}, card_files={path: "2400"})
+    assert gpu.clock() == 2400.0
+
+
+@pytest.mark.parametrize("driver", ["xe", "i915"])
+def test_intel_power_comes_from_the_energy_counter(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, driver: str) -> None:
+    """Neither driver has power1_average; watts = Δenergy1_input / Δt.  The
+    first read seeds, a counter wrap is dropped rather than reported."""
+    gpu = _intel_gpu(tmp_path, driver, hwmon_files={"energy1_input": "1000000"},
+                     card_files={})
+    counter = tmp_path / "hwmon8" / "energy1_input"
+    times = iter([10.0, 12.0, 13.0])
+    monkeypatch.setattr(hwmon.time, "monotonic", lambda: next(times))
+    assert gpu.power() is None                     # baseline
+    counter.write_text("91000000")                 # +90 J over 2 s
+    assert gpu.power() == 45.0
+    counter.write_text("5")                        # wrapped
+    assert gpu.power() is None
+
+
+def test_a_stuck_spd_hub_is_a_warning_not_a_missing_file(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """``temp1_input`` there and failing is a stuck SPD hub, not a DIMM with no
+    sensor.  It used to log "has no temp1_input" at DEBUG -- invisible in a
+    report, and wrong (2026-10-09, after another program probed the bus).
+
+    MUTATION CHECK: drop the ``exists()`` branch in ``discover_dram_temp``."""
+    import logging
+    stuck = _hwmon_dir(tmp_path, "hwmon2", "spd5118")
+    (tmp_path / "hwmon2" / "temp1_input").mkdir()     # reads fail, like ENXIO
+    absent = _hwmon_dir(tmp_path, "hwmon3", "jc42")    # no sensor file at all
+    caplog.set_level(logging.DEBUG, logger="trcc.adapters.sensors.hwmon")
+
+    assert hwmon.discover_dram_temp([stuck, absent]) == []
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1 and "does not answer" in warnings[0]
+    assert "power-off" in warnings[0]

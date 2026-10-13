@@ -1,8 +1,8 @@
 """The cadence behind a screencast — the piece that made CLI/API work.
 
-``StartScreencast`` publishes ``ScreencastStarted`` and deliberately nothing
-else, because the GUI's ``ScreencastHandler`` subscribes and runs a Qt timer.
-That left every other client driving nothing: ``trcc display screencast``
+``StartScreencast`` used to publish ``ScreencastStarted`` and deliberately
+nothing else, because the GUI's ``ScreencastHandler`` subscribed and ran a Qt
+timer.  That left every other client driving nothing: ``trcc display screencast``
 printed "Capturing on …" and then sat in ``signal.pause()``, and the REST route
 had the same shape.  This is the missing driver — it dispatches
 ``CaptureScreencastFrame`` on a fixed cadence from a scheduler thread, so a
@@ -44,7 +44,7 @@ class ScreencastDriver(BaseSendTask):
     KEY_PREFIX = "screencast:"
     DEFAULT_INTERVAL_S = SCREENCAST_TICK_S
 
-    def run_once(self, now: float) -> float:
+    def _run(self, now: float) -> float:
         """Capture one frame; return the seconds to wait before the next.
 
         A failed frame does NOT stop the driver — capture depends on a desktop

@@ -2,28 +2,42 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 from uuid import uuid4
 
 from .._safe import is_safe_user_name, is_under
 from ..errors import (
+    DeviceNotConnectedError,
+    DeviceNotFoundError,
     HttpFetchError,
     ThemeError,
     TransportError,
     TrccError,
 )
 from ..events import (
+    DataInstalled,
     ErrorOccurred,
     FrameSent,
+    ThemeDeleted,
     ThemeExported,
     ThemeImported,
     ThemeLoaded,
     ThemeSaved,
 )
 from ..geometry import content_is_portrait, save_folder_resolution
-from ..models import ZT_MAX_DURATION_MS, FitMode, ThemeDir, VideoExportRequest
+from ..models import (
+    CUTTER_DEFAULT_FPS,
+    CUTTER_FPS_CHOICES,
+    ZT_MAX_DURATION_MS,
+    Capability,
+    FitMode,
+    ThemeDir,
+    VideoExportRequest,
+)
 from ..ports import ContentStore
 from ..results import (
     CloudCategoryEntry,
@@ -32,9 +46,7 @@ from ..results import (
     CloudThemesListResult,
     DeleteThemeResult,
     EnsureDataDownloadResult,
-    ExportConfigResult,
     FileEntry,
-    ImportConfigResult,
     MasksListResult,
     MaskUploadResult,
     ThemeDcExportResult,
@@ -49,16 +61,24 @@ from ..results import (
 )
 from ._base import Command, Query
 from ._helpers import (
+    _drive_game_mode,
+    _drive_slideshow,
     _invalidate_scene,
-    _json_default_tuple,
+    _live_sensors,
     _publish_if_disconnect,
+    _require_connected_device,
     _resolve_oriented_resolution,
     _search_theme_by_name,
     as_working_layer,
     device_overlay_layout,
+    enter_orientation,
+    fit_mask_upload,
     native_canvas,
     oriented_theme_path,
     overlay_elements_to_dc,
+    screencast_dc_flags,
+    seed_screencast_rect,
+    user_mask_flags,
 )
 from .device import (
     ApplyMask,
@@ -66,6 +86,7 @@ from .device import (
     SetMaskPosition,
     SetMediaPlayer,
     StartScreencast,
+    StopScreencast,
     StopVideo,
 )
 
@@ -101,6 +122,38 @@ def _cloud_preview(web_dir: Path | None, theme_id: str) -> str:
     return str(png) if png.is_file() else ""
 
 
+def _layer_laid_out_elsewhere(app: App, key: str, catalog: str) -> str | None:
+    """Why *key*'s working layer does not belong to theme folder *catalog*.
+
+    ``None`` when it does, or when there is no layer.  The C# keys every layout
+    by its theme folder (``ThemeML``: resolution and orientation) and a
+    rotation reloads the rotated folder's own theme (FormCZTV.cs:1927-1960);
+    a layer laid out in another folder has coordinates for another canvas.
+
+    A layer saved before the folder was recorded is judged by where it lies:
+    an element outside the device's canvas is the mark of the rotation bug
+    this rule fixes, and the one state that must not be kept.
+    """
+    dev = app.settings.for_device(key)
+    if dev.user_overlay_elements is None:
+        return None
+    if dev.user_overlay_catalog is not None:
+        answer = (None if dev.user_overlay_catalog == catalog
+                  else f"laid out in {dev.user_overlay_catalog}, not {catalog}")
+        log.debug("_layer_laid_out_elsewhere: %s → %s", key, answer)
+        return answer
+    canvas = _resolve_oriented_resolution(app, key)
+    if canvas is None:
+        log.debug("_layer_laid_out_elsewhere: %s has no canvas yet", key)
+        return None
+    w, h = canvas
+    outside = [e.id for e in dev.user_overlay_elements if e.x >= w or e.y >= h]
+    log.debug("_layer_laid_out_elsewhere: %s unrecorded, %d outside %dx%d",
+              key, len(outside), w, h)
+    return (f"an unrecorded layer with {len(outside)} element(s) outside "
+            f"{w}x{h}") if outside else None
+
+
 @dataclass(frozen=True, slots=True)
 class LoadTheme(Command[ThemeResult]):
     """Parse a theme, persist it, render the first frame, and send it.
@@ -109,12 +162,14 @@ class LoadTheme(Command[ThemeResult]):
     takes effect on next connect.  If no Renderer is attached to the
     App, the send step is skipped (parse + persist only).
     """
+    USES_DEVICE: ClassVar[bool] = True
+    REQUIRES: ClassVar[Capability | None] = Capability.THEME
     key: str
     path: Path
     # Explicit user theme switch (default) establishes the theme's own state
     # and DROPS the device's overrides — live overlay edits, the applied mask,
     # AND the cloud-background / video override — so the new theme starts
-    # clean from its bundled assets.  RestoreLastTheme passes
+    # clean from its bundled assets.  RestoreDeviceState passes
     # ``reset_overrides=False`` — a reconnect / restart / view-switch keep-
     # alive PRESERVES those overrides (all persisted in config.json) instead
     # of reverting to the theme's bundled layout/background.
@@ -154,7 +209,7 @@ class LoadTheme(Command[ThemeResult]):
             return ThemeResult(ok=False, key=self.key, message=str(e))
 
         # Persist the absolute path — names are display strings, paths
-        # are the stable reference RestoreLastTheme needs.
+        # are the stable reference RestoreDeviceState needs.
         app.settings.set_current_theme(self.key, str(theme.path.resolve()))
         # Set the new theme BEFORE StopVideo: StopVideo's VideoStopped
         # publish is handled synchronously by _DeviceRenderObserver, which
@@ -167,6 +222,10 @@ class LoadTheme(Command[ThemeResult]):
         # (animated→static switches silently kept showing the old animation
         # until a second click finally cleared it).
         app.active_themes[self.key] = theme
+        if self.key in app.held:     # a theme load ends a push's hold (#306)
+            log.info("LoadTheme: %s released from a pushed frame's hold",
+                     self.key)
+            app.held.discard(self.key)
         # Single source of truth for "stop the previous video + clear the
         # cloud-background override + invalidate the scene cache": ``StopVideo``
         # (publishes VideoStopped, clears background_path, unloads playback).
@@ -218,14 +277,17 @@ class LoadTheme(Command[ThemeResult]):
         #
         # Still skipped on restore (reset_overrides=False): a reconnect must
         # keep the persisted edits, not overwrite them with the theme's.
-        if self.reset_overrides:
+        catalog = theme.path.parent.name
+        elsewhere = (None if self.reset_overrides
+                     else _layer_laid_out_elsewhere(app, self.key, catalog))
+        if self.reset_overrides or elsewhere:
             adopted = as_working_layer(theme.config.get("elements"))
             log.info(
                 "LoadTheme: adopting %s's %d overlay element(s) as the "
-                "working layer for %s (explicit theme switch)",
-                theme.name, len(adopted), self.key,
+                "working layer for %s (%s)", theme.name, len(adopted), self.key,
+                elsewhere or "explicit theme switch",
             )
-            app.settings.set_user_overlay_elements(self.key, adopted)
+            app.settings.set_user_overlay_elements(self.key, adopted, catalog)
         elif app.settings.for_device(self.key).user_overlay_elements is None:
             # Restore, and the working layer is empty — the state every
             # config written before the layer existed is in.  Seed it from the
@@ -247,7 +309,11 @@ class LoadTheme(Command[ThemeResult]):
                     "element(s) from %s for %s",
                     len(seeded), theme.name, self.key,
                 )
-                app.settings.set_user_overlay_elements(self.key, seeded)
+                app.settings.set_user_overlay_elements(self.key, seeded, catalog)
+        elif app.settings.for_device(self.key).user_overlay_catalog is None:
+            log.info("LoadTheme: %s's working layer fits — recording it as "
+                     "laid out in %s", self.key, catalog)
+            app.settings.set_user_overlay_catalog(self.key, catalog)
 
         # If device is attached + connected + Renderer available, send an
         # immediate first frame.  Otherwise the theme is saved for the
@@ -296,6 +362,22 @@ class LoadTheme(Command[ThemeResult]):
                 if apply.ok:
                     log.info("LoadTheme: applied mask %s → %s (%s)",
                              embedded_mask, resolved_mask, theme.name)
+                    # ApplyMask adopts the MASK's config1.dc as the working
+                    # layer — right for a mask the user picks, wrong here.  A
+                    # theme that bundles a mask is a SAVED theme, and its
+                    # inline elements are already the final layout the user
+                    # saw (SaveTheme bakes user > mask > theme into them).  So
+                    # they win, or a saved "Game" reloads as the mask's stock
+                    # set, and the GUI editor (which reads the theme folder)
+                    # lists fields the screen does not draw (#301).  Only when
+                    # the theme HAS elements: a legacy config.json with an
+                    # empty ``dc`` keeps showing its mask's layout as before.
+                    if own := as_working_layer(theme.config.get("elements")):
+                        log.info("LoadTheme: %s keeps its own %d element(s) "
+                                 "over the bundled mask's layout",
+                                 theme.name, len(own))
+                        app.settings.set_user_overlay_elements(
+                            self.key, own, catalog)
                 else:
                     log.warning(
                         "LoadTheme: theme %s mask %s resolved to %s but "
@@ -313,6 +395,14 @@ class LoadTheme(Command[ThemeResult]):
         # TOP-LEFT.  Same conversion ApplyMask runs — port the legacy
         # behavior here so a freshly-loaded theme renders its bundled
         # mask at the right spot, not stored-center-as-top-left.
+        # The theme's screencast region (the C#'s Jp*, read from every DC it
+        # loads).  AFTER the bundled mask, so the theme's own wins over its
+        # mask's; on a restore only when the device never had one, so a
+        # reconnect does not undo the user's edit.
+        if (self.reset_overrides
+                or app.settings.for_device(self.key).screencast_rect is None):
+            seed_screencast_rect(app, self.key, theme.config,
+                                 f"theme {theme.name}")
         from ...services.overlay import OverlayService
         theme_mask = ThemeDir(theme.path).mask
         pos = theme.config.get("mask_position")
@@ -369,6 +459,14 @@ class LoadTheme(Command[ThemeResult]):
         # Screencast-backed theme: resume the saved screen-capture region as
         # the display source (mutually exclusive with a video/image bg).
         region = app.themes.screencast_region(theme)
+        if region is None and (
+            app.settings.for_device(self.key).screencast_region is not None
+        ):
+            # A theme is a display source too: without this the capture ran
+            # on behind the theme just picked, the desktop under its mask.
+            log.info("LoadTheme: %s carries no screencast — ending the "
+                     "running one", theme.name)
+            app.dispatch(StopScreencast(key=self.key))
         if region is not None:
             x, y, w, h, audio = region
             log.info("LoadTheme: %s carries a screencast region %s — "
@@ -384,9 +482,8 @@ class LoadTheme(Command[ThemeResult]):
             )
 
         # Media-player-backed theme: resume the saved source URI via the same
-        # Command every UI dispatches (restores the setting + plays a local
-        # source; a web URL is referenced — streaming playback is a runtime
-        # feature).
+        # Command every UI dispatches (restores the setting and plays the
+        # source: a local file, or a web URL as a live stream).
         media_uri = app.themes.media_player_uri(theme)
         if media_uri is not None:
             log.info("LoadTheme: %s carries a media-player source %r — "
@@ -426,14 +523,8 @@ class LoadTheme(Command[ThemeResult]):
         # used by MetricsLoop + ReadSensors + RenderAndSend so this
         # one-shot first-frame matches the cadence the periodic
         # broadcast will deliver.
-        from ...services.metrics_personalize import personalize_readings
-        s_app = app.settings.app
         try:
-            sensors = personalize_readings(
-                app.platform.sensors().read_all(),
-                temp_unit=s_app.temp_unit,
-                hdd_enabled=s_app.hdd_enabled,
-            )
+            sensors = _live_sensors(app)
         except Exception as e:
             log.warning(
                 "LoadTheme: sensors.read_all() raised %s — first frame "
@@ -484,6 +575,91 @@ class LoadTheme(Command[ThemeResult]):
                      if sent else f"Theme '{theme.name}' rendered but send failed",
             )
 
+def _composed_resolution(
+    app: App, key: str, theme: Theme, s: DeviceSettings,
+) -> tuple[int, int] | None:
+    """The resolution the device's live content is composed in -- its folder.
+
+    The content's orientation, not the raw angle: a portrait selection
+    (portrait mask / portrait theme) is ``{h}{w}``, landscape content
+    ``{w}{h}``, so a theme always reloads into the orientation it was composed
+    in.  Folder selection is the asset-catalog concern, kept separate from the
+    renderer's compose canvas.  A device with no live profile falls back to
+    the angle-keyed resolution.  Shared by :class:`SaveTheme` and
+    :class:`ExportCurrentTheme`, which describe the same content.
+    """
+    device = app.devices.get(key)
+    profile = device.profile if device is not None else None
+    if profile is None:
+        log.debug("_composed_resolution: %s has no live profile -- "
+                  "angle-keyed", key)
+        return _resolve_oriented_resolution(app, key)
+    portrait = content_is_portrait(theme, profile, s.mask_path, s.mask_visible)
+    resolution = save_folder_resolution(profile, s.orientation, portrait)
+    log.debug("_composed_resolution: %s portrait=%s -> %s",
+              key, portrait, resolution)
+    return resolution
+
+
+def _clip_end_ms(source: Path, start_ms: int) -> int:
+    """Where a clip of *source* from *start_ms* ends when no end was given:
+    the file's own end, or 10 s on when ffprobe cannot say."""
+    from ...services.video_export import probe_duration_ms
+
+    probed = probe_duration_ms(source)
+    if probed > 0:
+        log.debug("_clip_end_ms: %s ends at %d ms", source.name, probed)
+        return probed
+    log.warning("_clip_end_ms: cannot probe %s's length -- taking 10 s "
+                "from %d ms", source, start_ms)
+    return start_ms + 10_000
+
+
+@contextmanager
+def _tr_background(app: App, key: str, archive_path: Path,
+                   background: Path | None,
+                   size: tuple[int, int]) -> Iterator[Path | None]:
+    """The background a ``.tr`` export of *background* carries.
+
+    A ``.tr`` holds a still or a ``Theme.zt`` and nothing else
+    (``FormCZTV.buttonDaoChu_Click``), and the Windows app's own video themes
+    ARE a ``Theme.zt`` -- ``UCVideoCut.BmpToThemeFile`` bakes every video at
+    the canvas size when it is imported.  So a video becomes one here, at
+    *size* and the device's fit (what the panel shows), gone on exit.
+    Anything else -- a zip, a still, a ``Theme.zt`` -- passes through.
+    """
+    if (archive_path.suffix.lower() != ".tr" or background is None
+            or MEDIA.kind_of(background) is not MediaKind.ANIMATED
+            or background.suffix.lower() == ".zt"):
+        log.debug("_tr_background: %s carries %s as it is",
+                  archive_path.name, background)
+        yield background
+        return
+
+    from ...services.video_export import VideoExporter, VideoExportError
+
+    duration = _clip_end_ms(background, 0)
+    if duration > ZT_MAX_DURATION_MS:
+        log.warning("_tr_background: %s runs %d ms -- a Theme.zt holds "
+                    "%d, the rest is cut", background, duration,
+                    ZT_MAX_DURATION_MS)
+    fit = app.settings.for_device(key).fit_mode
+    w, h = size
+    log.info("_tr_background: baking %s into a %dx%d Theme.zt (%d ms, "
+             "fit %s) for %s", background, w, h,
+             min(duration, ZT_MAX_DURATION_MS), fit, archive_path.name)
+    try:
+        with VideoExporter(app.platform.software_install_hint).baked(
+                VideoExportRequest(source=background, start_ms=0,
+                                   end_ms=min(duration, ZT_MAX_DURATION_MS),
+                                   target_w=w, target_h=h, fit_mode=fit),
+        ) as zt:
+            yield zt
+    except VideoExportError as e:
+        raise ThemeError(f"could not turn the video into a Theme.zt for "
+                         f"the .tr: {e}") from e
+
+
 @dataclass(frozen=True, slots=True)
 class SaveTheme(Command[ThemeResult]):
     """Save the device's CURRENT rendered state as a new theme directory.
@@ -505,9 +681,9 @@ class SaveTheme(Command[ThemeResult]):
         background is an image / a mask is present.  Render flags
         (``overlay_enabled`` / ``rotation`` / ``mask_visible`` / …) carry
         over from the source.
-      * image background → stored in the library (deduped); video
-        background → bundled verbatim as ``Theme.<ext>`` (videos dedup
-        poorly and the in-dir convention already reloads them).
+      * background → stored in the user library (deduped) and referenced:
+        an image as ``.png``, an animation in its own container (every
+        animated format ``MEDIA`` declares, .gif included).
       * mask → stored image-only in the library (no ``config1.dc``); the
         manifest's inline ``elements`` own the layout, so ``ApplyMask`` on
         reload applies the mask image + position WITHOUT clobbering them.
@@ -527,6 +703,8 @@ class SaveTheme(Command[ThemeResult]):
     target is removed and the original DeviceSettings are left
     untouched so the user can retry without losing state.
     """
+    USES_DEVICE: ClassVar[bool] = True
+    REQUIRES: ClassVar[Capability | None] = Capability.THEME
     key: str
     name: str
     overwrite: bool = False
@@ -552,27 +730,9 @@ class SaveTheme(Command[ThemeResult]):
             )
 
         device_settings = app.settings.for_device(self.key)
-        # Save into the folder matching the content's orientation, not the raw
-        # angle — the content's parent folder IS the orientation.  A connected
-        # device carries its profile, so we key the resolution on
-        # save_folder_resolution: a portrait selection (portrait mask / portrait
-        # theme) → theme{h}{w}; landscape content → theme{w}{h}.  This makes
-        # save + reload agree — a theme always reloads into the orientation it
-        # was composed in.  (Folder selection is the asset-catalog concern, kept
-        # separate from the renderer's compose canvas.)  Disconnected (no live
-        # profile) falls back to the angle-keyed resolution, unchanged.
-        device = app.devices.get(self.key)
-        profile = device.profile if device is not None else None
-        if profile is not None:
-            portrait = content_is_portrait(
-                theme, profile, device_settings.mask_path,
-                device_settings.mask_visible,
-            )
-            resolution = save_folder_resolution(
-                profile, device_settings.orientation, portrait,
-            )
-        else:
-            resolution = _resolve_oriented_resolution(app, self.key)
+        resolution = _composed_resolution(
+            app, self.key, theme, device_settings,
+        )
         if resolution is None:
             log.warning(
                 "SaveTheme: cannot resolve resolution for %s "
@@ -670,6 +830,7 @@ class SaveTheme(Command[ThemeResult]):
         ))
         return ThemeResult(
             ok=True, key=self.key, theme_name=self.name,
+            theme_path=str(target),
             message=f"theme saved as '{self.name}' at {target}",
         )
 
@@ -689,10 +850,31 @@ class SaveTheme(Command[ThemeResult]):
         Carries the source's render flags, the baked overlay layout (see
         :meth:`_combine_elements`), and library refs for the background
         image / mask (see :meth:`_store_background` / :meth:`_store_mask`).
-        A video background is bundled verbatim by :meth:`_store_background`
-        and produces no ref.
+        An animated background is stored in its own container by
+        :meth:`_store_background` and referenced like an image.
         """
-        manifest: dict = {"name": self.name, "width": width, "height": height}
+        manifest = self._live_manifest(app, theme, s, self.name,
+                                       width, height)
+        bg_ref = self._store_background(app, theme, s, width, height)
+        if bg_ref is not None:
+            manifest["background"] = bg_ref
+        mask_ref = self._store_mask(app, theme, s, width, height)
+        if mask_ref is not None:
+            manifest["mask"] = mask_ref
+        return manifest
+
+    @classmethod
+    def _live_manifest(
+        cls, app: App, theme: Theme, s: DeviceSettings, name: str,
+        width: int, height: int,
+    ) -> dict:
+        """Everything a theme of the live state says except where its
+        background and mask live -- the part :class:`SaveTheme` (library
+        refs) and :class:`ExportCurrentTheme` (bundled files) share.
+        """
+        log.info("_live_manifest: %r %dx%d from %s", name, width, height,
+                 theme.name)
+        manifest: dict = {"name": name, "width": width, "height": height}
         # The codec names these, so the codec lists them.  Spelled out here,
         # the tuple went on saying ``transparent_display`` after the field was
         # renamed — and a manifest key nothing reads is indistinguishable from
@@ -701,15 +883,12 @@ class SaveTheme(Command[ThemeResult]):
         for field in THEME_FLAG_KEYS:
             if field in theme.config:
                 manifest[field] = theme.config[field]
+        # The device's region over the source theme's -- the user may have
+        # edited it, and the C# saves its live Jp* (FormCZTV.cs:7290).
+        manifest.update(screencast_dc_flags(s))
         manifest.setdefault("overlay_enabled", True)
-        manifest["elements"] = self._combine_elements(theme, s)
+        manifest["elements"] = cls._combine_elements(theme, s)
 
-        bg_ref = self._store_background(app, theme, s, width, height)
-        if bg_ref is not None:
-            manifest["background"] = bg_ref
-        mask_ref = self._store_mask(app, theme, s, width, height)
-        if mask_ref is not None:
-            manifest["mask"] = mask_ref
         # Screencast is the active display source when the screencast toggle is
         # on (mutually exclusive with a background/video) — store its region
         # config in the user library and reference it by URI.
@@ -819,9 +998,18 @@ class SaveTheme(Command[ThemeResult]):
         # ``_resolve_asset_ref`` joins under the data dirs, so deriving is
         # both shorter and the only version that can carry a suffix without
         # being taught about one.
-        for root in (paths.user_background_dir(width, height),
-                     app.libraries(self.key).cloud_theme_dir(width, height),
-                     paths.cloud_theme_dir(width, height)):
+        #
+        # A cloud VIDEO is the exception: it is a per-click download
+        # (``CloudThemeService.materialise``) that no data install ever puts
+        # back, so a ref into the cloud library loads BLACK once ``~/.trcc`` is
+        # wiped or reinstalled.  It is copied into the user library like a
+        # custom asset.  Cloud stills keep their refs — the data install
+        # restores those.
+        roots = [paths.user_background_dir(width, height)]
+        if not is_video:
+            roots += [app.libraries(self.key).cloud_theme_dir(width, height),
+                      paths.cloud_theme_dir(width, height)]
+        for root in roots:
             # ``is_under`` resolves BOTH sides itself (the #261 symlink fix), so
             # pre-resolving here only asked the filesystem the same question
             # twice.
@@ -856,7 +1044,16 @@ class SaveTheme(Command[ThemeResult]):
         cloud mask's own ``config1.dc`` is not written here; the saved theme's
         overlay layout lives inline in its ``trcc.json`` (baked elements).
         ``DeviceSettings.mask_path`` (override) wins over the source theme's mask.
+
+        A HIDDEN mask is not saved: a saved theme is what the user saw.
+        ``LoadTheme`` deliberately never applies a stored ``mask_visible``
+        (legacy treats it as design metadata), so a hidden mask stored here
+        came back visible on every reload — and at once, since SaveTheme
+        ends by loading what it wrote (#276).
         """
+        if not s.mask_visible:
+            log.info("SaveTheme: mask is hidden — not saved with the theme")
+            return None
         src = self._pick_asset(
             s.mask_path, app.themes.mask_path(theme), "mask",
         )
@@ -902,31 +1099,15 @@ class SaveTheme(Command[ThemeResult]):
 
         ``Theme.png`` is the chooser's preferred tile and is NEVER rendered
         to the device, so baking the full composite (background + mask +
-        overlay) is safe.  Best-effort: needs a connected device + renderer
-        to snapshot; a headless save falls back to the source theme's
-        thumbnail.  Never raises — a thumbnail miss must not fail the save.
+        overlay) is safe.  Best-effort: a headless save falls back to the
+        source theme's thumbnail.  Never raises — a thumbnail miss must not
+        fail the save.
         """
-        device = app.devices.get(self.key)
-        if device is not None:
-            try:
-                from ...services.metrics_personalize import personalize_readings
-                s_app = app.settings.app
-                sensors = personalize_readings(
-                    app.platform.sensors().read_all(),
-                    temp_unit=s_app.temp_unit, hdd_enabled=s_app.hdd_enabled,
-                )
-                surface = app.display.build_preview_surface(
-                    info=device.info, theme=theme, sensors=sensors,
-                    profile=device.profile,
-                )
-                out = app.themes.write_preview(
-                    target, app.renderer.encode_png(surface),
-                )
-                log.info("SaveTheme: preview snapshot → %s", out)
-                return
-            except Exception as e:
-                log.warning("SaveTheme: preview snapshot failed (%s) — "
-                            "falling back to source thumbnail", e)
+        png = self._preview_png(app, self.key, theme)
+        if png is not None:
+            out = app.themes.write_preview(target, png)
+            log.info("SaveTheme: preview snapshot → %s", out)
+            return
 
         if app.themes.copy_preview(theme.path, target):
             log.info("SaveTheme: copied source thumbnail from %s", theme.path)
@@ -934,120 +1115,32 @@ class SaveTheme(Command[ThemeResult]):
             log.info("SaveTheme: no device + no source thumbnail — "
                      "saved without a grid tile")
 
-@dataclass(frozen=True, slots=True)
-class ExportConfig(Command[ExportConfigResult]):
-    """Write one device's ``DeviceSettings`` to a JSON file.
-
-    Distinct from :class:`ExportTheme`:
-      * ``ExportTheme`` zips a theme directory (background + DC +
-        masks) for sharing the theme assets.
-      * ``ExportConfig`` snapshots the user's per-device prefs (active
-        theme path, brightness, overlay edits, mask choice, fit mode,
-        format prefs, etc.) — for backup / migration between hosts.
-
-    Restore with :class:`ImportConfig`.  File format is the same shape
-    Settings persists internally; the JSON is intentionally human-
-    inspectable so reporters can paste it into issues.
-    """
-    key: str
-    output_path: Path
-
-    def execute(self, app: App) -> ExportConfigResult:
-        import json
-        log.info("ExportConfig: key=%s output=%s", self.key, self.output_path)
+    @staticmethod
+    def _preview_png(app: App, key: str, theme: Theme) -> bytes | None:
+        """The live preview composite as PNG bytes, or None when there is no
+        connected device to snapshot or the render fails.  Never raises."""
+        device = app.devices.get(key)
+        if device is None:
+            log.info("_preview_png: %s not connected — no snapshot", key)
+            return None
         try:
-            snapshot = app.settings.snapshot_device(self.key)
+            sensors = _live_sensors(app)
+            surface = app.display.build_preview_surface(
+                info=device.info, theme=theme, sensors=sensors,
+                profile=device.profile,
+            )
+            return app.renderer.encode_png(surface)
         except Exception as e:
-            log.warning("ExportConfig: snapshot failed for %s: %s", self.key, e)
-            return ExportConfigResult(
-                ok=False, key=self.key, output_path=str(self.output_path),
-                message=f"snapshot failed: {e}",
-            )
-        payload = {
-            "version": 1,
-            "key": self.key,
-            "device": snapshot,
-        }
-        try:
-            self.output_path.parent.mkdir(parents=True, exist_ok=True)
-            with self.output_path.open("w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2, default=_json_default_tuple)
-        except OSError as e:
-            return ExportConfigResult(
-                ok=False, key=self.key, output_path=str(self.output_path),
-                message=f"write failed: {e}",
-            )
-        return ExportConfigResult(
-            ok=True, key=self.key, output_path=str(self.output_path),
-            message=(f"exported {self.key} config to {self.output_path}"),
-        )
-
-@dataclass(frozen=True, slots=True)
-class ImportConfig(Command[ImportConfigResult]):
-    """Restore one device's ``DeviceSettings`` from an :class:`ExportConfig` JSON.
-
-    Atomic — replaces the named device's entire settings dataclass.
-    Tolerant of older snapshot versions (unknown fields ignored;
-    missing fields fall back to dataclass defaults).
-
-    Refuses to import when the file's ``key`` field doesn't match the
-    target key — prevents accidental cross-device clobber.  Pass the
-    explicit ``--force`` at the caller edge if migration across keys
-    is intentional (caller responsibility, not Command).
-    """
-    key: str
-    input_path: Path
-
-    def execute(self, app: App) -> ImportConfigResult:
-        import json
-        log.info("ImportConfig: key=%s input=%s", self.key, self.input_path)
-        if not self.input_path.is_file():
-            return ImportConfigResult(
-                ok=False, key=self.key, input_path=str(self.input_path),
-                message=f"file not found: {self.input_path}",
-            )
-        try:
-            with self.input_path.open("r", encoding="utf-8") as f:
-                payload = json.load(f)
-        except (OSError, ValueError) as e:
-            return ImportConfigResult(
-                ok=False, key=self.key, input_path=str(self.input_path),
-                message=f"failed to parse JSON: {e}",
-            )
-        if not isinstance(payload, dict):
-            return ImportConfigResult(
-                ok=False, key=self.key, input_path=str(self.input_path),
-                message="config root must be an object",
-            )
-        snapshot_key = payload.get("key")
-        if snapshot_key and snapshot_key != self.key:
-            return ImportConfigResult(
-                ok=False, key=self.key, input_path=str(self.input_path),
-                message=(f"key mismatch: snapshot is for {snapshot_key!r}, "
-                         f"target is {self.key!r}"),
-            )
-        device_snapshot = payload.get("device")
-        if not isinstance(device_snapshot, dict):
-            return ImportConfigResult(
-                ok=False, key=self.key, input_path=str(self.input_path),
-                message="missing 'device' object in snapshot",
-            )
-        try:
-            app.settings.restore_device(self.key, device_snapshot)
-        except Exception as e:
-            log.warning("ImportConfig: restore failed for %s: %s", self.key, e)
-            return ImportConfigResult(
-                ok=False, key=self.key, input_path=str(self.input_path),
-                message=f"restore failed: {e}",
-            )
-        return ImportConfigResult(
-            ok=True, key=self.key, input_path=str(self.input_path),
-            message=f"restored {self.key} config from {self.input_path}",
-        )
+            log.warning("_preview_png: snapshot failed (%s)", e)
+            return None
 
 @dataclass(frozen=True, slots=True)
 class ExportTheme(Command[ThemeExportResult]):
-    """Zip a theme under ``user_theme_dir(w, h) / theme_name`` to an archive path.
+    """Export a theme under ``user_theme_dir(w, h) / theme_name`` to a file.
+
+    ``.tr`` writes the Windows app's own format, which Windows can import
+    (#272), with a video background baked into the ``Theme.zt`` that format
+    carries; any other name writes our zip, which keeps the video itself.
 
     Device-scoped — resolution comes from the device the caller named via
     ``key``, matching legacy's ``dev.export_config(path)`` shape where the
@@ -1094,7 +1187,12 @@ class ExportTheme(Command[ThemeExportResult]):
             )
 
         try:
-            app.themes.export(source, self.archive_path)
+            theme = app.themes.load(source)
+            with _tr_background(app, self.key, self.archive_path,
+                                app.themes.background_path(theme),
+                                resolution) as background:
+                app.themes.export(source, self.archive_path,
+                                  background=background)
         except ThemeError as e:
             return ThemeExportResult(
                 ok=False, theme_name=self.theme_name,
@@ -1110,6 +1208,77 @@ class ExportTheme(Command[ThemeExportResult]):
             archive_path=str(self.archive_path),
             message=f"theme '{self.theme_name}' exported to {self.archive_path}",
         )
+
+@dataclass(frozen=True, slots=True)
+class ExportCurrentTheme(Command[ThemeExportResult]):
+    """Export what the device is SHOWING, saved or not, to a file.
+
+    The Windows app's export button (``FormCZTV.buttonDaoChu_Click``, shown on
+    ``UCThemeLocal`` at 441,28) writes the live layout, background, mask and
+    orientation -- not a theme folder, so a program theme or unsaved edits
+    export too.  :class:`ExportTheme` exports a SAVED user theme by name.
+
+    The content is :class:`SaveTheme`'s, described once: the same resolution,
+    the same manifest, the same tile.  Only where the assets go differs --
+    bundled into a throwaway dir (``ContentStore.export_unsaved``), never the
+    user library, which would add a mask or background to a grid.
+    """
+    USES_DEVICE: ClassVar[bool] = True
+    REQUIRES: ClassVar[Capability | None] = Capability.THEME
+    key: str
+    archive_path: Path
+
+    def execute(self, app: App) -> ThemeExportResult:
+        name = self.archive_path.stem
+        log.info("ExportCurrentTheme: key=%s archive=%s", self.key,
+                 self.archive_path)
+
+        def failed(message: str) -> ThemeExportResult:
+            log.warning("ExportCurrentTheme: %s", message)
+            return ThemeExportResult(
+                ok=False, theme_name=name,
+                archive_path=str(self.archive_path), message=message,
+            )
+
+        theme = app.active_themes.get(self.key)
+        if theme is None:
+            return failed(f"no active theme for {self.key} — load one first")
+        s = app.settings.for_device(self.key)
+        resolution = _composed_resolution(app, self.key, theme, s)
+        if resolution is None:
+            return failed(f"cannot resolve resolution for {self.key} "
+                          "(connect the device first)")
+
+        manifest = SaveTheme._live_manifest(app, theme, s, name, *resolution)
+        bg = SaveTheme._pick_asset(
+            s.background_path, app.themes.background_path(theme), "background",
+        )
+        mask = (SaveTheme._pick_asset(
+            s.mask_path, app.themes.mask_path(theme), "mask",
+        ) if s.mask_visible else None)
+        try:
+            with _tr_background(app, self.key, self.archive_path, bg,
+                                resolution) as baked:
+                background = (
+                    baked if baked is None
+                    or MEDIA.kind_of(baked) is MediaKind.ANIMATED
+                    else app.renderer.encode_png(app.renderer.open_image(baked)))
+                app.themes.export_unsaved(
+                    manifest, self.archive_path, background=background,
+                    mask=mask,
+                    preview=SaveTheme._preview_png(app, self.key, theme),
+                )
+        except (OSError, ThemeError, TrccError) as e:
+            return failed(f"failed to export: {e}")
+
+        app.events.publish(ThemeExported(
+            theme_name=name, archive_path=str(self.archive_path),
+        ))
+        return ThemeExportResult(
+            ok=True, theme_name=name, archive_path=str(self.archive_path),
+            message=f"exported the panel's theme to {self.archive_path}",
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class ExportOverlay(Command[ThemeExportResult]):
@@ -1218,8 +1387,10 @@ class ImportTheme(Command[ThemeImportResult]):
     directory.
 
     ``name`` defaults to the archive filename's stem when blank.
-    Zip-slip is filtered server-side by ``ContentStore.import_``.
+    Zip-slip is filtered server-side by ``ContentStore.import_``.  Then the
+    imported theme is SHOWN, as the Windows app's import shows it.
     """
+    USES_DEVICE: ClassVar[bool] = True
     key: str
     archive_path: Path
     name: str = ""
@@ -1260,9 +1431,24 @@ class ImportTheme(Command[ThemeImportResult]):
         app.events.publish(ThemeImported(
             theme_name=chosen_name, path=str(theme.path),
         ))
+        # The Windows app's import puts the theme ON the panel
+        # (``FormCZTV.buttonDaoRu_Click`` → ``ReadFileTheme``), whichever UI
+        # asked.  A device that is not connected keeps it in the list only.
+        if app.devices.get(self.key) is None:
+            log.info("ImportTheme: %s not connected — imported, not shown",
+                     self.key)
+            return ThemeImportResult(
+                ok=True, theme_name=chosen_name, path=str(theme.path),
+                message=f"theme imported as '{chosen_name}' at {theme.path}",
+            )
+        shown = app.dispatch(LoadTheme(key=self.key, path=theme.path))
+        log.info("ImportTheme: showing %s → ok=%s", theme.path, shown.ok)
         return ThemeImportResult(
-            ok=True, theme_name=chosen_name, path=str(theme.path),
-            message=f"theme imported as '{chosen_name}' at {theme.path}",
+            ok=shown.ok, theme_name=chosen_name, path=str(theme.path),
+            message=(f"theme imported as '{chosen_name}' and shown"
+                     if shown.ok else
+                     f"theme imported as '{chosen_name}' at {theme.path}, "
+                     f"but showing it failed: {shown.message}"),
         )
 
 @dataclass(frozen=True, slots=True)
@@ -1401,6 +1587,7 @@ class ExportDcTheme(Command[ThemeDcExportResult]):
             written = app.themes.export_dc(
                 theme_dir, self.output_path,
                 elements=device_overlay_layout(app, self.key),
+                flags=screencast_dc_flags(app.settings.for_device(self.key)),
             )
         except ThemeError as e:
             return ThemeDcExportResult(
@@ -1478,6 +1665,9 @@ class DeleteTheme(Command[DeleteThemeResult]):
         else:
             log.info("DeleteTheme: no device was showing %s — no scene "
                      "invalidated", deleted.name)
+        # Every open theme list drops it, whichever UI asked.
+        app.events.publish(ThemeDeleted(theme_name=deleted.name,
+                                        path=str(deleted)))
         return DeleteThemeResult(
             ok=True, theme_name=deleted.name, path=str(deleted),
             invalidated=invalidated,
@@ -1496,6 +1686,8 @@ class UploadCustomMask(Command[MaskUploadResult]):
 
     Then dispatches ApplyMask so the new mask wires onto the device.
     """
+    USES_DEVICE: ClassVar[bool] = True
+    REQUIRES: ClassVar[Capability | None] = Capability.MASK
     key: str
     source: Path
 
@@ -1508,8 +1700,10 @@ class UploadCustomMask(Command[MaskUploadResult]):
                          "connect the device or register the product first"),
             )
         try:
-            image = self.source.read_bytes()
-        except OSError as e:
+            shrunk, size = fit_mask_upload(app, self.source, resolution)
+            image = shrunk if shrunk is not None else self.source.read_bytes()
+        except Exception as e:
+            log.warning("UploadCustomMask: cannot read %s: %s", self.source, e)
             return MaskUploadResult(
                 ok=False, key=self.key, path="",
                 message=f"Cannot read source {self.source}: {e}",
@@ -1520,6 +1714,7 @@ class UploadCustomMask(Command[MaskUploadResult]):
         # the image so the upload applies with its metrics.
         dc_bytes = overlay_elements_to_dc(
             device_overlay_layout(app, self.key), allow_empty=True,
+            flags=user_mask_flags(app, self.key, size),
         )
         # Named, not content-addressed: this mask is one the user chose and
         # will look for by name in the browser.  The store owns the layout —
@@ -1619,119 +1814,163 @@ class ListMasks(Query[MasksListResult]):
             message=f"{len(entries)} mask(s) under {target}",
         )
 
-@dataclass(frozen=True, slots=True)
-class RestoreLastTheme(Command[ThemeResult]):
-    """Re-load the theme persisted in Settings for *key*.
-
-    Convenience wrapper around LoadTheme — looks up the last
-    ``current_theme`` for this device and re-dispatches LoadTheme so
-    the render pipeline catches up on connect or after a restart.
+def _saved_theme_path(app: App, key: str,
+                      degrees: int | None = None) -> Path | None:
+    """Where *key*'s persisted theme (``current_theme``) is in the folder of
+    its orientation now, or ``None`` -- nothing saved, or that folder has no
+    theme of the name (saved in the other orientation; a portrait archive
+    that never downloaded).  Shared by the restore and the rotation, so both
+    pick the same theme.
 
     ``current_theme`` is normally the theme's absolute path (written by
-    LoadTheme).  Legacy values can be bare theme names like
-    ``"image:00"`` or ``"Custom_Theme1"`` — those trigger a heuristic
-    search across the device's known theme roots so existing users
-    don't lose their last selection on upgrade.
+    LoadTheme), re-rooted to the device's CURRENT orientation: a non-square
+    panel restored at 90°/270° must load the portrait-catalog variant
+    (theme480854), not the stored landscape path (theme854480), or the
+    preview/dirs go portrait while the theme stays landscape (#136).  A user
+    save never overwrites the shipped theme of the same name, so the persisted
+    path is loaded EXACTLY — never re-resolved to a same-named user theme.
+
+    Legacy values can be bare names (``"image:00"``, ``"Custom_Theme1"``);
+    those are searched across the device's theme roots so an upgrade keeps
+    the user's last selection.  ``reset_overrides=False`` replays the
+    device's persisted overlay edits + mask instead of reverting to the
+    theme's bundled layout (that is an explicit-switch behaviour).
     """
-    key: str
+    stored = app.settings.for_device(key).current_theme
+    if not stored:
+        log.info("_saved_theme_path: %s has no persisted theme", key)
+        return None
+    candidate = Path(stored)
+    path = (oriented_theme_path(app, key, candidate, degrees)
+            if candidate.is_dir() else _search_theme_by_name(app, key, stored))
+    if path is None:
+        log.warning("_saved_theme_path: %s persisted theme %r is not in the "
+                    "folder of its orientation -- Theme1 instead", key, stored)
+    return path
 
-    def execute(self, app: App) -> ThemeResult:
-        log.debug("execute: app=%s", app)
-        settings = app.settings.for_device(self.key)
-        stored = settings.current_theme
-        if not stored:
-            return ThemeResult(
-                ok=False, key=self.key,
-                message=f"No persisted theme for {self.key}",
-            )
 
-        # Absolute or already-resolvable path → use it directly, BUT re-rooted
-        # to the device's current orientation dir: a non-square panel restored
-        # at 90°/270° must load the portrait-catalog variant (theme480854), not
-        # the stored landscape path (theme854480), or the preview/dirs go
-        # portrait while the theme stays landscape (#136).  Orientation is
-        # already restored (``_restore_rotation``) before this runs.
-        # reset_overrides=False: a reconnect/restart restores the device's
-        # persisted overlay edits + last-applied mask, it does not revert to
-        # the theme's bundled layout (that's an explicit-switch behavior).
-        candidate = Path(stored)
-        if candidate.is_dir():
-            # Load EXACTLY the persisted path (re-rooted to the current
-            # orientation).  A user save never overwrites the shipped theme of
-            # the same name, so restore must NOT re-resolve a shipped pointer to
-            # the user one — it loads whatever the user last selected.
-            candidate = oriented_theme_path(app, self.key, candidate)
-            return app.dispatch(LoadTheme(
-                key=self.key, path=candidate, reset_overrides=False,
-            ))
+def _fallback_theme(app: App, key: str,
+                    degrees: int | None = None) -> Path | None:
+    """The theme a device with nothing saved shows: shipped ``Theme1``.
 
-        # Legacy bare-name value — search the known theme roots.
-        resolved = _search_theme_by_name(app, self.key, stored)
-        if resolved is None:
-            return ThemeResult(
-                ok=False, key=self.key, theme_name=stored,
-                message=(f"Persisted theme {stored!r} not found in any "
-                         "known theme root for this device"),
-            )
-        return app.dispatch(LoadTheme(
-            key=self.key, path=resolved, reset_overrides=False,
-        ))
+    Named, not ``themes[0]``: the listing is a plain lexical sort, so Theme1
+    came first only because no shipped name sorts before it.  Shipped themes
+    are listed before the user's, so a same-named user save never wins.  The
+    first listed theme is the fallback's own fallback, for a catalog without
+    a Theme1.
+    Resolved at the device's ORIENTED resolution, so a rotated panel gets its
+    portrait catalog — the same one the theme browsers list.
+    """
+    resolution = _resolve_oriented_resolution(app, key, degrees)
+    if resolution is None:
+        log.warning("_fallback_theme: %s — cannot resolve a resolution", key)
+        return None
+    themes = ListThemes(resolution=resolution).execute(app).themes
+    first = next((t for t in themes if t.name == "Theme1"),
+                 themes[0] if themes else None)
+    log.info("_fallback_theme: %s %dx%d -> %s (%d listed)", key, *resolution,
+             first.path if first else None, len(themes))
+    return Path(first.path) if first else None
+
+
+def _show_saved_theme(app: App, key: str, *, keep_overrides: bool = False,
+                     degrees: int | None = None) -> None:
+    """Load *key*'s saved theme in the folder of its orientation, else Theme1
+    — no background.
+
+    The THEME half of :func:`show_orientation_theme`, shared with the
+    background Commands (``PlayVideo`` / ``SetBackground``), which put their
+    own media on top.  Replaying the saved background here too would decode
+    the old video just before the new one replaced it.  The saved theme
+    replays the device's overlay edits and mask; Theme1 starts clean unless
+    *keep_overrides* (a rotation, whose background and mask the App
+    re-resolves).  A saved theme that fails to load falls to Theme1 too.
+    *degrees*: a rotation's new angle; ``None`` the saved one.
+    """
+    log.info("_show_saved_theme: %s keep_overrides=%s", key, keep_overrides)
+    saved = _saved_theme_path(app, key, degrees)
+    if saved is not None and app.dispatch(
+            LoadTheme(key=key, path=saved, reset_overrides=False)).ok:
+        return
+    if (fallback := _fallback_theme(app, key, degrees)) is not None:
+        app.dispatch(LoadTheme(key=key, path=fallback,
+                               reset_overrides=not keep_overrides))
+
+
+def show_orientation_theme(app: App, key: str, degrees: int | None = None) -> None:
+    """Enter the folder of *key*'s orientation and put its theme on the panel
+    -- the C#'s ``ReadFileTheme`` + ``Theme_Click_Event``, run on every
+    rotation and at connect.
+
+    The folder's own theme, brightness, split mode, slideshow and game mode
+    come back (``enter_orientation``), and the slideshow and game mode run if
+    that folder has them on; the theme shown is the one it remembers, the
+    same-named one there, else Theme1 -- never a theme of the other folder.
+    *degrees* is a rotation's new angle; ``None`` is a restore at the saved
+    one.  Only a restore with nothing saved starts the theme clean: a rotation
+    keeps the background and mask overrides, which the App re-resolves for the
+    new orientation.
+
+    One function for the restore and the rotation, which each used to pick
+    the theme their own way -- and the rotation kept the folder it left.
+    """
+    from ...services.slideshow_driver import task_key
+
+    visit = enter_orientation(app, key, degrees)
+    log.info("show_orientation_theme: %s %s folder", key, visit or "unknown")
+    # The slideshow's driver reads any theme it did not load as one picked by
+    # hand and switches the slideshow off.  ``_drive_slideshow`` below starts
+    # a fresh driver (tested); removing it first closes the window in which
+    # the OLD driver ticks during the load -- a race no test can time.
+    app.remove_task(task_key(key))
+    _show_saved_theme(app, key, keep_overrides=degrees is not None,
+                      degrees=degrees)
+    if visit == "first":
+        app.settings.mark_entered(key)
+    _drive_slideshow(app, key)
+    _drive_game_mode(app, key)
+
 
 @dataclass(frozen=True, slots=True)
 class RestoreDeviceState(Command[ThemeResult]):
-    """Ensure *key* has a renderable display state from persisted settings.
+    """Put *key*'s saved display back on the panel — the one restore Command.
 
-    The shared "make this device show something" path every UI dispatches at
-    its display-start entry — the GUI on connect, the CLI ``display play`` /
-    ``keepalive`` before their loop, the API ``restore-theme`` endpoint.
-    Idempotent: a no-op when a theme is already active (a daemon / GUI already
-    primed it), so it's safe to dispatch unconditionally at each entry.
+    Every "restore" in every UI is this: the CLI ``restore-theme`` / ``resume``
+    / ``play`` / ``keepalive``, the API ``restore-theme``, qtgui's button,
+    ``ResetDevice``, and the session's own prime on connect
+    (``App._prime``).  It used to be two — this and ``RestoreLastTheme`` —
+    and the UIs picked differently, so ``restore-theme`` reloaded in the CLI
+    and did nothing over the API.
 
-    Order (mirrors the GUI connect-restore, minus GUI-only widget restore):
-      1. Active theme already loaded → done.
-      2. ``RestoreLastTheme`` — the persisted theme + its mask + overlays +
-         bundled video (preserves the device's overrides).
-      3. No persisted theme → auto-load the first available theme
-         (``ListThemes`` → ``LoadTheme``), matching the GUI first-install
-         auto-load so a fresh device still shows something.
-      4. Replay the persisted ``background_path`` video override
-         (``PlayVideo``) so a cloud / user video resumes on top of the theme.
+    It ALWAYS restores: a user who asks gets their theme back, even over a
+    pushed image (the theme load releases the hold).  "Only if the panel is
+    blank" is the automatic caller's rule, and lives there (``App._prime``).
 
-    Steps 2-3 render + send an immediate first frame, which also leaves a
-    cached frame — so a keepalive resend has something to push (the terminal
-    "No cached frame — render at least once first" gap this closes). (#150)
+      1. The persisted theme, with its mask + overlay edits + bundled video.
+      2. Nothing persisted → the fallback theme (shipped ``Theme1``).
+      3. Resume the media player, or replay the persisted ``background_path``
+         video, over the theme -- the sources are exclusive, so at most one.
+      4. A saved slideshow resumes rotating (it never did when the App
+         started, in any UI but the gui, whose own timer is gone).
+
+    Needs a CONNECTED device, and fails with the connect reason otherwise:
+    ``LoadTheme`` succeeds without one ("saved"), so without this check a
+    CLI loop primed by a restore ticked forever against nothing.
     """
+    USES_DEVICE: ClassVar[bool] = True
+    REQUIRES: ClassVar[Capability | None] = Capability.THEME
     key: str
 
     def execute(self, app: App) -> ThemeResult:
         log.info("RestoreDeviceState: key=%s", self.key)
-        existing = app.active_themes.get(self.key)
-        if existing is not None:
-            log.info("RestoreDeviceState: %s already has an active theme — no-op",
-                     self.key)
-            return ThemeResult(ok=True, key=self.key, theme_name=existing.name,
-                               theme_path=str(existing.path),
-                               message="Display state already active")
+        try:
+            _require_connected_device(app, self.key)
+        except (DeviceNotFoundError, DeviceNotConnectedError) as e:
+            log.warning("RestoreDeviceState: %s — %s", self.key, e)
+            return ThemeResult(ok=False, key=self.key, message=str(e))
 
-        # 2. Persisted theme (reset_overrides=False preserves overlay/mask edits).
-        app.dispatch(RestoreLastTheme(key=self.key))
-
-        # 3. Nothing persisted → first available theme (GUI first-install parity).
-        #    Resolve via the shared oriented resolver (device profile → native →
-        #    registry) so a rotate panel lists its portrait catalog, matching
-        #    where the GUI browser lists themes.
-        if app.active_themes.get(self.key) is None:
-            resolution = _resolve_oriented_resolution(app, self.key)
-            if resolution is None:
-                log.warning("RestoreDeviceState: %s — cannot resolve resolution "
-                            "to auto-load a theme", self.key)
-            else:
-                listing = ListThemes(resolution=resolution).execute(app)
-                if listing.themes:
-                    first = Path(listing.themes[0].path)
-                    log.info("RestoreDeviceState: %s no persisted theme — "
-                             "auto-loading first theme %s", self.key, first)
-                    LoadTheme(key=self.key, path=first).execute(app)
+        # A rotation made while the panel was unplugged reaches it here.
+        show_orientation_theme(app, self.key)
 
         theme = app.active_themes.get(self.key)
         if theme is None:
@@ -1743,12 +1982,15 @@ class RestoreDeviceState(Command[ThemeResult]):
                          "or load a theme first"),
             )
 
-        # 4. Resume the persisted cloud / user video background over the theme.
-        bg = app.settings.for_device(self.key).background_path
-        if bg:
+        s = app.settings.for_device(self.key)
+        if s.media_player_uri:
+            log.info("RestoreDeviceState: %s resuming its media player %s",
+                     self.key, s.media_player_uri)
+            app.dispatch(SetMediaPlayer(key=self.key, uri=s.media_player_uri))
+        elif s.background_path:
             log.info("RestoreDeviceState: %s replaying persisted background %s",
-                     self.key, bg)
-            app.dispatch(PlayVideo(key=self.key, path=Path(bg)))
+                     self.key, s.background_path)
+            app.dispatch(PlayVideo(key=self.key, path=Path(s.background_path)))
 
         return ThemeResult(
             ok=True, key=self.key, theme_name=theme.name,
@@ -1804,10 +2046,10 @@ class ListCloudThemes(Query[CloudThemesListResult]):
 class EnsureDataDownload(Command[EnsureDataDownloadResult]):
     """Force-install the theme + cloud + mask archives for a resolution.
 
-    The DataInstaller is normally invoked implicitly by
-    :class:`DiscoverDevices` (it ensures every attached device's
-    resolution).  This Command exposes the same machinery for users
-    who want to **pre-fetch** before connecting — e.g. populating a
+    The installer normally runs in the background when a device connects
+    (``ConnectDevice`` submits its resolution to the ``DataInstallRunner``).
+    This Command exposes the same machinery for users who want to
+    **pre-fetch** before connecting — e.g. populating a
     laptop's cache while still online so a headless display setup
     works offline later.
 
@@ -1827,6 +2069,10 @@ class EnsureDataDownload(Command[EnsureDataDownloadResult]):
                          "(both dimensions must be > 0)"),
             )
         result = app.data_install.ensure_all((self.width, self.height))
+        # Every open grid re-lists, whichever UI asked -- the connect-time
+        # installer announces the same way.
+        app.events.publish(DataInstalled(resolution=(self.width, self.height),
+                                         ok=result.ok))
         return EnsureDataDownloadResult(
             ok=result.ok,
             width=self.width, height=self.height,
@@ -1853,8 +2099,8 @@ class DownloadCloudTheme(Command[CloudThemeLoadResult]):
     Until this Command existed that download was on no UI's bus — the GUI
     reached ``app.cloud_themes.materialise`` directly and cli / api could not
     pre-fetch at all.  ``materialise`` is documented idempotent: an already
-    cached MP4 is not re-downloaded, and the preview PNG + GIF are only
-    generated when missing, so calling this twice is cheap and safe.
+    cached MP4 is not re-downloaded, and ``ensure_previews`` makes the PNG +
+    GIF only when missing, so calling this twice is cheap and safe.
 
     ``resolution`` is the ORIENTED catalog size (854×480 ↔ 480×854), not the
     panel's native one — cloud backgrounds are catalogued per direction, and
@@ -1872,6 +2118,7 @@ class DownloadCloudTheme(Command[CloudThemeLoadResult]):
             mp4_path = app.cloud_themes.materialise(
                 self.theme_id, self.resolution,
             )
+            app.cloud_themes.ensure_previews(self.theme_id, self.resolution)
         except ValueError as e:
             log.warning("DownloadCloudTheme: ValueError materialising %s: %s",
                         self.theme_id, e)
@@ -1915,12 +2162,13 @@ class LoadCloudTheme(Command[CloudThemeLoadResult]):
       2. ``CloudThemeService.materialise`` downloads the MP4 flat into
          ``paths.cloud_theme_dir(w, h)/<id>.mp4`` and generates the
          first-frame PNG + animated GIF previews for the GUI.
-      3. Persist the new background path on ``DeviceSettings.background_path``
-         so it survives an app restart.
-      4. Dispatch ``PlayVideo(key, path=<mp4>)`` — that's the path
+      3. Dispatch ``PlayVideo(key, path=<mp4>)`` — that's the path
          MediaService + DisplayService already use to render a video
-         background on every tick.
+         background on every tick.  It persists ``background_path`` itself,
+         and only once the video loads.
     """
+    USES_DEVICE: ClassVar[bool] = True
+    REQUIRES: ClassVar[Capability | None] = Capability.THEME
     key: str
     theme_id: str
 
@@ -1970,13 +2218,10 @@ class LoadCloudTheme(Command[CloudThemeLoadResult]):
                 message=f"Local IO failed: {e}",
             )
 
-        log.info(
-            "LoadCloudTheme: %s ready at %s — setting background override + "
-            "dispatching PlayVideo",
-            self.theme_id, mp4_path,
-        )
-        # Persist the new background on the device — survives restart.
-        app.settings.set_background_path(self.key, str(mp4_path))
+        log.info("LoadCloudTheme: %s ready at %s — dispatching PlayVideo",
+                 self.theme_id, mp4_path)
+        # Not persisted here: PlayVideo saves the path once the video LOADS, so
+        # a play that fails keeps the background the user had.
         # MediaService.load_video populates the playback; DisplayService's
         # ``_resolve_background`` short-circuits to ``playback.current``
         # when a playback exists, so this is the entire "play this video
@@ -2003,6 +2248,8 @@ class LoadImage(Command[ThemeResult]):
     Errors surface as structured Results.  Acceptable extensions:
     PNG / JPG / JPEG / BMP / WEBP.
     """
+    USES_DEVICE: ClassVar[bool] = True
+    REQUIRES: ClassVar[Capability | None] = Capability.THEME
     key: str
     path: Path
 
@@ -2108,6 +2355,12 @@ class ExportVideoClip(Command[VideoExportResult]):
     as ``LoadCloudTheme`` versus ``DownloadCloudTheme``: fetch-and-apply
     is not the same capability as fetch.
 
+    **The finished clip lands in the user's background library**
+    (``ContentStore.store_background``): stable across reboots, identical
+    clips kept once, and ``VideoExportFinished.path`` names it.  It was left
+    in the exporter's ``/tmp`` directory, and each UI decided for itself what
+    to do with it -- only gui copied it somewhere safe (#271).
+
     **Returns as soon as the clip is QUEUED.**  ffmpeg runs for minutes
     and the IPC dispatch timeout is 30 s, so waiting here would make the
     Command impossible in daemon mode.  Watch the bus instead: every
@@ -2124,6 +2377,10 @@ class ExportVideoClip(Command[VideoExportResult]):
     letterboxed identically and looked broken (#291).  ``None`` keeps the
     load path — fit inside, never crop — so an export only changes for a
     user who presses one.
+
+    ``fps`` is the trimmer's 15/24 choice, 15 by default as in the C#
+    (``UCVideoCut.cs:120``).  Every export was 24 until 2026-10-07: the first
+    commit hardcoded it and the selector was never ported.
     """
     key: str
     path: Path
@@ -2131,6 +2388,7 @@ class ExportVideoClip(Command[VideoExportResult]):
     end_ms: int | None = None
     rotation: int = 0
     fit_mode: FitMode | None = None
+    fps: int = CUTTER_DEFAULT_FPS
 
     def execute(self, app: App) -> VideoExportResult:
         # ``fit_mode`` is logged WITHOUT touching ``.value``: the entry log
@@ -2138,9 +2396,9 @@ class ExportVideoClip(Command[VideoExportResult]):
         # as a plain ``str``.  Reading an attribute off it crashed the
         # Command before it could refuse the input politely.
         log.info("ExportVideoClip.execute: key=%s path=%s start_ms=%d "
-                 "end_ms=%s rotation=%d fit_mode=%s", self.key, self.path,
-                 self.start_ms, self.end_ms, self.rotation,
-                 self.fit_mode or "auto")
+                 "end_ms=%s rotation=%d fit_mode=%s fps=%s", self.key,
+                 self.path, self.start_ms, self.end_ms, self.rotation,
+                 self.fit_mode or "auto", self.fps)
         if not self.path.is_file():
             log.warning("ExportVideoClip.execute: %s not found", self.path)
             return VideoExportResult(
@@ -2205,6 +2463,15 @@ class ExportVideoClip(Command[VideoExportResult]):
                          f"{self.rotation}"),
             )
 
+        if self.fps not in CUTTER_FPS_CHOICES:
+            log.warning("ExportVideoClip.execute: bad fps %r", self.fps)
+            return VideoExportResult(
+                ok=False, source=str(self.path),
+                message=(f"Frame rate must be one of "
+                         f"{'/'.join(map(str, CUTTER_FPS_CHOICES))}, got "
+                         f"{self.fps!r}"),
+            )
+
         if self.fit_mode is not None and not isinstance(self.fit_mode, FitMode):
             # Reachable over IPC, where an unknown string falls through the
             # union coercion as itself rather than raising.  Say so instead of
@@ -2227,6 +2494,7 @@ class ExportVideoClip(Command[VideoExportResult]):
             target_h=target_h,
             rotation=self.rotation,
             fit_mode=self.fit_mode,
+            fps=self.fps,
         ))
         log.info("ExportVideoClip.execute: queued token=%s for %dx%d",
                  token, target_w, target_h)
@@ -2245,15 +2513,23 @@ class LoadVideo(Command[ThemeResult]):
     Conceptually parallel to :class:`LoadImage`: turn an arbitrary file
     into a one-shot theme directory + dispatch :class:`LoadTheme`.
 
-    For ``.zt`` inputs the source is copied straight in.  For real video
-    files (``.mp4``, ``.mov``, ``.webm``, etc.) the file is transcoded
-    into a ``Theme.zt`` via :class:`VideoExporter`, sized to the
-    device's native resolution and optionally clipped to ``start_ms`` →
-    ``end_ms``.
+    The file goes in as it is (``Theme.mp4``, ``Theme.zt``, ...), so it plays
+    the way the gui's video button plays it: decoded at its own size, with
+    the device's fit (``SetFitMode``) applied live and changeable while it
+    plays (#291).  It was transcoded to a canvas-sized ``Theme.zt`` with a
+    fixed contain-fit, so no fit ever reached it, a clip over five minutes
+    failed, and every load ran ffmpeg on the Command.
+
+    ``start_ms`` / ``end_ms`` / ``rotation`` ask for a CUT, which is the
+    C#'s trimmer (``UCVideoCut``): that clip is baked into a ``Theme.zt`` at
+    the canvas, with the device's fit, as the trimmer bakes its W/H choice.
+    A ``.zt`` is already baked and always goes in as it is.
 
     The device must be attached (so we know its native resolution).
     Errors surface as structured Results — never exceptions to UIs.
     """
+    USES_DEVICE: ClassVar[bool] = True
+    REQUIRES: ClassVar[Capability | None] = Capability.THEME
     key: str
     path: Path
     start_ms: int = 0
@@ -2290,36 +2566,35 @@ class LoadVideo(Command[ThemeResult]):
                 ),
             )
 
-        from ...services.video_export import (
-            VideoExporter,
-            VideoExportError,
-            VideoExportRequest,
-            probe_duration_ms,
-        )
+        from ...services.video_export import VideoExporter, VideoExportError
 
         # One ``with`` for the whole assembly: the marker is written only on a
         # clean exit, so any failure below leaves a markerless directory that
         # never shows up in the theme list.  The four separate error arms this
         # replaces each returned their own wording for the same outcome — the
         # video was not staged.
+        cut = (self.start_ms, self.end_ms, self.rotation) != (0, None, 0)
+        log.info("LoadVideo: %s %s", self.path.name,
+                 f"cut {self.start_ms}-{self.end_ms} ms rot {self.rotation}"
+                 if cut else "as it is")
         try:
             with app.themes.single_file_theme(self.path, "video") as unit:
                 theme_dir = unit.path
-                if self.path.suffix.lower() == ".zt":
-                    unit.install(self.path, ThemeDir.ZT)
+                if not cut or self.path.suffix.lower() == ".zt":
+                    unit.install(self.path, ThemeDir.video(self.path.suffix))
                 else:
-                    end_ms = self.end_ms
-                    if end_ms is None:
-                        probed = probe_duration_ms(self.path)
-                        end_ms = (probed if probed > 0
-                                  else self.start_ms + 10_000)
-                    produced = VideoExporter().export_zt(VideoExportRequest(
+                    end_ms = (self.end_ms if self.end_ms is not None
+                              else _clip_end_ms(self.path, self.start_ms))
+                    produced = VideoExporter(
+                        app.platform.software_install_hint,
+                    ).export_zt(VideoExportRequest(
                         source=self.path,
                         start_ms=self.start_ms,
                         end_ms=end_ms,
                         target_w=target_w,
                         target_h=target_h,
                         rotation=self.rotation,
+                        fit_mode=app.settings.for_device(self.key).fit_mode,
                     ))
                     unit.adopt(produced, ThemeDir.ZT)
         except VideoExportError as e:

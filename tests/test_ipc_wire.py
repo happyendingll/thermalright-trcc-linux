@@ -34,7 +34,6 @@ from trcc.core.models import (
     HandshakeResult,
     HardwareMetrics,
     Kind,
-    PanelCutout,
     ProductInfo,
     Wire,
 )
@@ -48,6 +47,7 @@ from trcc.ipc import (
     COMMAND_TYPES,
     EVENT_TYPES,
     RESULT_TYPES,
+    _to_wire,
     decode_command,
     decode_event,
     decode_result,
@@ -294,13 +294,12 @@ def test_discover_result_with_products_roundtrips() -> None:
     """Regression guard (859634af): a NON-EMPTY ProductInfo must survive the
     wire.  The empty-lists case above never builds a ProductInfo, so it missed
     the bug where ``decode_result`` → ``get_type_hints(ProductInfo)`` raised
-    ``NameError`` on the TYPE_CHECKING-only ``PanelCutout`` annotation.  Any
-    non-empty products list triggers it; the explicit PanelCutout also asserts
-    the nested value survives."""
+    ``NameError`` on a TYPE_CHECKING-only annotation.  Any non-empty products
+    list triggers it.  (The ``PanelCutout`` it used to carry was removed with
+    the island mirror it served, #149.)"""
     product = ProductInfo(
         vid=0x0402, pid=0x3922, vendor="Acme", product="Test LCD",
         wire=Wire.SCSI, kind=Kind.LCD, native_resolution=(320, 320),
-        panel_cutout=PanelCutout(x=10, y=20, w=30, h=40),
     )
     result = DiscoverResult(
         ok=True, message="1 device",
@@ -315,7 +314,6 @@ def test_discover_result_with_products_roundtrips() -> None:
     assert (p.vid, p.pid, p.product) == (0x0402, 0x3922, "Test LCD")
     assert p.wire is Wire.SCSI and p.kind is Kind.LCD
     assert p.native_resolution == (320, 320)
-    assert p.panel_cutout == PanelCutout(x=10, y=20, w=30, h=40)
     assert len(rebuilt.devices) == 1
     assert (rebuilt.devices[0].vid, rebuilt.devices[0].pid) == (0x0402, 0x3922)
 
@@ -410,9 +408,14 @@ def _sample(hint: object, field_name: str) -> object:
 
 
 def _populated(cls: type) -> object:
+    """Every WIRE field set to a non-default value.  In-process-only fields
+    keep their defaults: they never cross by design, which
+    ``test_a_live_surface_stays_in_its_process_quietly`` checks on its own."""
+    from trcc.core.models import IN_PROCESS_ONLY_KEY
     hints = typing.get_type_hints(cls)
     return cls(**{f.name: _sample(hints[f.name], f.name)
-                  for f in dataclasses.fields(cls)})
+                  for f in dataclasses.fields(cls)
+                  if not f.metadata.get(IN_PROCESS_ONLY_KEY)})
 
 
 @pytest.mark.parametrize("name", sorted(EVENT_TYPES))
@@ -453,6 +456,22 @@ def test_event_registry_covers_every_bus_bridge_subscription() -> None:
     assert declared <= set(EVENT_TYPES), declared - set(EVENT_TYPES)
 
 
+def test_what_following_sent_crosses_the_socket_as_tuples() -> None:
+    """``RgbFollowSent`` reaches a window's preview through JSON: columns of
+    colours, three levels deep, must come back as the same tuples."""
+    import json
+
+    from trcc.core.events import RgbFollowSent
+    event = RgbFollowSent(source="0402:3922",
+                          columns=(((152, 18, 23),) * 10, ((0, 0, 255),) * 10))
+
+    rebuilt = decode_event(json.loads(json.dumps(encode_event(event))))
+
+    assert rebuilt == event
+    assert isinstance(rebuilt, RgbFollowSent)
+    assert isinstance(rebuilt.columns[0][0], tuple)
+
+
 def test_frame_sent_keeps_its_colours_as_tuples() -> None:
     """``display_colors`` carries ``(r, g, b)`` triples.  Annotated bare
     ``list`` they came back as lists — equal-looking, but the coercion had
@@ -468,17 +487,48 @@ def test_frame_sent_keeps_its_colours_as_tuples() -> None:
     assert rebuilt == event
 
 
-def test_a_live_surface_is_dropped_rather_than_crashing_the_stream() -> None:
-    """``FrameSent.surface`` is a renderer surface — unserializable by design.
-    It must become None, not raise: one un-encodable frame event cannot be
-    allowed to take down the subscription."""
-    event = FrameSent(key="0402:3922", bytes_sent=12, surface=object())
+def test_a_live_surface_stays_in_its_process_quietly(caplog) -> None:
+    """``FrameSent.surface`` is a renderer surface, declared in-process only.
+
+    It is left off the wire (the far side reads the default, None) and nothing
+    is logged: it used to be dropped with a WARNING, one per frame a daemon
+    client watched -- 32 of 34 lines in a 2 s cast.
+
+    MUTATION CHECK: drop the ``IN_PROCESS_ONLY_KEY`` skip from ``_to_wire``.
+    """
+    import logging
+    caplog.set_level(logging.WARNING)
+    event = FrameSent(key="0402:3922", bytes_sent=12, surface=object(),
+                      pixels=b"\x01\x02\x03\x04")
 
     envelope = encode_event(event)
     json.dumps(envelope)
 
-    assert envelope["fields"]["surface"] is None
-    assert decode_event(envelope).surface is None
+    # The shared frame's pixels are read from the frame file on the far side;
+    # 400 KB of them in every JSON line is the cost frame_share removed.
+    assert "surface" not in envelope["fields"]
+    assert "pixels" not in envelope["fields"]
+    decoded = decode_event(envelope)
+    assert decoded.surface is None and decoded.pixels == b""
+    assert caplog.records == [], [r.getMessage() for r in caplog.records]
+
+
+def test_an_undeclared_surprise_warns_once_not_per_frame(caplog) -> None:
+    """Anything unserializable that is NOT declared still becomes None and is
+    reported -- once per type, because this runs on every frame."""
+    import logging
+    from dataclasses import dataclass
+
+    @dataclass
+    class Carrier:
+        thing: object
+
+    caplog.set_level(logging.WARNING, logger="trcc.ipc")
+    for _ in range(5):
+        assert _to_wire(Carrier(thing=object())) == {"thing": None}
+
+    warned = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warned) == 1, [r.getMessage() for r in warned]
 
 
 def test_sensors_updated_carries_its_typed_snapshot() -> None:
@@ -580,3 +630,20 @@ def test_the_hint_cache_does_not_change_what_crosses_the_wire() -> None:
             for n, c in sorted(RESULT_TYPES.items())}
 
     assert cold == warm
+
+
+def test_the_subscribe_ack_leaves_the_events_behind_it_in_the_socket() -> None:
+    """The App writes events straight after the ack, often in the same read.
+    Reading the ack with ``_recv_json`` (64 KiB, keep line one) threw them
+    away: a reopened stream lost its first event 1 run in 7."""
+    import socket as _socket
+
+    from trcc.ipc import _recv_ack
+
+    app_side, client = _socket.socketpair()
+    with app_side, client:
+        app_side.sendall(b'{"ok": true, "subscribed": ["*"]}\n'
+                         b'{"event": "ThemeLoaded"}\n')
+        assert _recv_ack(client) == {"ok": True, "subscribed": ["*"]}
+        client.settimeout(1.0)
+        assert client.recv(4096) == b'{"event": "ThemeLoaded"}\n'

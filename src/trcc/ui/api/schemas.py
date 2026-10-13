@@ -10,6 +10,7 @@ from typing import Generic, TypeVar
 from pydantic import BaseModel, ConfigDict, Field, RootModel
 
 from ...core.models import (
+    CUTTER_DEFAULT_FPS,
     DEFAULT_REFRESH_INTERVAL_S,
     MAX_REFRESH_INTERVAL_S,
     MIN_REFRESH_INTERVAL_S,
@@ -17,7 +18,13 @@ from ...core.models import (
     OVERLAY_DEFAULT_COLOR,
     OVERLAY_DEFAULT_FORMAT,
     OVERLAY_DEFAULT_SIZE,
+    EffectDirection,
+    EffectSpeed,
     FitMode,
+    FollowColors,
+    FollowMapping,
+    RamEffect,
+    RgbFollowMode,
 )
 from ...core.results import ConnectionIssuesResult, ConnectResult
 
@@ -103,12 +110,6 @@ class ThemeResponse(ResultBase):
 
 
 # ── Control-center settings ──────────────────────────────────────────
-
-
-class ImportConfigResponse(ResultBase):
-    """Deliberately narrower than ``ImportConfigResult``: ``input_path`` is a
-    server-side absolute path and is not disclosed over HTTP."""
-    key: str = ""
 
 
 # =========================================================================
@@ -200,11 +201,6 @@ class LedSelectZoneRequest(BaseModel):
     zone: int = Field(..., ge=0)
 
 
-class LedToggleSegmentRequest(BaseModel):
-    index: int = Field(..., ge=0)
-    on: bool
-
-
 # Tier-2 request/response shapes
 class ClockFormatRequest(BaseModel):
     is_24h: bool
@@ -219,6 +215,56 @@ class MemoryRatioRequest(BaseModel):
 
 
 class HddEnabledRequest(BaseModel):
+    enabled: bool
+
+
+class RgbFollowRequest(BaseModel):
+    """Pick what follows the cooler (#160): off, openrgb or ram.
+
+    ``host`` is OpenRGB's, a hostname or IP address only -- no scheme, path
+    or port -- so the API cannot point TRCC at an arbitrary URL.  Empty keeps
+    the saved one; ``port`` 0 likewise.
+    """
+    mode: RgbFollowMode
+    host: str = Field("", max_length=253, pattern=r"^[A-Za-z0-9.:\-]*$")
+    port: int = Field(0, ge=0, le=65535)
+    #: The device that leads -- an LCD's key, or "" for the first LED
+    #: cooler; None keeps the saved one.
+    source: str | None = Field(None, max_length=64,
+                               pattern=r"^([0-9a-fA-F]{4}:[0-9a-fA-F]{4}(@[\w.:-]+)?)?$")
+    mapping: FollowMapping | None = None
+    #: How a region of that picture becomes a light's colour; None keeps
+    #: the saved one.
+    colors: FollowColors | None = None
+    #: The lights that follow (refs); [] for every one; None keeps the saved.
+    targets: list[str] | None = Field(None, max_length=64)
+
+
+class RgbScanRequest(BaseModel):
+    """Where to look for OpenRGB -- a hostname or IP address only, as in
+    ``RgbFollowRequest``.  Empty keeps the saved address, ``port`` 0 likewise;
+    a new one is saved."""
+    host: str = Field(default="", max_length=253,
+                      pattern=r"^[A-Za-z0-9.:\-]*$")
+    port: int = Field(default=0, ge=0, le=65535)
+
+
+class RamEffectRequest(BaseModel):
+    """One of the memory's own effects, saved on the sticks named by
+    ``sticks`` (refs; [] for every stick)."""
+    effect: RamEffect
+    sticks: list[str] = Field(default_factory=list, max_length=16)
+    speed: EffectSpeed = EffectSpeed.MEDIUM
+    direction: EffectDirection | None = None
+    colors: list[tuple[int, int, int]] = Field(default_factory=list,
+                                               max_length=2)
+    random_colors: bool = False
+    brightness: int = Field(255, ge=0, le=255)
+
+
+class RamLightingRequest(BaseModel):
+    """Switch the opt-in RAM-lighting grant on or off.  The App asks for the
+    password at the desktop; the API cannot grant the bus by itself."""
     enabled: bool
 
 
@@ -254,15 +300,9 @@ class BackgroundFileRequest(BaseModel):
     path: str
 
 
-class SendImageRequest(BaseModel):
-    """An image to show once, without staging it as a theme."""
-    path: str
-
-
 class RenderDcRequest(BaseModel):
     """Render a .dc standalone — no device, so the size is explicit."""
     dc_path: str
-    output_path: str
     width: int = Field(..., gt=0)
     height: int = Field(..., gt=0)
 
@@ -271,18 +311,11 @@ class ExportOverlayRequest(BaseModel):
     """Copy a theme's overlay config file out."""
     key: str
     theme_name: str
-    output_path: str
 
 
 class ZoneSyncZonesRequest(BaseModel):
     """Which zones take part in the zone-sync carousel."""
     zones: list[bool]
-
-
-class SlideshowDriveRequest(BaseModel):
-    """Start or stop the slideshow DRIVER — distinct from enabling the
-    slideshow, which only persists the setting."""
-    drive: bool = True
 
 
 class BackgroundModeRequest(BaseModel):
@@ -369,10 +402,6 @@ class OverlayElementUpdateRequest(BaseModel):
     source: str | None = None
 
 
-class OverlayFlashRequest(BaseModel):
-    duration_ms: int = Field(1500, ge=100, le=10000)
-
-
 class OverlayConfigRequest(BaseModel):
     elements: list[OverlayElementSchema] = []
 
@@ -404,19 +433,17 @@ class CloudThemeDownloadRequest(BaseModel):
 
 
 class ThemeDcExportRequest(BaseModel):
-    """Server-side path to write the legacy DC file to.
+    """Which device's copy of the theme to export; the DC comes back as bytes.
 
     ``key`` is required — the device's resolution scopes the source
     lookup and the device's user-overlay elements are layered into the
     exported DC.
     """
     key: str = Field(..., min_length=1)
-    output_path: str
 
 
 # Diagnostics
 class DebugReportRequest(BaseModel):
-    output_path: str | None = None
     log_tail_lines: int = Field(1000, ge=0, le=100_000)
 
 
@@ -438,14 +465,15 @@ class SlideshowConfigureRequest(BaseModel):
 class KeepaliveRequest(BaseModel):
     """Keepalive-loop parameters.
 
-    * ``count`` — ``0`` means run until interrupted (legacy parity);
-      ``>=1`` runs that many iterations.
+    * ``count`` — how many iterations, at least 1.  The CLI's ``0`` (run until
+      Ctrl-C) cannot exist here: nothing interrupts an HTTP request, so it
+      held a server worker forever.
     * ``interval_s`` — fast-resend cadence.  Default 0.150 s is below
       the 2-3 s firmware-revert threshold on Bulk/LY devices.
     * ``metric_interval_s`` — how often to re-render the overlay so
       sensor values stay current.  Set to 0 to disable refresh.
     """
-    count: int = Field(0, ge=0)
+    count: int = Field(1, ge=1)
     interval_s: float = Field(0.150, ge=0.05)
     metric_interval_s: float = Field(1.0, ge=0.0)
 
@@ -468,6 +496,12 @@ class OverlayRequest(BaseModel):
 
 class SplitModeRequest(BaseModel):
     mode: int = Field(..., ge=0, le=3)
+
+
+class GameModeRequest(BaseModel):
+    """Either half alone, or both; the threshold is the C#'s two digits."""
+    enabled: bool | None = None
+    threshold: int | None = Field(None, ge=0, le=99)
 
 
 class MaskApplyRequest(BaseModel):
@@ -494,27 +528,6 @@ class ThemeSaveRequest(BaseModel):
     #: delete-then-save, the only workaround a client had before this field,
     #: does not.
     overwrite: bool = False
-
-
-class ThemeExportRequest(BaseModel):
-    """Export an existing theme by name to a server-side archive path.
-
-    ``key`` scopes the lookup to the device's resolution dir.
-    """
-    key: str = Field(..., min_length=1)
-    theme_name: str = Field(..., min_length=1)
-    archive_path: str = Field(..., min_length=1)
-
-
-class ThemeImportRequest(BaseModel):
-    """Import a theme from a server-side archive path.
-
-    ``key`` scopes the target to the device's resolution dir.
-    ``name`` defaults to the archive filename stem when blank.
-    """
-    key: str = Field(..., min_length=1)
-    archive_path: str = Field(..., min_length=1)
-    name: str = ""
 
 
 class DeleteThemeRequest(BaseModel):
@@ -598,18 +611,32 @@ class DaemonStatusResponse(ResultBase):
 
 
 class ScreencastStartRequest(BaseModel):
-    """Body for ``POST /devices/{key}/display/screencast/start``."""
-    x: int = Field(..., ge=0)
-    y: int = Field(..., ge=0)
-    w: int = Field(..., gt=0)
-    h: int = Field(..., gt=0)
+    """Body for ``POST /devices/{key}/display/screencast/start``.
+
+    No region (all 0, the default) casts the device's stored one.
+    """
+    x: int = Field(0, ge=0)
+    y: int = Field(0, ge=0)
+    w: int = Field(0, ge=0)
+    h: int = Field(0, ge=0)
     audio: bool = False
+
+
+class ScreencastRegionRequest(BaseModel):
+    """Body for ``POST /devices/{key}/display/screencast/region``."""
+    x: int = Field(..., ge=0, le=9999)
+    y: int = Field(..., ge=0, le=9999)
+    w: int = Field(..., ge=0, le=9999)
+    h: int = Field(..., ge=0, le=9999)
+    hide_border: bool | None = Field(
+        None, description="Hide the on-screen border; null leaves it as it is.")
 
 
 class MediaPlayerRequest(BaseModel):
     """Body for ``POST /devices/{key}/display/media-player``."""
     uri: str = Field(
-        "", description="A local file path, or a web URL/stream. '' clears.",
+        "", description=("A local file path, or an http/https/rtsp URL played "
+                         "live. '' clears."),
     )
 
 
@@ -674,6 +701,8 @@ class ExportVideoRequest(BaseModel):
     #: encoded AT canvas size, so this choice is baked in and the device's
     #: render-time ``fit_mode`` cannot recover it afterwards.
     fit_mode: FitMode | None = None
+    #: Frames per second: 15 (the Windows app's default) or 24.
+    fps: int = Field(CUTTER_DEFAULT_FPS)
 
 
 # ── Control-center settings ──────────────────────────────────────────

@@ -66,19 +66,11 @@ KNOWN_FIELD_ASYMMETRY: dict[tuple[str, str], tuple[frozenset[str], str]] = {
         "the Result; the editor never needs to choose one, while a script or a "
         "REST client may want an idempotent id"
     )),
-    ("StopVideo", "api"): (frozenset({"keep_override"}), (
-        "scoped: TRACED 2026-09-22.  The flag exists only to stop gui's own "
-        "_cleanup_device teardown wiping the persisted background (#271).  No "
-        "other face makes that call, App.close never dispatches StopVideo, and "
-        "App.detach already frees the decode -- so clearing the override is "
-        "the CORRECT behaviour for a user-initiated stop, which is the only "
-        "StopVideo these faces make"
-    )),
-    ("StopVideo", "cli"): (frozenset({"keep_override"}), (
-        "scoped: same as api -- a user-initiated stop must clear the override"
-    )),
-    ("StopVideo", "qtgui"): (frozenset({"keep_override"}), (
-        "scoped: same -- qtgui's only StopVideo is the Stop button"
+    ("GenerateDebugReport", "api"): (frozenset({"output_path"}), (
+        "scoped: TRACED 2026-09-26.  The API writes nothing where a client "
+        "says -- it wrote this report over an existing file anywhere the "
+        "process could (the trust-boundary pass).  The text comes back in the "
+        "response body; ``trcc report -o`` still writes a file, locally"
     )),
     ("BuildPreview", "api"): (frozenset({"sample_cols"}), (
         "unclassified: measured 2026-09-22, not traced"
@@ -95,14 +87,13 @@ KNOWN_FIELD_ASYMMETRY: dict[tuple[str, str], tuple[frozenset[str], str]] = {
     ("EnableAutostart", "gui"): (frozenset({"target"}), (
         "unclassified: measured 2026-09-22, not traced"
     )),
-    ("EnsureDaemon", "api"): (frozenset({"timeout"}), (
-        "unclassified: measured 2026-09-22, not traced"
-    )),
     ("GetPaths", "api"): (frozenset({"resolution"}), (
         "unclassified: measured 2026-09-22, not traced"
     )),
     ("ImportTheme", "gui"): (frozenset({"name"}), (
-        "unclassified: measured 2026-09-22, not traced"
+        "scoped: the C# import has no name field -- the theme is named after "
+        "the file (FormCZTV.buttonDaoRu_Click sets textBoxCMM to the file "
+        "stem), which is ImportTheme's own default"
     )),
     ("ImportTheme", "qtgui"): (frozenset({"name"}), (
         "unclassified: measured 2026-09-22, not traced"
@@ -133,18 +124,6 @@ KNOWN_FIELD_ASYMMETRY: dict[tuple[str, str], tuple[frozenset[str], str]] = {
         "ExportVideoClip, so this may well be scoped, but nobody has read it"
     )),
     ("PlayVideo", "qtgui"): (frozenset({"fps"}), (
-        "unclassified: measured 2026-09-22, not traced"
-    )),
-    ("RunUpgrade", "gui"): (frozenset({"dry_run"}), (
-        "unclassified: measured 2026-09-22, not traced"
-    )),
-    ("StartScreencast", "qtgui"): (frozenset({"audio"}), (
-        "unclassified: measured 2026-09-22, not traced"
-    )),
-    ("StartScreencastDriver", "api"): (frozenset({"interval_s"}), (
-        "unclassified: measured 2026-09-22, not traced"
-    )),
-    ("StartScreencastDriver", "cli"): (frozenset({"interval_s"}), (
         "unclassified: measured 2026-09-22, not traced"
     )),
 }
@@ -239,7 +218,20 @@ def test_every_record_is_tagged(pair: tuple[str, str]) -> None:
 #: without reading it -- the exact move the tag exists to prevent.  Caught by
 #: mutation while this file was being written; the one-sided version let it
 #: through silently.  Same two-sided idiom as ``test_god_classes``.
-UNCLASSIFIED = 22
+#: 22 -> 21 on 2026-09-23: ``("StartScreencast", "qtgui")`` / ``audio`` was
+#: TRACED by the ``ui/gui`` hand walk and closed.  It was a real gap -- gui had
+#: a mic button, cli ``--audio``, api ``body.audio``, and ``grep -ri audio
+#: src/trcc/ui/qtgui/`` returned ZERO lines -- and tracing it turned up a
+#: defect in the Command underneath: re-issuing a live session with
+#: ``audio=False`` persisted the flag and never released the microphone, so
+#: the bars kept drawing after every face turned them off.  See
+#: ``_sync_audio`` in ``core/commands/device.py``.
+#: 19 -> 18 on 2026-09-29: ``EnsureDaemon`` was DELETED (V5c: every dispatch finds or starts
+#: the App now), not traced — its ('EnsureDaemon', 'api') record went with it.
+#: 18 → 17 on 2026-10-02: the gui stopped dispatching ImportTheme.  It
+#: dispatches it again since 94c16024 (2026-10-05, UCThemeLocal's export/import
+#: pair), and its record came back CLASSIFIED ("scoped:", above) -- so 17 stands.
+UNCLASSIFIED = 16   # RunUpgrade.gui left 2026-10-09: the dry_run field itself is gone
 
 
 def test_the_unclassified_backlog_does_not_grow() -> None:
@@ -273,11 +265,9 @@ def _unclassified() -> list[tuple[str, str]]:
 _RECORDED = frozenset({
     ("BuildPreview", "api"), ("BuildPreview", "cli"), ("BuildPreview", "gui"),
     ("BuildPreview", "qtgui"), ("EnableAutostart", "gui"),
-    ("EnsureDaemon", "api"), ("GetPaths", "api"), ("ImportTheme", "gui"),
+    ("GetPaths", "api"),
     ("ImportTheme", "qtgui"), ("ListCloudThemes", "api"),
     ("ListCloudThemes", "cli"), ("ListMasks", "api"), ("ListMasks", "gui"),
     ("ListMasks", "qtgui"), ("ListThemes", "gui"), ("ListThemes", "qtgui"),
-    ("LoadVideo", "qtgui"), ("PlayVideo", "qtgui"), ("RunUpgrade", "gui"),
-    ("StartScreencast", "qtgui"), ("StartScreencastDriver", "api"),
-    ("StartScreencastDriver", "cli"),
+    ("LoadVideo", "qtgui"), ("PlayVideo", "qtgui"),
 })

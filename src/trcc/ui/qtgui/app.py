@@ -12,11 +12,10 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QGuiApplication, QIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -27,17 +26,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ...app import App
 from ...core.commands import (
-    ControlCenterSnapshot,
     GetFirstRunStatus,
     GetPlatformInfo,
-    ListDevices,
+    MarkFirstRunDone,
     RefreshAutostart,
-    RenderAndSend,
-    RestoreDeviceState,
-    TickDisplay,
 )
+from ...core.logs import per_frame
+from ...core.ports import CommandBus
 
 if TYPE_CHECKING:
     from ...core.ports import Platform
@@ -46,14 +42,10 @@ from ...core.events import (
     DeviceDisconnected,
     ErrorOccurred,
     FrameSent,
-    ThemeLoaded,
-    VideoStarted,
-    VideoStopped,
 )
-from ...core.models import Wire
 from ..bus_bridge import BusBridge
-from ..qt_periodic import PeriodicUpdater
 from ..qt_tray import TrayController
+from ..viewfinder import ViewfinderFleet
 from .device_selection import DeviceSelection
 from .panels import (
     AboutPanel,
@@ -67,6 +59,7 @@ from .panels import (
     MaskBrowser,
     OverlayEditorPanel,
     PreviewPanel,
+    RgbPanel,
     ScreencastPanel,
     StatusPanel,
     SystemPanel,
@@ -74,15 +67,19 @@ from .panels import (
 from .preview_surface import FRAME_EDGE, PreviewSurface
 
 log = logging.getLogger(__name__)
+frame_log = per_frame(__name__)
 
 
 class MainWindow(QMainWindow):
     """Top-level window: sidebar + stacked content + status bar."""
 
-    def __init__(self, app: App) -> None:
+    def __init__(self, app: CommandBus) -> None:
         super().__init__()
         self._app = app
         self._bus = BusBridge(app.events)
+        # The frame round each casting device's region (C# FormScreenshot),
+        # the same module gui uses.
+        self._viewfinders = ViewfinderFleet(app, self._bus)
 
         # #201 repair — the same Command cli, api and gui all dispatch, and
         # the one capability qtgui could not reach.  An entry keeps whatever
@@ -96,7 +93,7 @@ class MainWindow(QMainWindow):
         log.info("MainWindow.__init__: autostart refresh — enabled=%s target=%s",
                  autostart.enabled, autostart.target)
 
-        self.setWindowTitle("TRCC — Thermalright LCD/LED Cooler Control (next)")
+        self.setWindowTitle("TRCC Linux — Thermalright LCD/LED Cooler Control")
         # Rail + a 480px preview + a usable tool column.  ``ui/gui`` is a
         # fixed 1454x800 for the same three regions.
         self.resize(1440, 760)
@@ -113,6 +110,9 @@ class MainWindow(QMainWindow):
         self._state_panel = PreviewPanel(
             app, self._bus, self, selection=self._lcd_selection,
         )
+
+        # Held typed too: its live preview is one the bridge follows.
+        self._rgb_panel = RgbPanel(app, self._bus, self)
 
         # Register panels.  Key matches the sidebar entry's key.
         self._panels: dict[str, QWidget] = {
@@ -134,6 +134,7 @@ class MainWindow(QMainWindow):
                                     selection=self._lcd_selection),
             "led":     LedPanel(app, self._bus, self,
                                     selection=self._led_selection),
+            "rgb":     self._rgb_panel,
             "status":  StatusPanel(app, self._bus, self,
                                     selection=self._lcd_selection),
             "system":  SystemPanel(app, self._bus, self),
@@ -142,9 +143,15 @@ class MainWindow(QMainWindow):
         for widget in self._panels.values():
             content.addWidget(widget)
         # First-run users land on System (where the doctor lives) so the
-        # welcome screen guides them; everyone else starts on Devices.
-        initial = ("system" if app.dispatch(GetFirstRunStatus()).is_first_run
-                   else "devices")
+        # welcome screen guides them; everyone else starts on Devices.  Read
+        # ONCE and marked done: nothing else in this window ever cleared it,
+        # so a qtgui-only user got the welcome at every launch.
+        self._first_run = app.dispatch(GetFirstRunStatus()).is_first_run
+        if self._first_run:
+            log.info("MainWindow: first run — opening on System, then marking "
+                     "it done")
+            app.dispatch(MarkFirstRunDone())
+        initial = "system" if self._first_run else "devices"
         content.setCurrentWidget(self._panels[initial])
         sidebar.select(initial)
         self._wire_device_selection(sidebar)
@@ -163,36 +170,13 @@ class MainWindow(QMainWindow):
         self._bus.device_connected.connect(self._on_connected, type=qconn)
         self._bus.device_disconnected.connect(self._on_disconnected, type=qconn)
         self._bus.frame_sent.connect(self._on_frame_sent, type=qconn)
-        self._bus.theme_loaded.connect(self._on_theme_loaded, type=qconn)
         self._bus.error_occurred.connect(self._on_error, type=qconn)
-        self._bus.video_started.connect(self._on_video_started, type=qconn)
-        self._bus.video_stopped.connect(self._on_video_stopped, type=qconn)
 
-        # Display-start restore — METHOD_UI.md's entry contract, which qtgui
-        # did not honour at all: `RestoreLastTheme` was reachable ONLY from the
-        # display panel's "Restore last" button, so connecting a device and
-        # opening qtgui showed nothing until you clicked it.  cli and api have
-        # dispatched `RestoreDeviceState` at their display-start since #150.
-        #
-        # It sits HERE, after the subscriptions above, on purpose: the restore
-        # loads a theme, which publishes `ThemeLoaded`, which is what starts
-        # the render ticker.  Dispatched any earlier in __init__ the event
-        # would fire into an unconnected bus and nothing would ever animate.
-        self._restore_display_state()
-
-        # Metrics ticker — dispatches RenderAndSend to every device with an
-        # active theme, at AppSettings.refresh_interval_s.  Started lazily when
-        # a theme gets loaded; stops when no active themes remain.
-        self._ticker = QTimer(self)
-        self._ticker.setSingleShot(False)
-        self._ticker.timeout.connect(self._on_tick)
-
-        # Per-device VIDEO tickers, keyed by device.  A video needs its own
-        # cadence (~33 ms at 30 fps), which the metrics ticker above cannot
-        # provide — it runs at refresh_interval_s, 2 s by default, so driving
-        # video from it would advance one frame every two seconds.  Matches the
-        # gui skin, which likewise keeps a separate per-device animation timer.
-        self._video: dict[str, PeriodicUpdater] = {}
+        # No render loop here: the App's MetricsLoop renders every device at
+        # the refresh interval, and its VideoLoop plays videos.  This window
+        # ran a second RenderAndSend ticker beside them, doubling the frames
+        # sent to every panel (measured 2026-09-30: 5 -> 10 in 5 s at a 1 s
+        # refresh, shown or hidden).  A UI never owns a loop that feeds a panel.
 
         self._show_platform_info()
 
@@ -206,7 +190,6 @@ class MainWindow(QMainWindow):
             self,
             # The same Query ``_show_platform_info`` uses — asking the bus
             # instead of ``app.platform``, which an AppProxy does not have.
-            minimize_on_close=app.dispatch(GetPlatformInfo()).minimize_on_close,
             icon=icon,
         )
         self._tray.install()
@@ -214,11 +197,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: Any) -> None:
         if self._tray.intercept_close(event):
             return
-        # Genuine quit: stop the metrics ticker AND every per-device video
-        # ticker; the daemon-thread loops die with the process.
-        self._ticker.stop()
-        for updater in self._video.values():
-            updater.stop()
+        # Genuine quit.  The core's loops are stopped by ``App.close``.
+        self._viewfinders.close()
         event.accept()
         # End the event loop so ``run``'s ``finally: app.close()`` actually
         # runs.  ``quitOnLastWindowClosed`` is False (hide-to-tray), so
@@ -238,7 +218,7 @@ class MainWindow(QMainWindow):
         info = self._app.dispatch(GetPlatformInfo())
         msg = (f"{info.distro_name}  |  install: {info.install_method}"
                f"  |  config: {info.config_dir}")
-        if self._app.dispatch(GetFirstRunStatus()).is_first_run:
+        if self._first_run:
             msg = (
                 "Welcome to TRCC.  Open System → run Doctor to check your "
                 "setup, then plug in a device and open Devices to scan."
@@ -247,116 +227,25 @@ class MainWindow(QMainWindow):
 
     # ── Event handlers ────────────────────────────────────────────────
 
-    def _restore_display_state(self, key: str | None = None) -> None:
-        """Give every attached LCD a renderable display state.  Idempotent.
-
-        Enumerates through ``ListDevices`` rather than ``app.devices``: the
-        latter is an ``AttributeError`` under ``TRCC_DAEMON=1``, where a UI
-        holds an ``AppProxy`` that exposes ``dispatch`` and nothing else, and
-        that Query exists precisely because nothing else could answer "which
-        devices are there".
-
-        ``key=None`` covers the coldplug fleet — devices attached by
-        ``discover_and_connect`` BEFORE this window existed, which never emit
-        ``DeviceConnected`` anywhere this window can hear it.  A key restores
-        the one device that just arrived.  ``RestoreDeviceState`` no-ops when a
-        theme is already active, so the two paths may overlap freely.
-        """
-        fleet = self._app.dispatch(ListDevices()).devices
-        # Entry log with the resolved count — THE RULE.  Without it this method
-        # is SILENT on an empty fleet, which is precisely the case a reader
-        # needs to distinguish from "ran and restored nothing".
-        log.info("_restore_display_state: key=%s, %d device(s) attached",
-                 key or "<all>", len(fleet))
-        for entry in fleet:
-            if key is not None and entry.key != key:
-                continue
-            if not entry.connected or entry.wire == Wire.LED.value:
-                log.debug("_restore_display_state: skip %s (wire=%s connected=%s)",
-                          entry.key, entry.wire, entry.connected)
-                continue
-            result = self._app.dispatch(RestoreDeviceState(key=entry.key))
-            log.info("_restore_display_state: %s → ok=%s %s",
-                     entry.key, result.ok, result.message)
-
     def _on_connected(self, event: DeviceConnected) -> None:
         log.info("_on_connected: %s", event.key)
         w, h = event.resolution
         self._status.showMessage(f"Connected: {event.key} ({w}×{h})", 5000)
-        # A hotplugged device needs the same display-start restore the
-        # coldplug fleet gets in __init__ — otherwise it attaches and sits dark.
-        self._restore_display_state(event.key)
 
     def _on_disconnected(self, event: DeviceDisconnected) -> None:
         log.info("_on_disconnected")
         self._status.showMessage(f"Disconnected: {event.key}", 5000)
 
     def _on_frame_sent(self, event: FrameSent) -> None:
-        log.info("_on_frame_sent")
+        frame_log.debug("_on_frame_sent: %s", event.key)     # per frame
         self._status.showMessage(f"Frame sent: {event.bytes_sent} bytes", 2000)
 
     def _on_error(self, event: ErrorOccurred) -> None:
         log.info("_on_error")
         self._status.showMessage(f"Error [{event.kind}]: {event.message}", 8000)
 
-    def _on_theme_loaded(self, event: ThemeLoaded) -> None:
-        """A theme got loaded on some device — make sure the ticker is running."""
-        log.info("_on_theme_loaded")
-        del event
-        self._ensure_ticker_running()
-
-    def _ensure_ticker_running(self) -> None:
-        """Start the QTimer if there are active themes; stop it otherwise."""
-        log.debug("_ensure_ticker_running")
-        if not any(d.has_active_theme
-                   for d in self._app.dispatch(ListDevices()).devices):
-            if self._ticker.isActive():
-                self._ticker.stop()
-            return
-        snap = self._app.dispatch(ControlCenterSnapshot())
-        interval_ms = max(100, int(snap.refresh_interval_s * 1000))
-        if not self._ticker.isActive() or self._ticker.interval() != interval_ms:
-            self._ticker.start(interval_ms)
-
-    def _on_video_started(self, event: VideoStarted) -> None:
-        """A video began on a device — give it its own frame-rate ticker.
-
-        Without this qtgui rendered a video theme repeatedly but never advanced
-        its cursor, so the panel showed frame 0 forever.  ``interval_ms`` comes
-        off the event (derived from the playback's fps server-side), so this
-        skin never has to query MediaService.
-        """
-        log.info("_on_video_started: key=%s interval_ms=%d frames=%d",
-                 event.key, event.interval_ms, event.frame_count)
-        updater = self._video.get(event.key)
-        if updater is None:
-            updater = PeriodicUpdater(self)
-            self._video[event.key] = updater
-        # PeriodicUpdater drops the previous connection on restart, so a
-        # re-started video re-paces instead of firing twice per tick.
-        updater.start(event.interval_ms, partial(self._on_video_tick, event.key))
-
-    def _on_video_stopped(self, event: VideoStopped) -> None:
-        """Video ended on a device — stop its ticker; metrics keep it alive."""
-        log.info("_on_video_stopped: key=%s", event.key)
-        updater = self._video.pop(event.key, None)
-        if updater is not None:
-            updater.stop()
-
-    def _on_video_tick(self, key: str) -> None:
-        """One video frame for *key* — advance the cursor, render, send.
-
-        Per-tick (~30 Hz), so DEBUG — never INFO, or one video buries every
-        user-action line in the log.
-        """
-        log.debug("_on_video_tick: key=%s", key)
-        try:
-            self._app.dispatch(TickDisplay(key=key))
-        except Exception as e:
-            log.exception("Video tick failed for %s: %s", key, e)
-
     def _build_chrome(
-        self, app: App, sidebar: ActivitySidebar, content: QStackedWidget,
+        self, app: CommandBus, sidebar: ActivitySidebar, content: QStackedWidget,
     ) -> QWidget:
         """Assemble rail | preview | content, with the preview permanent.
 
@@ -377,6 +266,12 @@ class MainWindow(QMainWindow):
         # The state read-out reports the size of the render the surface just
         # produced rather than dispatching a second BuildPreview of its own.
         self._preview_surface.rendered.connect(self._state_panel.set_render_size)
+        # Frames only while the preview is on screen (it always is while the
+        # window is); on its return, the current one -- a still theme may not
+        # send another for a while.
+        self._bus.frames_resumed.connect(self._preview_surface.refresh)
+        self._bus.follow_previews(self._preview_surface,
+                                  self._rgb_panel.page.follow.preview)
 
         container = QWidget(self)
         row = QHBoxLayout(container)
@@ -431,28 +326,6 @@ class MainWindow(QMainWindow):
         target = self._led_selection if kind == "led" else self._lcd_selection
         target.set_key(key)
 
-    def _on_tick(self) -> None:
-        """Fire one render+send for every device with an active theme.
-
-        Skips any device currently driven by its own video ticker — that
-        ticker already renders at frame rate, and rendering the same device
-        from both would double its wire traffic.  Same rule the gui skin
-        states as "animation timer owns the wire".
-        """
-        rendering = [d.key for d in self._app.dispatch(ListDevices()).devices
-                     if d.has_active_theme]
-        if not rendering:
-            self._ticker.stop()
-            return
-        for key in rendering:
-            updater = self._video.get(key)
-            if updater is not None and updater.is_active:
-                log.debug("_on_tick: %s driven by its video ticker — skip", key)
-                continue
-            try:
-                self._app.dispatch(RenderAndSend(key=key))
-            except Exception as e:
-                log.exception("Tick failed for %s: %s", key, e)
 
 
 def run(

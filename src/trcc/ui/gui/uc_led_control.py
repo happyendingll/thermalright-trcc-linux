@@ -37,6 +37,7 @@ from ...core.led_models import (
     LED_SELECT_ALL_STYLES,
     PRESET_COLORS,
 )
+from ...core.logs import per_frame
 from ...core.models import HardwareMetrics
 from ..presentation.led_display import LedSelector, led_display_for
 from ..presentation.led_metrics_format import (
@@ -53,6 +54,16 @@ from .uc_color_wheel import UCColorWheel
 from .uc_screen_led import UCScreenLED
 
 log = logging.getLogger(__name__)
+#: A follow runs on every move of an LED slider; its lines are per-frame volume.
+frame_log = per_frame(__name__)
+
+
+def _set_quietly(widget: QSlider | QSpinBox, value: int) -> None:
+    """Set a slider or spinbox without it announcing the change."""
+    frame_log.debug("_set_quietly: %s → %d", type(widget).__name__, value)
+    widget.blockSignals(True)
+    widget.setValue(value)
+    widget.blockSignals(False)
 
 #: Values a widget carries so its slot is a named method rather than a closure
 #: over a loop variable — ``feedback_no_lambdas``.
@@ -280,7 +291,6 @@ class UCLedControl(QWidget):
     color_changed = Signal(int, int, int)   # R, G, B
     brightness_changed = Signal(int)         # 0-100
     global_toggled = Signal(bool)            # on/off (from color wheel center button)
-    segment_clicked = Signal(int)            # segment index
     # Zone signals
     zone_selected = Signal(int)              # zone index (0-based)
     zone_toggled = Signal(int, bool)         # zone index, on/off
@@ -321,6 +331,7 @@ class UCLedControl(QWidget):
         # so the panel never reaches into _boot for global settings.  Kept
         # current via set_language() on every language change.
         self._language = language
+        self._is_select_all_style = False     # set per style by initialize()
 
         self._current_mode = 0
         self._zone_count = 1
@@ -357,7 +368,6 @@ class UCLedControl(QWidget):
         # -- LED Preview (standard: circles) --
         self._preview = UCScreenLED(self)
         self._preview.move(PREVIEW_X, PREVIEW_Y)
-        self._preview.segment_clicked.connect(self.segment_clicked.emit)
 
         # -- Title label (hidden when background is loaded — bg has device name) --
         self._title = QLabel("RGB LED Control", self)
@@ -933,6 +943,15 @@ class UCLedControl(QWidget):
     # Public API
     # ================================================================
 
+    def _selector_word(self) -> str:
+        """The label beside the selector switch, as the C#'s panel art reads:
+        PA120 / LF10 select every zone ("Select all", the switch beside
+        buttonLB; FormLED hides the timer there, :1669 / :1724), a page style
+        circulates its pages ("Circulate")."""
+        word = "Select all" if self._is_select_all_style else "Circulate"
+        log.debug("_selector_word: %s", word)
+        return word
+
     def initialize(self, style_id: int,
                    zone_count: int = 1,
                    model: str = '') -> None:
@@ -943,6 +962,8 @@ class UCLedControl(QWidget):
             zone_count: Number of independent zones.
             model: Device model name (for PM-specific preview image).
         """
+        log.info("initialize: style=%d zones=%d model=%r lang=%s",
+                 style_id, zone_count, model, self._language)
         self._style_id = style_id
         self._zone_count = zone_count
         self._model = model
@@ -965,10 +986,11 @@ class UCLedControl(QWidget):
         if (preview_pixmap := Assets.get(preview_name)):
             self._preview.set_overlay(QPixmap(preview_pixmap))
 
-        # Set panel background (localized with fallback)
-        bg_name = Assets.get_localized(style.background_base, self._language)
-        if Assets.get(bg_name):
-            set_background_pixmap(self, bg_name)
+        # Background AND captions in the current language.  A language change
+        # made while no LED was bound skipped both (``_style_id`` was still the
+        # sentinel); this used to re-apply only the background, so the mode
+        # buttons and section labels stayed in the start-up language.
+        self.apply_localized_background()
 
         self._title.setText(f"RGB LED Control \u2014 {style.model_name}")
 
@@ -996,6 +1018,7 @@ class UCLedControl(QWidget):
         )
         self._carousel_interval.setVisible(is_page)
         self._display_selection_label.setVisible(has_selector)
+        self._circulate_label.setText(tr(self._selector_word(), self._language))
         self._circulate_label.setVisible(has_selector)
         self._zones.configure(zone_count, self._is_select_all_style)
         self._carousel_btn.setChecked(False)
@@ -1023,7 +1046,7 @@ class UCLedControl(QWidget):
         if panel.show_memory_panel:
             self._populate_memory_identity()
         elif panel.show_disk_panel:
-            self._populate_disk_identity()
+            self.show_disk_identity()
 
     def _apply_selector_labels(self, style_id: int) -> None:
         """Label the selector buttons with the metric each page shows.
@@ -1102,7 +1125,7 @@ class UCLedControl(QWidget):
                 self._mode_buttons[i].setText(text)
                 self._mode_buttons[i].setToolTip(text)
         self._display_selection_label.setText(tr('Display Selection', lang))
-        self._circulate_label.setText(tr('Circulate', lang))
+        self._circulate_label.setText(tr(self._selector_word(), lang))
         # Memory-panel field names (LC1) follow the language too.
         for lbl, key in self._mem_name_labels:
             lbl.setText(tr(key, lang))
@@ -1364,12 +1387,11 @@ class UCLedControl(QWidget):
         else:
             self._carousel_interval.setVisible(carousel and self._zone_count > 1)
         self._sync_zone_buttons()
+        # The App decides what the mask becomes (``SetLedZoneSync`` keeps the
+        # lowest page when the carousel goes off); the panel used to decide it
+        # here and send it, a choice no other UI made.  An empty mask is the
+        # first page, as FormLED starts, so nothing needs seeding.
         self.carousel_changed.emit(carousel)
-        # toggle_carousel recomputed the enabled mask (on → keep current
-        # multi-select; off → collapse to the selected one); persist it so the
-        # carousel seeds with at least the selected page instead of an empty
-        # mask (which would leave it stuck on page 0).
-        self.carousel_zones_changed.emit(self._zones.enabled)
 
     def _on_carousel_interval_changed(self, text: str = ""):
         """Handle carousel interval input change (C# textBoxTimer_TextChanged)."""
@@ -1379,39 +1401,42 @@ class UCLedControl(QWidget):
         if text.isdigit() and int(text) > 0:
             self.carousel_interval_changed.emit(int(text))
 
-    def load_zone_state(self, zone_index: int, mode: int,
-                        color: tuple, brightness: int,
-                        on: bool = True):
-        """Load a zone's state into the UI controls."""
-        for slider in self._rgb_sliders:
-            slider.blockSignals(True)
-        for spinbox in self._rgb_spinboxes:
-            spinbox.blockSignals(True)
-        self._brightness_slider.blockSignals(True)
+    def show_state(self, mode: int, color: tuple[int, int, int],
+                   brightness: int, on: bool) -> None:
+        """Show the App's LED state — sends nothing.
 
-        r, g, b = color
-        self._rgb_sliders[0].setValue(r)
-        self._rgb_sliders[1].setValue(g)
-        self._rgb_sliders[2].setValue(b)
-        for i, val in enumerate([r, g, b]):
-            self._rgb_spinboxes[i].setValue(val)
-
-        self._brightness_slider.setValue(brightness)
-        self._brightness_label.setText(f"{brightness}%")
-
+        A control the user is holding is left alone: every move of a slider
+        or of the wheel is a Command, its change comes back to follow, and in
+        the shared App it can arrive after the next move and pull the control
+        back.  A brightness change still in its debounce is held the same way.
+        """
+        held = self._brightness_slider.isSliderDown() or self._brightness_debounce.isActive()
+        frame_log.debug("show_state: mode=%d color=%s brightness=%d on=%s (brightness "
+                  "held=%s, wheel held=%s)", mode, color, brightness, on, held,
+                  self._color_wheel.is_dragging)
+        for slider, spinbox, value in zip(self._rgb_sliders, self._rgb_spinboxes,
+                                          color, strict=True):
+            if not slider.isSliderDown():
+                _set_quietly(slider, value)
+            _set_quietly(spinbox, value)
+        if not held:
+            _set_quietly(self._brightness_slider, brightness)
+            self._brightness_label.setText(f"{brightness}%")
         for i, btn in enumerate(self._mode_buttons):
             btn.setChecked(i == mode)
         self._current_mode = mode
-
-        for slider in self._rgb_sliders:
-            slider.blockSignals(False)
-        for spinbox in self._rgb_spinboxes:
-            spinbox.blockSignals(False)
-        self._brightness_slider.blockSignals(False)
-
-        # Sync color wheel indicator + on/off button with zone state
-        self._sync_wheel_from_rgb(r, g, b)
+        self._preview.set_led_mode(mode)          # its decorations follow the mode
+        if not self._color_wheel.is_dragging:
+            self._sync_wheel_from_rgb(*color)
         self._color_wheel.set_onoff(1 if on else 0)
+
+    def show_prefs(self, clock_24h: bool, week_sunday: bool, memory_ratio: int) -> None:
+        """Show the App's clock format, week start and DDR ratio — sends nothing."""
+        frame_log.debug("show_prefs: 24h=%s sunday=%s ratio=%d",
+                  clock_24h, week_sunday, memory_ratio)
+        self._show_clock_format(clock_24h)
+        self._show_week_start(week_sunday)
+        self.set_memory_ratio(memory_ratio)
 
     def load_sync_state(self, enabled: bool, zones: list[bool],
                         interval_secs: int) -> None:
@@ -1444,16 +1469,26 @@ class UCLedControl(QWidget):
     # -- LC2 clock handlers --
 
     def _set_clock_format(self, is_24h: bool):
+        log.info("_set_clock_format: 24h=%s", is_24h)
+        self._show_clock_format(is_24h)
+        self.clock_format_changed.emit(is_24h)
+
+    def _show_clock_format(self, is_24h: bool) -> None:
+        log.debug("_show_clock_format: 24h=%s", is_24h)
         self._is_timer_24h = is_24h
         self._btn_24h.setChecked(is_24h)
         self._btn_12h.setChecked(not is_24h)
-        self.clock_format_changed.emit(is_24h)
 
     def _set_week_start(self, is_sunday: bool):
+        log.info("_set_week_start: sunday=%s", is_sunday)
+        self._show_week_start(is_sunday)
+        self.week_start_changed.emit(is_sunday)
+
+    def _show_week_start(self, is_sunday: bool) -> None:
+        log.debug("_show_week_start: sunday=%s", is_sunday)
         self._is_week_sunday = is_sunday
         self._btn_sun.setChecked(is_sunday)
         self._btn_mon.setChecked(not is_sunday)
-        self.week_start_changed.emit(is_sunday)
 
     def _on_mon_clicked(self) -> None:
         log.info("_on_mon_clicked")
@@ -1600,13 +1635,14 @@ class UCLedControl(QWidget):
 
     def set_memory_ratio(self, ratio: int) -> None:
         """Set DDR combo from saved state (without emitting signal)."""
+        log.debug("set_memory_ratio: %d", ratio)
         self._memory_ratio = ratio
         idx = {1: 0, 2: 1, 4: 2}.get(ratio, 1)
         self._ddr_combo.blockSignals(True)
         self._ddr_combo.setCurrentIndex(idx)
         self._ddr_combo.blockSignals(False)
 
-    def _populate_disk_identity(self) -> None:
+    def show_disk_identity(self) -> None:
         """Populate the disk selector from the THERMAL sensor list.
 
         Sourced from ``ListDiskSensors``, which is the list ``disk_temp``
@@ -1619,10 +1655,10 @@ class UCLedControl(QWidget):
         list (``ListDisks``, psutil partitions) fed the CLI's ``disk-index``.
         Three lists, three cardinalities, no shared key.
         """
-        log.info("_populate_disk_identity: app=%s", self._app is not None)
+        log.info("show_disk_identity: app=%s", self._app is not None)
         try:
             if self._app is None:
-                log.warning("_populate_disk_identity: no bus — selector empty")
+                log.warning("show_disk_identity: no bus — selector empty")
                 return
             result = self._app.dispatch(ListDiskSensors())
             self._disk_slots = result.disks
@@ -1639,7 +1675,7 @@ class UCLedControl(QWidget):
                 if idx >= 0:
                     self._disk_selector.setCurrentIndex(idx)
             self._disk_selector.blockSignals(False)
-            log.info("_populate_disk_identity: %d sensor(s), active=%s",
+            log.info("show_disk_identity: %d sensor(s), active=%s",
                      len(result.disks), result.active or "(hottest)")
         except Exception as e:
             # Probe surface is wide (hwmon / WMI / SMC) — fall safe.

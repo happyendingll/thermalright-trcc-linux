@@ -18,7 +18,8 @@ from pathlib import Path
 
 import psutil  # pyright: ignore[reportMissingImports]
 
-from ...core.models import DisplayServer, DisplaySession
+from ...core.logs import per_frame
+from ...core.models import DeviceInfo, DisplayServer, DisplaySession
 from ...core.ports import (
     AutostartManager,
     HotplugMonitor,
@@ -26,11 +27,40 @@ from ...core.ports import (
     ScsiTransport,
     SensorEnumerator,
 )
+from ...core.registry import ALL_DEVICES
+from ..device._pyusb_find import find as usb_find
+from ..device._pyusb_find import usb_path
 from ..device.transport import PyUsbBulkTransport
 from ..device.usb_bot_scsi import UsbBotScsiTransport
-from ._base import BaseOS, BasePaths
+from ._base import BaseOS, BasePaths, disambiguate
 
 log = logging.getLogger(__name__)
+frame_log = per_frame(__name__)
+
+
+def _present_units() -> set[tuple[int, int, str]]:
+    """The units on the bus as ``(vid, pid, unit)``, cheap enough to poll.
+
+    The hotplug poll used ``scan_devices``, built for the one-shot discover:
+    three INFO lines and a serial-string read per panel, every second.  The
+    #283 report holds 129 such scans a second apart -- the log tail eaten,
+    and a USB control transfer to a streaming panel each time.  This reads
+    no string descriptor, and reads ports only where twins need telling
+    apart (#287): a single unit is keyed by its id alone.
+    """
+    units: set[tuple[int, int, str]] = set()
+    twins: list[DeviceInfo] = []
+    for vid, pid in ALL_DEVICES:
+        devices = list(usb_find(find_all=True, idVendor=vid, idProduct=pid) or [])
+        if len(devices) == 1:
+            units.add((vid, pid, ""))
+        else:
+            twins += [DeviceInfo(vid=vid, pid=pid, path=usb_path(dev))
+                      for dev in devices]
+    if twins:       # rare: the one-shot scan's rule names each unit
+        units |= {(d.vid, d.pid, d.unit) for d in disambiguate(twins)}
+    frame_log.debug("_present_units: %d unit(s)", len(units))
+    return units
 
 
 class MacOSPaths(BasePaths):
@@ -89,7 +119,7 @@ class MacOSPlatform(BaseOS, key="darwin"):
         return MacOSAutostart()
 
     def _build_hotplug(self) -> HotplugMonitor:
-        """Polling fallback — 1 s ``scan_devices`` diff.
+        """Polling fallback — 1 s diff of :func:`_present_units`.
 
         Native IOKit ``IOServiceAddMatchingNotification`` + CFRunLoop would
         need ~250 lines of fragile ctypes or a 50 MB pyobjc dep; polling once
@@ -97,24 +127,15 @@ class MacOSPlatform(BaseOS, key="darwin"):
         """
         log.debug("_build_hotplug")
         from ._hotplug import PollingHotplugMonitor
-        return PollingHotplugMonitor(scan=self._scan_vid_pid_set)
+        return PollingHotplugMonitor(scan=_present_units)
 
-    def _open_scsi(self, vid: int, pid: int,
-                  serial: str | None = None) -> ScsiTransport:
+    def _open_scsi(self, vid: int, pid: int, serial: str | None = None,
+                  unit: str = "") -> ScsiTransport:
         """SCSI via USB BOT over libusb — macOS has no kernel SCSI passthrough."""
-        log.info("open_scsi: %04x:%04x serial=%r", vid, pid, serial)
-        bulk = PyUsbBulkTransport(vid, pid, serial)
+        log.info("open_scsi: %04x:%04x serial=%r unit=%s",
+                 vid, pid, serial, unit or "(only)")
+        bulk = PyUsbBulkTransport(vid, pid, serial, unit)
         return UsbBotScsiTransport(bulk)
-
-    def _scan_vid_pid_set(self) -> set[tuple[int, int]]:
-        """Snapshot of currently-attached registry vid:pid combos.
-
-        Named method (not a lambda) so PollingHotplugMonitor's scan
-        callable survives across stack frames + shows up in tracebacks
-        with a real name.
-        """
-        log.debug("_scan_vid_pid_set: called")
-        return {(d.vid, d.pid) for d in self.scan_devices()}
 
     def setup(self, dry_run: bool = False) -> int:
         """Diagnose codesign / quarantine / privileges, print fix steps.

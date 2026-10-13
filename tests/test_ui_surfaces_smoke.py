@@ -26,52 +26,41 @@ def _app(tmp_path: Path) -> App:
     return App(MockPlatform([_SPEC], tmp_path), renderer=QtRenderer())
 
 
-def test_the_window_captures_through_its_own_platform(tmp_path: Path) -> None:
-    """Under ``TRCC_DAEMON=1`` the window's session is not the daemon's, so
-    the screencast must read the screen through the Platform the window was
-    started with, never through ``app.platform``.  Two distinct platforms
-    here stand in for the two sessions; the capture the handler holds must be
-    the host's.
+def test_the_window_runs_no_capture_loop_of_its_own(tmp_path: Path) -> None:
+    """The one capture loop is the App's driver, started by ``StartScreencast``.
+
+    The window used to run its own 150 ms timer, which made it the one face
+    where a saved screencast theme captured -- and, once the Command started
+    the driver, would have been a second loop on the wire.  With the
+    scheduler held still, a started cast in an open window grabs NOTHING
+    until the App's driver ticks, and then exactly one frame.
+
+    MUTATION CHECK: give the window a capture timer of its own (as its
+    ``ScreencastHandler`` once had) and frames arrive while the scheduler is
+    still.
     """
-    from trcc.ui.gui.trcc_app import TRCCApp
-    app = _app(tmp_path)
-    host = MockPlatform([], tmp_path / "host")
-    try:
-        window = TRCCApp(app=app, platform=host)
+    from PySide6.QtTest import QTest
 
-        assert window._screencast._capture is host.screen_capture()
-        assert window._screencast._capture is not app.platform.screen_capture()
-    finally:
-        app.close()
-
-
-def test_stopping_the_screencast_releases_the_capture_through_the_port(
-    tmp_path: Path,
-) -> None:
-    """The window calls ``stop`` on whatever capture it was handed -- the
-    port's method, not an attribute it checks for -- so a portal session is
-    closed when the cast ends and nothing keeps streaming a screen nobody is
-    showing.
-    """
-    from tests.conftest import FakeScreenCapture
+    from trcc.adapters.infra.send_scheduler import SyncSendScheduler
+    from trcc.core.commands import StartScreencast
     from trcc.ui.gui.trcc_app import TRCCApp
 
-    class _Recording(FakeScreenCapture):
-        def __init__(self) -> None:
-            super().__init__()
-            self.stops = 0
-
-        def stop(self) -> None:
-            self.stops += 1
-
-    app = _app(tmp_path)
-    host = MockPlatform([], tmp_path / "host")
-    host.capture = _Recording()
+    scheduler = SyncSendScheduler()
+    app = App(MockPlatform([_SPEC], tmp_path), renderer=QtRenderer(),
+              send_scheduler=scheduler)
     try:
-        window = TRCCApp(app=app, platform=host)
-        window._screencast.cleanup()
+        assert app.dispatch(ConnectDevice(key=_KEY)).ok
+        window = TRCCApp(app=app)
+        window.replay_initial_devices()
+        assert app.dispatch(StartScreencast(key=_KEY, x=0, y=0, w=32, h=32)).ok
+        QTest.qWait(300)
 
-        assert host.capture.stops == 1, "the window did not release its capture source"
+        assert window.uc_theme_setting.screencast_panel.values() == (0, 0, 32, 32), (
+            "the window missed ScreencastStarted")
+        assert app.platform.capture.regions == [], (
+            "the window captured on its own — a second capture loop")
+        scheduler.tick(0.0)
+        assert app.platform.capture.regions == [(0, 0, 32, 32)]
     finally:
         app.close()
 
@@ -105,12 +94,12 @@ def test_cli_lists_and_connects_device(tmp_path: Path) -> None:
 
 
 def test_api_lists_and_connects_device(tmp_path: Path) -> None:
-    from fastapi.testclient import TestClient
-
     from trcc.ui.api.main import build_app
 
+    from .conftest import loopback_client
+
     api = build_app(trcc=_app(tmp_path))
-    with TestClient(api) as client:
+    with loopback_client(api) as client:
         listed = client.get("/devices")
         assert listed.status_code == 200, listed.text
         keys = [p["key"] for p in listed.json()["products"]]
@@ -129,9 +118,114 @@ def test_gui_builds_a_handler_for_the_device(tmp_path: Path) -> None:
     app = _app(tmp_path)
     try:
         assert app.dispatch(ConnectDevice(key=_KEY)).ok
-        window = TRCCApp(app=app, platform=app.platform)
+        window = TRCCApp(app=app)
         window.replay_initial_devices()
         assert _KEY in window._handlers, list(window._handlers)
+    finally:
+        app.close()
+
+
+def test_the_window_follows_what_another_ui_does(tmp_path: Path) -> None:
+    """A theme loaded and a slideshow switched from ANOTHER UI show in the window.
+
+    The vision's second question.  The gui followed neither: its slideshow
+    rotated from its own timer and updated itself from that tick, so once the
+    App rotates -- or the CLI loads a theme -- the window has to hear it.
+
+    MUTATION CHECK: drop the ``theme_loaded`` or ``slideshow_changed``
+    connection in ``TRCCApp``.
+    """
+    from PySide6.QtTest import QTest
+
+    from tests.conftest import renderable_theme
+    from trcc.core.commands import ConfigureSlideshow, LoadTheme, SetSlideshow
+    from trcc.ui.gui.trcc_app import TRCCApp
+
+    app = _app(tmp_path)
+    try:
+        assert app.dispatch(ConnectDevice(key=_KEY)).ok
+        window = TRCCApp(app=app)
+        window.replay_initial_devices()
+        handler = window._handlers[_KEY]
+        assert handler._pm.ui_active, "fixture: the one panel should be the active one"
+        root = app.platform.paths().user_content_dir() / "data" / "theme320320"
+        theme = renderable_theme(root, "FromTheCli")
+
+        assert app.dispatch(LoadTheme(key=_KEY, path=theme)).ok
+        assert app.dispatch(ConfigureSlideshow(
+            key=_KEY, themes=("FromTheCli",), interval_s=60.0)).ok
+        assert app.dispatch(SetSlideshow(key=_KEY, enabled=True)).ok
+        QTest.qWait(300)
+        assert handler._pm.state.current_theme_path == theme
+        assert window.uc_theme_local.is_slideshow()
+
+        assert app.dispatch(SetSlideshow(key=_KEY, enabled=False)).ok
+        QTest.qWait(300)
+        assert not window.uc_theme_local.is_slideshow()
+    finally:
+        app.close()
+
+
+def _spied(app: App) -> list[str]:
+    """Record the name of every Command the App is asked to run from here on."""
+    sent: list[str] = []
+    real = app.dispatch
+
+    def spy(cmd):
+        sent.append(type(cmd).__name__)
+        return real(cmd)
+    app.dispatch = spy                  # type: ignore[method-assign]
+    return sent
+
+
+def test_quitting_the_window_leaves_the_panels_to_the_app(tmp_path: Path) -> None:
+    """A window quitting blanked every panel itself -- as a daemon client, for
+    every other UI too.  The App blanks them when IT closes, exactly once.
+
+    MUTATION CHECK: restore the handler's ``SleepDevice`` teardown.
+    """
+    from trcc.ui.gui.trcc_app import TRCCApp
+
+    app = _app(tmp_path)
+    try:
+        assert app.dispatch(ConnectDevice(key=_KEY)).ok
+        window = TRCCApp(app=app)
+        window.replay_initial_devices()
+        sent = _spied(app)
+
+        window.close()                  # offscreen: no tray, a real quit
+
+        assert not {"SleepDevice", "StopVideo", "SendColor"} & set(sent), sent
+        assert app.devices[_KEY].is_connected
+    finally:
+        app.close()
+    assert sent.count("SleepDevice") == 1, sent
+
+
+def test_a_disconnect_is_not_undone_by_the_window(tmp_path: Path) -> None:
+    """The window's teardown sent ``SleepDevice``, which connects its device
+    first -- so a disconnect from anywhere was reconnected by an open gui, which
+    then wrote brightness, orientation and split back into the App.  Measured.
+
+    MUTATION CHECK: restore the handler's ``SleepDevice`` teardown.
+    """
+    from PySide6.QtTest import QTest
+
+    from trcc.core.commands import DisconnectDevice
+    from trcc.ui.gui.trcc_app import TRCCApp
+
+    app = _app(tmp_path)
+    try:
+        assert app.dispatch(ConnectDevice(key=_KEY)).ok
+        window = TRCCApp(app=app)
+        window.replay_initial_devices()
+        assert app.dispatch(DisconnectDevice(key=_KEY)).ok
+        sent = _spied(app)
+        QTest.qWait(500)
+
+        assert not {"EnsureConnected", "ConnectDevice"} & set(sent), sent
+        assert not (_KEY in app.devices and app.devices[_KEY].is_connected)
+        assert _KEY not in window._handlers
     finally:
         app.close()
 
@@ -139,13 +233,13 @@ def test_gui_builds_a_handler_for_the_device(tmp_path: Path) -> None:
 # ── qtgui (MainWindow) ────────────────────────────────────────────────────────
 
 
-def test_qtgui_main_window_constructs_with_a_device(tmp_path: Path) -> None:
-    from trcc.ui.qtgui.app import MainWindow
-
+def test_qtgui_main_window_constructs_with_a_device(
+    tmp_path: Path, make_window,
+) -> None:
     app = _app(tmp_path)
     try:
         assert app.dispatch(ConnectDevice(key=_KEY)).ok
-        window = MainWindow(app=app)
+        window = make_window(app)
         # The unified surface is live: the devices panel exists and the window
         # holds the same App that already has the connected device.
         assert "devices" in window._panels

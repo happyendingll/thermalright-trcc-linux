@@ -29,7 +29,6 @@ def test_device_state_defaults() -> None:
     assert s.is_rotated is False
     assert s.overlay_enabled is False
     assert s.current_theme_path is None
-    assert s.last_metrics is None
 
 
 def test_model_holds_key_and_fresh_state() -> None:
@@ -44,7 +43,6 @@ def test_activation_flag_defaults() -> None:
     pm = LcdPresentationModel("0402:3922")
     assert pm.ui_active is False
     assert pm.configured is False
-    assert pm.background_active is False
     assert pm.brightness_level == 100
     assert pm.split_mode == 0
     assert pm.ldd_is_split is False
@@ -97,61 +95,30 @@ def test_apply_rotation_portrait_swaps_lcd_size_and_flags() -> None:
     assert pm.state.lcd_size == (854, 480)       # restored
 
 
-# ── Video math (B5) ───────────────────────────────────────────────────
-
-
-def test_video_interval_ms() -> None:
-    pm = LcdPresentationModel("87ad:70db")
-    assert pm.video_interval_ms(None) == 33      # no playback → 30fps fallback
-    assert pm.video_interval_ms(0) == 33          # fps 0 → 30fps fallback
-    assert pm.video_interval_ms(30) == 33
-    assert pm.video_interval_ms(60) == 16
-    assert pm.video_interval_ms(1000) == 1        # clamped to >= 1ms
-
-
-def test_seek_frame_clamps() -> None:
-    pm = LcdPresentationModel("87ad:70db")
-    assert pm.seek_frame(0.0, 100) == 0
-    assert pm.seek_frame(0.5, 100) == 50
-    assert pm.seek_frame(1.0, 100) == 99          # last valid index, not 100
-    assert pm.seek_frame(-0.2, 100) == 0          # below range clamps to 0
-    assert pm.seek_frame(2.0, 100) == 99          # above range clamps to last
-
-
-def test_progress_fraction() -> None:
-    pm = LcdPresentationModel("87ad:70db")
-    assert pm.progress_fraction(0, 100) == 0.0
-    assert pm.progress_fraction(50, 100) == 0.5
-    assert pm.progress_fraction(5, 0) == 0.0       # no frames → 0.0, no ZeroDiv
-
-
 # ── Split-mode policy (B4) ────────────────────────────────────────────
 
 
-def test_apply_split_mode_split_capable_panel() -> None:
-    """A split-capable resolution: ldd_is_split True, dispatch the chosen mode."""
+def test_apply_split_mode_shows_the_apps_mode_on_a_split_capable_panel() -> None:
     pm = LcdPresentationModel("87ad:70db")
-    mode = pm.apply_split_mode(3, (1920, 462))      # a SPLIT_MODE resolution
+    pm.apply_split_mode(3, (1920, 462))              # a SPLIT_MODE resolution
     assert pm.ldd_is_split is True
     assert pm.split_mode == 3
-    assert mode == 3
 
 
-def test_apply_split_mode_defaults_to_two_when_unset() -> None:
+def test_apply_split_mode_shows_a_chosen_off_as_off() -> None:
+    """It used to turn 0 into 2 -- so a user who chose "off" in qtgui or the
+    CLI saw style 2 in the gui, which then WROTE 2 back over their choice."""
     pm = LcdPresentationModel("87ad:70db")
-    mode = pm.apply_split_mode(0, (1280, 480))       # persisted 0 → default 2
-    assert pm.split_mode == 2
+    pm.apply_split_mode(0, (1280, 480))
+    assert pm.split_mode == 0
     assert pm.ldd_is_split is True
-    assert mode == 2
 
 
-def test_apply_split_mode_non_split_panel_dispatches_zero() -> None:
-    """A non-split resolution: ldd_is_split False, dispatch mode 0."""
+def test_apply_split_mode_non_split_panel_has_no_editor() -> None:
     pm = LcdPresentationModel("0402:3922")
-    mode = pm.apply_split_mode(3, (320, 320))         # not a split resolution
+    pm.apply_split_mode(3, (320, 320))                # not a split resolution
     assert pm.ldd_is_split is False
-    assert pm.split_mode == 3                          # still recorded
-    assert mode == 0                                   # but 0 is sent
+    assert pm.split_mode == 3                          # shown as the App has it
 
 
 class _FakeComposer:

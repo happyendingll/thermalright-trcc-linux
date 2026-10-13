@@ -11,8 +11,27 @@ permissions:
 
 jobs:
   build-macos:
-    name: Build macOS app
-    runs-on: macos-latest
+    name: Build macOS app (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    # A ceiling, not a target: ~2-3x the slowest run measured 2026-10-01, and
+    # above that day's slow-mirror outlier.  Without one a hang holds the
+    # runner for GitHub's 6-hour default.
+    timeout-minutes: 30
+    # One DMG per architecture (#219).  Not universal2: the app bundles
+    # Homebrew's 7z, ffmpeg and libusb, and Homebrew ships each only for the
+    # host architecture -- a universal2 PyInstaller app would still carry
+    # arm64-only tools.  macos-15-intel is the LAST x86_64 image GitHub
+    # offers; it is retired in August 2027, and the Intel leg with it.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            arch: arm64
+            suffix: ""
+          - runner: macos-15-intel
+            arch: x86_64
+            suffix: "-intel"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -25,7 +44,7 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          brew install libusb create-dmg p7zip ffmpeg
+          brew install libusb create-dmg sevenzip ffmpeg dylibbundler
 
       - name: Install Python dependencies
         run: |
@@ -81,10 +100,23 @@ jobs:
 
       - name: Bundle dependencies
         run: |
-          # Bundle 7z for theme extraction (p7zip is LGPL, redistributable)
-          cp "$(which 7z)" dist/TRCC.app/Contents/MacOS/7z
-          # Bundle ffmpeg for video playback (LGPL, like C# app)
+          # Bundle 7-Zip for theme extraction.  `7zz` from Homebrew's
+          # sevenzip is one real binary; p7zip's `7z` is a shell WRAPPER that
+          # execs Homebrew's own copy, so bundled it pointed at a path no
+          # user without Homebrew has (#219).  The toolchain tries 7z, 7zz,
+          # 7za, 7zr, and the app puts this folder first on PATH when frozen.
+          cp "$(which 7zz)" dist/TRCC.app/Contents/MacOS/7zz
+          # Bundle ffmpeg for video playback (LGPL, like C# app).  Homebrew's
+          # ffmpeg is dynamic -- ~20 dylibs under /opt/homebrew -- so copy
+          # those in beside it and point it at them (#219).  Rewriting a
+          # load path breaks the signature, and Apple Silicon refuses to run
+          # an invalid one, so everything touched is ad-hoc re-signed.
           cp "$(which ffmpeg)" dist/TRCC.app/Contents/MacOS/ffmpeg
+          dylibbundler -od -b -x dist/TRCC.app/Contents/MacOS/ffmpeg \
+            -d dist/TRCC.app/Contents/Frameworks/ffmpeg/ \
+            -p @executable_path/../Frameworks/ffmpeg/
+          codesign --force -s - dist/TRCC.app/Contents/Frameworks/ffmpeg/*.dylib \
+            dist/TRCC.app/Contents/MacOS/ffmpeg
           # NOTE: no CLI symlink — macOS APFS is case-insensitive,
           # ln -sf TRCC .../trcc would DELETE the TRCC executable
 
@@ -102,7 +134,7 @@ jobs:
           echo "Python: $(python3 --version)"
           echo "PyInstaller: $(python3 -c 'import PyInstaller; print(PyInstaller.__version__)')"
           echo "PySide6: $(python3 -c 'import PySide6; print(PySide6.__version__)')"
-          echo "7z: $(which 7z || echo 'not found')"
+          echo "7zz: $(which 7zz || echo 'not found')"
           echo "ffmpeg: $(which ffmpeg || echo 'not found')"
           echo "libusb: $(brew --prefix libusb)/lib/libusb-1.0.dylib"
 
@@ -129,7 +161,7 @@ jobs:
             find -L dist/TRCC.app -type f -perm +111 2>/dev/null | head -20
             missing+=("TRCC")
           fi
-          [ -f "dist/TRCC.app/Contents/MacOS/7z" ] && echo "  7z: OK" || missing+=("7z")
+          [ -f "dist/TRCC.app/Contents/MacOS/7zz" ] && echo "  7zz: OK" || missing+=("7zz")
           [ -f "dist/TRCC.app/Contents/MacOS/ffmpeg" ] && echo "  ffmpeg: OK" || missing+=("ffmpeg")
           # libusb could be in Frameworks (PyInstaller) or copied there by us
           if find -L dist/TRCC.app/Contents/Frameworks -name "libusb*" -type f 2>/dev/null | grep -q .; then
@@ -144,6 +176,43 @@ jobs:
           fi
           echo "PASSED — all dependencies bundled"
 
+      - name: Verify the app's architecture
+        run: |
+          # The #219 DMG was arm64-only and nothing noticed until an Intel user
+          # could not launch it.  Every leg must produce ITS architecture.
+          for bin in TRCC 7zz ffmpeg; do
+            info="$(file "dist/TRCC.app/Contents/MacOS/$bin")"
+            echo "$info"
+            case "$info" in
+              *${{ matrix.arch }}*) ;;
+              *) echo "::error::$bin is not ${{ matrix.arch }}"; exit 1 ;;
+            esac
+          done
+
+      - name: Verify bundled tools run without Homebrew
+        run: |
+          # A tool copied out of Homebrew still loads its libraries FROM
+          # Homebrew.  Bundled, it must link only the system -- or it cannot
+          # start on the Mac of anyone who has not installed the same formula.
+          # The libraries bundled for ffmpeg are checked too: one of them
+          # reaching back into Homebrew fails the same way, one load later.
+          fail=0
+          for bin in dist/TRCC.app/Contents/MacOS/7zz dist/TRCC.app/Contents/MacOS/ffmpeg \
+                     dist/TRCC.app/Contents/Frameworks/ffmpeg/*.dylib; do
+            deps="$(otool -L "$bin" | tail -n +2)"
+            echo "== $bin"; echo "$deps"
+            if echo "$deps" | grep -qE '/opt/homebrew|/usr/local/(Cellar|opt|lib)'; then
+              echo "::error::$bin links Homebrew libraries — it will not start without Homebrew"
+              fail=1
+            fi
+          done
+          [ "$fail" = 0 ] || exit 1
+          # Then RUN them with Homebrew's copies gone -- otool reads the load
+          # commands; only a launch proves the loader and signatures accept it.
+          brew uninstall --ignore-dependencies ffmpeg sevenzip
+          dist/TRCC.app/Contents/MacOS/7zz i > /dev/null && echo "7zz runs"
+          dist/TRCC.app/Contents/MacOS/ffmpeg -hide_banner -version > /dev/null && echo "ffmpeg runs"
+
       - name: Create DMG
         run: |
           create-dmg \
@@ -154,18 +223,18 @@ jobs:
             --icon "TRCC.app" 150 185 \
             --app-drop-link 450 185 \
             --no-internet-enable \
-            "trcc-${{ steps.version.outputs.VERSION }}-macos.dmg" \
+            "trcc-${{ steps.version.outputs.VERSION }}-macos${{ matrix.suffix }}.dmg" \
             dist/TRCC.app
 
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v7
         with:
-          name: trcc-macos-dmg
-          path: trcc-${{ steps.version.outputs.VERSION }}-macos.dmg
+          name: trcc-macos${{ matrix.suffix }}-dmg
+          path: trcc-${{ steps.version.outputs.VERSION }}-macos${{ matrix.suffix }}.dmg
 
       - name: Create fixed-name alias for stable download URL
         if: startsWith(github.ref, 'refs/tags/v')
-        run: cp "trcc-${{ steps.version.outputs.VERSION }}-macos.dmg" trcc-latest-macos.dmg
+        run: cp "trcc-${{ steps.version.outputs.VERSION }}-macos${{ matrix.suffix }}.dmg" trcc-latest-macos${{ matrix.suffix }}.dmg
 
       - name: Attach to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -173,6 +242,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release upload "$GITHUB_REF_NAME" \
-            "trcc-${{ steps.version.outputs.VERSION }}-macos.dmg" \
-            trcc-latest-macos.dmg \
+            "trcc-${{ steps.version.outputs.VERSION }}-macos${{ matrix.suffix }}.dmg" \
+            trcc-latest-macos${{ matrix.suffix }}.dmg \
             --clobber

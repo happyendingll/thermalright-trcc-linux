@@ -97,7 +97,47 @@ import logging_coverage  # noqa: E402  # pyright: ignore[reportMissingImports]
 #: name that left the silent set.
 _SRC_ROOT = Path(__file__).resolve().parents[1] / "src" / "trcc"
 
-MAX_SILENT = 341
+#: 336 -> 335 on 2026-09-29: ``TRCCApp.is_app_visible`` was DELETED with the
+#: Windows minimise-on-close it existed to read (close now hides to the tray on
+#: every OS).  Diffing ``--list`` across the change: the only name that left.
+#: 328 -> 320 on 2026-09-30: the gui overlay editor stopped reading the theme
+#: file and re-sending the whole grid.  Five silent functions were DELETED with
+#: that keyed-dict shape (``to_overlay_config`` and ``load_from_overlay_config``
+#: on the grid and on ``UCThemeSetting``, the grid's ``to_next_elements``); the
+#: grid's ``add_element`` / ``delete_element`` and ``UCThemeSetting.load_configs``
+#: gained a line.  Diffing ``--list`` across the change: those 8 left, none joined.
+#: 320 -> 319 on 2026-09-30: the gui's ``TRCCApp._make_timer`` was DELETED --
+#: its one use was the flash timer, gone with FlashOverlayElement (it drew
+#: nothing in any UI; the C# has no panel highlight).  Diffing ``--list``
+#: across the change: the only name that left.
+#: 319 -> 318 on 2026-09-30: the gui's ``UCPreview.set_progress`` gained a
+#: per-frame line when the progress bar moved to frames.  Diffing ``--list``
+#: across the change: the only name that left, none joined.
+#: 318 -> 313 on 2026-09-30: the gui's ``ScreencastHandler`` was DELETED -- a
+#: window-wide copy of the App's cast that re-issued B's cast on A.  Its five
+#: silent members left (``active``, ``audio_enabled``, ``params``,
+#: ``set_border``, ``set_params``); the panel's new ``audio_on`` got a line.
+#: 313 -> 310 on 2026-09-30: the gui's mode switches show App state.
+#: ``MaskPanel.set_mask_visible`` gained a line; ``LCDHandler``'s
+#: ``is_background_active`` getter + setter were DELETED -- a flag written in
+#: five places and read in none.  Diffing ``--list``: those 3 left, none joined.
+#: 310 -> 306 on 2026-09-30: the screencast region became the App's.  Left:
+#: ``_emit_params`` (deleted -- it emitted per keystroke), ``set_border_visible``
+#: (became ``set_hide_border``, logged), ``UCThemeSetting.set_resolution``
+#: (deleted -- its one caller wrote the NATIVE size where the cast canvas
+#: belongs) and ``ScreenCastPanel.set_resolution`` (logged).  None joined.
+#: 302 -> 300 on 2026-10-06: two DELETED, both silent and called by nothing
+#: (AST, src + tests + dev): ``UCAbout.sync_language`` and
+#: ``MaskPanel.apply_language``.  Diffing ``--list``: those 2 left, none joined.
+#: 300 -> 297 on 2026-10-06: nine definitions with zero references (AST, src +
+#: tests + dev) DELETED; three were silent -- ``get_selected_mask`` and both
+#: ``get_selected_theme``.  Diffing ``--list``: those 3 left, none joined.
+#: 297 -> 295 on 2026-10-07: dead code DELETED (AST, src + tests + dev, zero
+#: callers): both ``stop_periodic_updates``, four ``apply_language`` hooks,
+#: ``LCDHandler.has_video_playback``, ``download_preview`` and the unreachable
+#: ``UCInfoModule`` strip with ``set_show_info_module``.  The two silent ones
+#: were gui's ``stop_periodic_updates`` and ``set_show_info_module``.
+MAX_SILENT = 286
 
 
 def test_logging_coverage_only_improves() -> None:
@@ -212,6 +252,45 @@ def test_the_record_handling_path_is_exempt_on_a_logging_handler() -> None:
         )
 
 
+def test_nothing_on_the_record_path_logs() -> None:
+    """The exemption stops the ratchet DEMANDING a log line there; this forbids one.
+
+    Without this half, the only thing between a record-path function and a log
+    line was the ratchet's silence.  ``__main__._safe_stream_emit`` is attached
+    onto ``logging.StreamHandler.emit`` rather than defined in a handler class,
+    so the class-only exemption missed it, a bulk pass gave it a log line, and
+    every Windows record re-entered the handler holding the msvcrt lock —
+    ~9 s per record measured on the VM, v9.10.0 through v9.10.4.
+    """
+    assert logging_coverage.logging_on_the_record_path() == [], (
+        "a function logging runs WHILE HANDLING a record logs itself — the "
+        "record re-enters the handler running it (recursion, or on Windows a "
+        "second msvcrt lock this process already holds: ~9 s, then EDEADLK). "
+        "Remove the log line."
+    )
+
+
+def test_a_function_attached_onto_a_logging_class_is_on_the_record_path() -> None:
+    """``logging.StreamHandler.emit = f`` puts *f* on the path exactly as a method.
+
+    Attached onto anything else, it is an ordinary function and still counted.
+    """
+    countable = _countable_names('''
+def _safe_stream_emit(self, record):
+    self.stream.write(self.format(record))
+logging.StreamHandler.emit = _safe_stream_emit
+
+def _send(self, frame):
+    self._device.write(frame)
+DeviceSender.emit = _send
+''')
+
+    assert countable == {"_send"}, (
+        "an attached emit must be exempt like a handler method, and the "
+        "qualifier must still be the logging class it is attached onto"
+    )
+
+
 def test_the_exemption_does_not_reach_a_non_logging_handler() -> None:
     """``LCDHandler(BaseHandler)`` is a device handler, not a logging one.
 
@@ -282,7 +361,13 @@ def test_an_arbitrary_bare_call_is_not_mistaken_for_logging() -> None:
 
 def test_log_functions_stays_a_deliberate_allowlist() -> None:
     """Pinned so nobody widens it without meaning to."""
-    assert set(logging_coverage._LOG_FUNCTIONS) == {"trace"}, (
+    # recurring_failure joined 2026-09-29 (#312): it emits on every call, so the
+    # three sensor helpers it serves were never silent — the count went back to
+    # 340, not below it.  recurring_warning joined the same day for the same
+    # reason: ``ipc._to_wire``'s one log line moved to it, and the count stayed
+    # at 336.
+    assert set(logging_coverage._LOG_FUNCTIONS) == {
+        "trace", "recurring_failure", "recurring_warning"}, (
         "adding a name here lowers the silent count without adding a log line "
         "anywhere — say why in the commit, and lower MAX_SILENT to match")
 

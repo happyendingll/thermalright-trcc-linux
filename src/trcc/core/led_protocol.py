@@ -24,9 +24,11 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from .logs import Blob, per_frame
 from .models import LedStyle
 
 log = logging.getLogger(__name__)
+frame_log = per_frame(__name__)
 
 # =========================================================================
 # Entry shape
@@ -171,7 +173,7 @@ def is_fingerprint_header(header: bytes) -> bool:
     Magic Qube's ``DC DD AA 01``) as expected instead of logging it as an
     anomaly next to the standard ``DA DB DC DD`` magic.
     """
-    log.debug("is_fingerprint_header: header=%s", header)
+    log.debug("is_fingerprint_header: header=%s", Blob(header))
     return bytes(header[:4]) in _HEADER_OVERRIDES
 
 
@@ -366,7 +368,7 @@ def remap_led_colors(
     Sub-tables (e.g. LF25 = LF8 with sub=1) take precedence over the
     base style table when both exist.
     """
-    log.debug("remap_led_colors: style=%s sub=%d colors=%d",
+    frame_log.debug("remap_led_colors: style=%s sub=%d colors=%d",
               style, style_sub, len(colors))
     if style is None:
         return colors

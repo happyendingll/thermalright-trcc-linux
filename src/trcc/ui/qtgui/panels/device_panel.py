@@ -22,10 +22,20 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from ....core.commands import ConnectDevice, DeviceState, DisconnectDevice, DiscoverDevices
+from ....core.commands import (
+    ConnectDevice,
+    DeviceState,
+    DisconnectDevice,
+    DiscoverDevices,
+    ListDevices,
+)
+from ....core.logs import per_frame
+from ....core.results import DeviceStateResult
 from ..base import BasePanel
 
 log = logging.getLogger(__name__)
+#: The inspector redraws per sent frame — see core.logs.per_frame.
+frame_log = per_frame(__name__)
 
 _MONO = "font-family: monospace; font-size: 11px;"
 _USER_ROLE = 0x0100  # Qt.ItemDataRole.UserRole
@@ -81,10 +91,15 @@ class DevicePanel(BasePanel):
         root.addWidget(inspector_box, stretch=2)
         root.addWidget(self._status)
 
-        # Live refresh: (re)connect + every wire frame the device sends.
-        self._bus.device_connected.connect(self._refresh_inspector)
-        self._bus.device_disconnected.connect(self._refresh_inspector)
+        # Live refresh: (re)connect re-reads; a wire frame only updates the
+        # byte count (it re-queried DeviceState on EVERY frame, a socket round
+        # trip per frame under a shared App, for fields that do not change).
+        self._state: DeviceStateResult | None = None
+        self._bus.device_connected.connect(self._on_fleet_changed)
+        self._bus.device_disconnected.connect(self._on_fleet_changed)
         self._bus.frame_sent.connect(self._on_frame_sent)
+        # The App's devices on open; Scan still looks for new ones.
+        self._show_attached()
 
     # ── Actions ───────────────────────────────────────────────────────
 
@@ -92,15 +107,37 @@ class DevicePanel(BasePanel):
         log.info("_on_scan")
         result = self.dispatch(DiscoverDevices())
         self._list.clear()
-        for product in result.products:
+        for key, product in result.units():
+            # A scan does not handshake: name and size are the catalog's
+            # guess for the USB id, which covers several coolers (#176).
             item = QListWidgetItem(
-                f"{product.key}  —  {product.vendor} {product.product}  "
+                f"{key}  —  {product.vendor} {product.product}  "
                 f"({product.wire.value}, {product.native_resolution[0]}×"
-                f"{product.native_resolution[1]})"
+                f"{product.native_resolution[1]}, catalog)"
             )
-            item.setData(_USER_ROLE, product.key)
+            item.setData(_USER_ROLE, key)
             self._list.addItem(item)
         self._status.setText(result.message)
+
+    def _show_attached(self) -> None:
+        """List the devices the App holds -- it was empty until Scan."""
+        selected = self._current_key()
+        devices = self.dispatch(ListDevices()).devices
+        log.info("_show_attached: %d device(s)", len(devices))
+        self._list.clear()
+        for entry in devices:
+            item = QListWidgetItem(
+                f"{entry.key}  —  {entry.vendor} {entry.product}  "
+                f"({entry.wire}{', connected' if entry.connected else ''})")
+            item.setData(_USER_ROLE, entry.key)
+            self._list.addItem(item)
+            if entry.key == selected:
+                self._list.setCurrentItem(item)
+
+    def _on_fleet_changed(self, event: object) -> None:
+        log.info("_on_fleet_changed: %s", type(event).__name__)
+        self._show_attached()
+        self._refresh_inspector()
 
     def _selected_key(self) -> str | None:
         log.debug("_selected_key")
@@ -137,18 +174,19 @@ class DevicePanel(BasePanel):
     # ── Inspector ─────────────────────────────────────────────────────
 
     def _on_frame_sent(self, event: object) -> None:
-        log.debug("_on_frame_sent: event=%s", event)
+        frame_log.debug("_on_frame_sent: event=%s", event)
         key = getattr(event, "key", None)
         n = getattr(event, "bytes_sent", None)
         if key is None or n is None:
             return
         self._last_bytes[str(key)] = int(n)
-        if str(key) == self._current_key():
-            self._refresh_inspector()
+        if self._state is not None and str(key) == self._state.key:
+            self._show_inspector(self._state)
 
     def _refresh_inspector(self, *_args: object) -> None:
         log.debug("_refresh_inspector")
         key = self._current_key()
+        self._state = None
         if not key:
             self._inspector.setText("Select a device to inspect.")
             return
@@ -159,11 +197,19 @@ class DevicePanel(BasePanel):
                 "Connect it to read its handshake + profile.",
             )
             return
+        self._state = state
+        self._show_inspector(state)
+
+    def _show_inspector(self, state: DeviceStateResult) -> None:
+        """Draw a read state plus the latest byte count -- no Query."""
+        frame_log.debug("_show_inspector: %s", state.key)
+        key = state.key
 
         lines = [
             f"Device        {state.key}",
             f"  wire        {state.wire}",
-            f"  native res  {state.native_resolution[0]}×{state.native_resolution[1]}",
+            f"  catalog     {state.catalog_product} "
+            f"{state.catalog_resolution[0]}×{state.catalog_resolution[1]}",
         ]
 
         # ``None`` means "not handshaken yet" and is distinct from a real 0 —

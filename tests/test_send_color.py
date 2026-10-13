@@ -78,9 +78,6 @@ class RecordingRenderer(Renderer):
             return _Surface(surface.h, surface.w)
         return _Surface(surface.w, surface.h)
 
-    def flip_horizontal(self, surface: Any) -> Any:
-        return surface
-
     def apply_brightness(self, surface: Any, percent: int) -> Any:
         self._record("apply_brightness", surface, percent)
         return surface
@@ -101,13 +98,6 @@ class RecordingRenderer(Renderer):
 
     def from_raw_rgb24(self, frame: Any) -> Any:
         return _Surface(frame.width, frame.height)
-
-    def to_raw_rgb24(self, surface):
-        # The inverse the port now requires.  Test doubles carry no pixels,
-        # so this reports the surface's DIMENSIONS with blank bytes — enough
-        # for a caller that only needs a correctly-sized RawFrame.
-        w, h = self.surface_size(surface)
-        return RawFrame(data=bytes(w * h * 3), width=w, height=h)
 
     def decode_image(self, data: bytes) -> Any:
         return _Surface(100, 100)
@@ -326,9 +316,9 @@ def test_send_color_command_drives_real_app_dispatch(
     # FrameSent event published
     assert len(frame_sent_events) == 1
     assert frame_sent_events[0].key == "0402:3922"
-    # SendColor bypasses the scene cache (solid fill), so it carries no
-    # surface — the GUI falls back to a re-render for it.
-    assert frame_sent_events[0].surface is None
+    # SendColor holds the panel (#306), so there is no theme left to
+    # re-render for the preview: the event carries the colour's own surface.
+    assert frame_sent_events[0].surface is not None
 
 
 def test_sleep_device_blanks_lcd_with_black_frame(tmp_home: Path) -> None:
@@ -717,9 +707,22 @@ def test_send_to_an_attached_but_unconnected_device_returns_a_result(
     tmp_home: Path,
 ) -> None:
     """Attached, never handshaken: a Result with ``connected is False`` —
-    NOT a raised DeviceNotConnectedError."""
-    app = App(platform=FakePlatform(tmp_home), renderer=RecordingRenderer())
+    NOT a raised DeviceNotConnectedError.
+
+    Dispatch now tries the connect first.  Here it cannot open the device --
+    the commonest real failure, a permission -- and the message carries WHY:
+    the whole diagnosis for hardware we do not own.
+    """
+    from trcc.core.commands import DeviceConnectionIssues
+
+    platform = FakePlatform(tmp_home)
+    app = App(platform=platform, renderer=RecordingRenderer())
     app.attach(0x0402, 0x3922)          # attached; ConnectDevice never dispatched
+
+    def refuse(*a: object, **k: object) -> None:
+        raise PermissionError("Permission denied: '/dev/sg1'")
+
+    platform.open_transport = refuse    # type: ignore[method-assign]
 
     result = app.dispatch(SendColor(key="0402:3922", r=1, g=2, b=3))
 
@@ -728,7 +731,12 @@ def test_send_to_an_attached_but_unconnected_device_returns_a_result(
         "an unusable device must be reported by the field, not by a message "
         "a caller would have to string-match"
     )
-    assert "not connected" in result.message
+    reason = app.dispatch(DeviceConnectionIssues()).issues[0].message
+    # "Not attached", not "not connected": the connect goes through the App's
+    # one locked path (``App.connect_unit``), which releases a never-connected
+    # entry before it tries -- so after the refusal nothing is attached.
+    assert result.message == f"Not attached: 0402:3922 — {reason}"
+    assert reason == "Permission denied: '/dev/sg1'"
 
 
 def test_unknown_device_is_also_connected_false(tmp_home: Path) -> None:
@@ -846,31 +854,8 @@ def test_current_frame_returns_the_frame_without_rendering_one(
 # panel blank, since the cutover (4fa876be).
 
 
-def test_to_raw_rgb24_round_trips_a_surface(tmp_home: Path) -> None:
-    """The inverse the port was missing: surface → RawFrame → surface.
-
-    Uses a width whose ``*3`` is NOT a multiple of 4 (7*3 = 21), because Qt
-    pads each scanline to a 4-byte boundary — reading the buffer flat would
-    carry that padding into the pixel data of every row after the first.
-    """
-    from trcc.adapters.render.qt import QtRenderer
-    from trcc.core.models import RawFrame
-
-    r = QtRenderer()
-    original = RawFrame(data=bytes(range(7 * 5 * 3 % 256)) * 0 + bytes(7 * 5 * 3),
-                        width=7, height=5)
-    surface = r.from_raw_rgb24(original)
-
-    back = r.to_raw_rgb24(surface)
-
-    assert (back.width, back.height) == (7, 5)
-    assert len(back.data) == 7 * 5 * 3, (
-        "row padding leaked into the packed data — 7*3=21 is not 4-aligned"
-    )
-
-
-def test_screencast_frame_encodes_from_a_surface(tmp_home: Path) -> None:
-    """End to end: what the gui holds → wire bytes.
+def test_screencast_frame_encodes_from_a_raw_frame(tmp_home: Path) -> None:
+    """End to end: a captured frame → wire bytes.
 
     Fails before the fix with ``AttributeError: 'QImage' object has no
     attribute 'data'`` — which the handler swallowed, so the device got
@@ -884,14 +869,103 @@ def test_screencast_frame_encodes_from_a_surface(tmp_home: Path) -> None:
     app = App(platform=FakePlatform(tmp_home), renderer=renderer)
     lcd = next(p for p in ALL_DEVICES.values() if p.kind is Kind.LCD)
 
-    # A surface exactly as the capture tick produces one.
-    surface = renderer.from_raw_rgb24(
-        RawFrame(data=bytes(64 * 48 * 3), width=64, height=48),
-    )
-
     data = app.display.build_screencast_frame(
-        info=lcd, frame=renderer.to_raw_rgb24(surface),
+        info=lcd, frame=RawFrame(data=bytes(64 * 48 * 3), width=64, height=48),
     )
 
     assert isinstance(data, bytes)
     assert len(data) > 0, "no wire bytes produced from a captured surface"
+
+
+# ── App.dispatch connects a USES_DEVICE Command's device (2026-09-26) ────
+#
+# Each UI used to decide "connect first" itself: the CLI before 21 commands,
+# the API before 9 routes, and 6 routes not at all -- a verb that worked in the
+# CLI failed over the API with "Not attached".  Now the Command declares it.
+
+def _fresh(tmp_home: Path) -> tuple[App, FakePlatform]:
+    platform = FakePlatform(tmp_home)
+    platform.scsi.read_script.append(_scsi_poll_response(100))
+    return App(platform=platform, renderer=RecordingRenderer()), platform
+
+
+def test_a_wire_command_connects_its_own_device(tmp_home: Path) -> None:
+    app, _ = _fresh(tmp_home)
+
+    result = app.dispatch(SendColor(key="0402:3922", r=0, g=0, b=255))
+
+    assert result.ok is True
+    assert app.devices["0402:3922"].is_connected
+
+
+def test_a_command_that_does_not_use_the_device_connects_nothing(
+    tmp_home: Path,
+) -> None:
+    from trcc.core.commands import SetBrightness
+
+    app, _ = _fresh(tmp_home)
+
+    app.dispatch(SetBrightness(key="0402:3922", percent=50))
+
+    assert app.devices == {}
+
+
+def test_no_per_tick_command_connects_a_device() -> None:
+    """A per-tick Command that connected would retry a failed USB handshake at
+    frame rate while a panel is unplugged; hotplug and the loops own that."""
+    import inspect
+    import logging
+
+    import trcc.core.commands as C
+    from trcc.core.commands._base import Command
+
+    per_tick_that_connect = sorted(
+        name for name, cls in vars(C).items()
+        if inspect.isclass(cls) and issubclass(cls, Command)
+        and cls.LOG_LEVEL <= logging.DEBUG and cls.USES_DEVICE)
+    assert per_tick_that_connect == []
+
+
+def test_closing_does_not_try_to_connect_an_unconnected_panel(
+    tmp_home: Path,
+) -> None:
+    """SleepDevice uses its device, so sleeping a panel whose connect failed
+    would retry the connect -- handshake retries and all -- on the way out."""
+    from trcc.core.commands import EnsureConnected
+
+    app, platform = _fresh(tmp_home)
+    app.attach(0x0402, 0x3922)
+    tried: list[str] = []
+    real = app.dispatch
+
+    def spy(cmd: Any) -> Any:
+        tried.append(type(cmd).__name__)
+        return real(cmd)
+
+    app.dispatch = spy                      # type: ignore[method-assign]
+    app.close()
+
+    assert EnsureConnected.__name__ not in tried
+    assert "SleepDevice" not in tried
+
+
+def test_a_tolerant_command_still_saves_when_the_device_will_not_open(
+    tmp_home: Path,
+) -> None:
+    """The connect is an ATTEMPT, never a gate: LoadImage keeps the choice
+    when the panel refuses to open, exactly as it did with no device."""
+    from trcc.core.commands import LoadImage
+
+    app, platform = _fresh(tmp_home)
+    png = tmp_home / "pick.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    def refuse(*a: object, **k: object) -> None:
+        raise PermissionError("Permission denied: '/dev/sg1'")
+
+    platform.open_transport = refuse        # type: ignore[method-assign]
+
+    result = app.dispatch(LoadImage(key="0402:3922", path=png))
+
+    assert result.ok is True
+    assert app.settings.for_device("0402:3922").current_theme

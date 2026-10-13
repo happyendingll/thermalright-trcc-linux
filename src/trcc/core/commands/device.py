@@ -2,14 +2,18 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, replace
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
+from .. import toolchain
 from ..errors import (
     DeviceNotConnectedError,
     DeviceNotFoundError,
     HandshakeError,
+    PermissionError_,
     ThemeError,
     TransportError,
     TrccError,
@@ -23,6 +27,7 @@ from ..events import (
     ErrorOccurred,
     FitModeChanged,
     FrameSent,
+    GameModeEngaged,
     MaskApplied,
     MaskPositionChanged,
     MaskVisibilityChanged,
@@ -31,6 +36,8 @@ from ..events import (
     ScreencastStarted,
     ScreencastStopped,
     SplitModeChanged,
+    VideoAdvanced,
+    VideoPauseChanged,
     VideoStarted,
     VideoStopped,
 )
@@ -39,16 +46,19 @@ from ..models import (
     OVERLAY_DEFAULT_COLOR,
     OVERLAY_DEFAULT_FORMAT,
     OVERLAY_DEFAULT_SIZE,
-    SCREENCAST_TICK_S,
+    STREAM_SCHEMES,
+    STREAM_TICK_S,
     FitMode,
     HandshakeResult,
     OverlayElement,
     RawFrame,
     ThemeDir,
     Wire,
+    new_overlay_id,
     oriented_resolution,
+    parse_device_key,
 )
-from ..protocol import artwork_variant, mask_variant, pm_to_fbl
+from ..protocol import DEFAULT_PROFILE, artwork_variant, mask_variant, pm_to_fbl
 from ..registry import find_product
 from ..results import (
     BackgroundModeResult,
@@ -64,6 +74,8 @@ from ..results import (
     DisconnectResult,
     DiscoverResult,
     FitModeResult,
+    GameModeResult,
+    GameModeTickResult,
     LcdSnapshotResult,
     LoopVideoResult,
     MaskApplyResult,
@@ -71,7 +83,6 @@ from ..results import (
     MaskVisibilityResult,
     MediaPlayerResult,
     OrientationResult,
-    OrientedThemeTargetResult,
     OverlayBackgroundResult,
     OverlayConfigResult,
     OverlayElementDeleteResult,
@@ -81,6 +92,7 @@ from ..results import (
     PauseVideoResult,
     PreviewResult,
     PreviewSizeResult,
+    RecentColorsResult,
     RenderDcResult,
     RenderResult,
     ScreencastResult,
@@ -91,15 +103,26 @@ from ..results import (
     VideoResult,
     VideoStatusResult,
 )
+from ..variants import covers_several_coolers
 from ._base import Command, Query
 from ._helpers import (
+    _drive_game_mode,
     _element_to_entry,
+    _game_row,
     _invalidate_scene,
+    _lacks,
+    _live_sensors,
+    _publish_game_mode,
     _publish_if_disconnect,
+    _rendered_surface,
     _require_connected_device,
     _resolve_mask_path,
+    _theme_directories,
     native_canvas,
     resolve_overlay_layout,
+    screencast_box,
+    seed_screencast_rect,
+    store_screencast_box,
 )
 
 if TYPE_CHECKING:
@@ -107,7 +130,7 @@ if TYPE_CHECKING:
     from ..ports import Device
 
 from ..logs import per_frame
-from ..models import MEDIA, MediaKind
+from ..models import MEDIA, Capability, MediaKind
 from ..ports import CaptureNotReady
 
 log = logging.getLogger(__name__)
@@ -118,11 +141,13 @@ frame_log = per_frame(__name__)
 class DiscoverDevices(Command[DiscoverResult]):
     """List attached devices that match the product registry.
 
-    Also kicks off a per-resolution data install for each discovered
-    product the first time we see that resolution — so the GUI's theme
-    / web preview / mask grids aren't empty on first launch.  Subsequent
-    discoveries are no-ops because ``DataInstallService`` short-circuits
-    on already-populated dirs.
+    Installs NO data.  Discovery never handshakes, so all it knows of a
+    device is its registry row, and three rows still guess a size one USB id
+    cannot know (0402:3922, 87ad:70db, 87cd:70db).  It used to install for
+    that guess, without the variant library either: measured 2026-10-06, an
+    854x480 87ad:70db fetched 38.5 MB of 480x480 data ahead of its real
+    26 MB in the one-worker queue (#300 was the same shape).  ConnectDevice
+    installs for the handshake's resolution and variants, ~0.1 s later.
     """
 
     def execute(self, app: App) -> DiscoverResult:
@@ -131,35 +156,45 @@ class DiscoverDevices(Command[DiscoverResult]):
         # Cache the fingerprints so ConnectDevice→attach can resolve per-device
         # firmware quirks (bcdDevice isn't in the static registry).  (#228)
         app.remember_scan(live)
-        products = []
-        seen_resolutions: set[tuple[int, int]] = set()
+        products, units = [], []
         for info in live:
             product = find_product(info.vid, info.pid)
             if product is not None:
                 products.append(product)
+                units.append(info)
                 app.events.publish(DeviceDiscovered(
                     key=info.key, product_name=product.product,
                 ))
-                if product.native_resolution != (0, 0):
-                    seen_resolutions.add(product.native_resolution)
-        # One install pass per unique resolution, handed to the background
-        # runner: discovery must not wait on ~30 MB of archives, and the
-        # runner de-duplicates so ConnectDevice re-submitting the same panel
-        # costs nothing.  Grids fill in when ``DataInstalled`` lands.  (#275)
-        for resolution in seen_resolutions:
-            app.data_install_runner.submit(resolution)
-        log.info(
-            "DiscoverDevices: %d live, %d recognised, resolutions=%s",
-            len(live), len(products), sorted(seen_resolutions),
-        )
+        log.info("DiscoverDevices: %d live, %d recognised", len(live),
+                 len(products))
         return DiscoverResult(
             ok=True,
             message=f"{len(products)} device(s) found",
             products=products,
-            devices=live,
+            devices=units,
+            several_coolers=[u.key for u in units
+                             if covers_several_coolers(u.vid, u.pid)],
         )
 
-def _suspended_panel_hints(app: App, vid: int, pid: int) -> list[str]:
+def _connect_failure_hints(app: App, error: Exception, vid: int, pid: int,
+                           unit: str) -> list[str]:
+    """What to tell the user when a connect fails with *error*.
+
+    The OS's standing checks, then its advice for a REFUSED open -- the
+    transport says what was refused; why, and the fix, are per-OS (udev on
+    Linux, WinUSB on Windows, #173) -- then the sleeping-panel note (#150).
+    """
+    hints = app.platform.check_permissions()
+    if isinstance(error, PermissionError_):
+        hints.append(app.platform.permission_denied_hint())
+    hints += _suspended_panel_hints(app, vid, pid, unit)
+    log.info("_connect_failure_hints: %s -> %d hint(s)", type(error).__name__,
+             len(hints))
+    return hints
+
+
+def _suspended_panel_hints(app: App, vid: int, pid: int,
+                           unit: str) -> list[str]:
     """Explain a failed handshake when the panel is merely ASLEEP.
 
     A USB-suspended panel and a dead one produce the identical error --
@@ -174,7 +209,7 @@ def _suspended_panel_hints(app: App, vid: int, pid: int) -> list[str]:
     a diagnostic must never become the thing that breaks the diagnosis.
     """
     try:
-        power = app.platform.usb_power_state(vid, pid)
+        power = app.platform.usb_power_state(vid, pid, unit)
     except Exception:
         log.exception("_suspended_panel_hints: usb_power_state raised")
         return []
@@ -198,7 +233,8 @@ class ConnectDevice(Command[ConnectResult]):
     key: str
 
     def _handshake_with_quirk_retry(self, app: App, device: Device,
-                                    vid: int, pid: int) -> HandshakeResult:
+                                    vid: int, pid: int,
+                                    unit: str) -> HandshakeResult:
         """Handshake, retrying once on a firmware's overriding transport.
 
         The override goes SECOND, never first.  It is keyed on
@@ -219,8 +255,8 @@ class ConnectDevice(Command[ConnectResult]):
             log.info("ConnectDevice %s: ordinary transport failed (%s) — "
                      "retrying on the firmware's HID output-report transport",
                      self.key, e)
-            app.detach(self.key)
-            retried = app.attach(vid, pid, quirk_transport=True)
+            app.release_device(self.key)    # the device, not what it shows
+            retried = app.attach(vid, pid, quirk_transport=True, unit=unit)
             result = retried.connect()
             log.info("ConnectDevice %s: the quirk transport handshook where "
                      "the ordinary one did not", self.key)
@@ -228,25 +264,25 @@ class ConnectDevice(Command[ConnectResult]):
 
     def execute(self, app: App) -> ConnectResult:
         try:
-            vid_str, pid_str = self.key.split(":")
-            vid, pid = int(vid_str, 16), int(pid_str, 16)
+            vid, pid, unit = parse_device_key(self.key)
         except ValueError:
             return ConnectResult(
                 ok=False, key=self.key,
-                message=f"Invalid device key: {self.key!r} (expected 'vvvv:pppp')",
+                message=(f"Invalid device key: {self.key!r} "
+                         "(expected 'vvvv:pppp' or 'vvvv:pppp@unit')"),
             )
 
         try:
-            device = app.attach(vid, pid)
+            device = app.attach(vid, pid, unit=unit)
         except DeviceNotFoundError as e:
             hints = app.platform.check_permissions()
             app.events.publish(ErrorOccurred(message=str(e), kind="not_found",
                                              key=self.key, hints=hints))
             result = ConnectResult(ok=False, key=self.key, message=str(e),
                                    hints=hints)
-            app.note_connect_issue(result)
+            app.note_connect_issue(result, permanent=True)
             return result
-        except (ImportError, OSError) as e:
+        except (ImportError, OSError, TransportError) as e:
             # Building the transport can fail for reasons that are the user's
             # environment, not a missing device: a firmware quirk selects the
             # HID output-report transport, and hidapi may be absent or be the
@@ -254,6 +290,11 @@ class ConnectDevice(Command[ConnectResult]):
             # (#244, #253).  Those raise from the transport constructor, and an
             # uncaught raise here takes the GUI down instead of telling anyone
             # what to install — so report it like any other connect failure.
+            # ``TransportError`` is the SCSI node not existing (yet): a usb add
+            # arrives ~1 s before usb-storage creates /dev/sgN, and a panel a
+            # VM holds has none.  It used to escape this Command — and every
+            # Command that connects first — as an exception, with no issue
+            # recorded for any UI to show.
             hints = app.platform.check_permissions()
             log.warning("ConnectDevice %s: transport unavailable — %s",
                         self.key, e)
@@ -261,32 +302,38 @@ class ConnectDevice(Command[ConnectResult]):
                                              key=self.key, hints=hints))
             result = ConnectResult(ok=False, key=self.key, message=str(e),
                                    hints=hints)
-            app.note_connect_issue(result)
+            # A missing library or a denied open stays that way until the user
+            # acts; a node that is not there yet does not.
+            app.note_connect_issue(
+                result, permanent=isinstance(e, (ImportError, PermissionError_)))
             return result
 
         try:
-            handshake = self._handshake_with_quirk_retry(app, device, vid, pid)
+            handshake = self._handshake_with_quirk_retry(app, device, vid, pid,
+                                                         unit)
             device = app.devices[self.key]      # the retry may have rebuilt it
         except (HandshakeError, TransportError, ImportError, OSError) as e:
-            app.detach(self.key)   # clears any prior issue for this key first
-            hints = app.platform.check_permissions()
-            hints += _suspended_panel_hints(app, vid, pid)
+            # The device only: a retry that fails here must not throw away what
+            # the panel is coming back to (its theme, a cast, a slideshow).
+            app.release_device(self.key)
+            hints = _connect_failure_hints(app, e, vid, pid, unit)
             app.events.publish(ErrorOccurred(message=str(e), kind="handshake",
                                              key=self.key, hints=hints))
             result = ConnectResult(ok=False, key=self.key, message=str(e),
                                    hints=hints)
-            app.note_connect_issue(result)
+            app.note_connect_issue(
+                result, permanent=isinstance(e, PermissionError_))
             return result
 
         # Variant override: handshake reveals the PM/SUB fingerprint, which
         # disambiguates products sharing one (VID, PID).  Patch the device's
-        # ProductInfo with the resolved button_image / panel_cutout so the
-        # GUI sidebar shows the right product picture and the renderer
-        # masks any panel cutout.  Without this, every device falls back to
-        # the registry default (A1CZTV "ransom" button).
+        # ProductInfo with the resolved button_image so the GUI sidebar
+        # shows the right product picture.  Without this, every device falls
+        # back to the registry default (A1CZTV "ransom" button).
         from dataclasses import replace as _dc_replace
 
         from ..variants import get_variant_override
+        catalog_product = device.info.product
         override = get_variant_override(
             vid, pid, handshake.pm_byte, handshake.sub_byte,
         )
@@ -294,8 +341,6 @@ class ConnectDevice(Command[ConnectResult]):
             patch: dict[str, object] = {}
             if override.button_image:
                 patch["button_image"] = override.button_image
-            if override.panel_cutout is not None:
-                patch["panel_cutout"] = override.panel_cutout
             if override.display_name:
                 # The registry's ``product`` is one string for a USB id that
                 # covers dozens of coolers, so it names the wrong one for most
@@ -336,9 +381,9 @@ class ConnectDevice(Command[ConnectResult]):
                 )
 
         # Install theme/cloud/mask data for the HANDSHAKE-resolved resolution.
-        # Non-square bulk panels report native_resolution=(0,0) and only learn
-        # their real size here, so DiscoverDevices' static-resolution pass
-        # skipped them — they'd have no data on disk.  ensure_all installs BOTH
+        # This is the only install a device gets: DiscoverDevices never
+        # handshakes, so it cannot know the size or the variant library
+        # (2026-10-06).  ensure_all installs BOTH
         # orientations for non-square panels (so portrait themes/masks exist).
         #
         # SUBMITTED, not called: this is the port of legacy's
@@ -379,11 +424,35 @@ class ConnectDevice(Command[ConnectResult]):
         app.events.publish(DeviceConnected(
             key=self.key, resolution=handshake.resolution,
         ))
+        _warn_if_it_cannot_draw(app, self.key, device)
+        log.info("ConnectDevice %s: %s %dx%d (catalog: %s)", self.key,
+                 device.info.product, w, h, catalog_product)
         return ConnectResult(
             ok=True, key=self.key,
-            message=f"Connected: {handshake.resolution}",
+            message=f"Connected: {device.info.product} {w}x{h}",
             handshake=handshake,
+            product=device.info.product, catalog_product=catalog_product,
         )
+
+
+def _warn_if_it_cannot_draw(app: App, key: str, device: Any) -> None:
+    """An LCD that connected to an App started with only LED coolers.
+
+    That App loaded no renderer (#299), and Qt cannot be started now: off
+    the main thread it crashes the process at exit.  Say so where the user
+    is looking, rather than leave the panel dark.
+    """
+    if (Capability.FRAME_RENDER not in device.info.capabilities
+            or app.has_renderer):
+        return
+    log.warning("_warn_if_it_cannot_draw: %s — no renderer, TRCC started "
+                "with only LED coolers", key)
+    app.events.publish(ErrorOccurred(
+        message=(f"{device.info.product} appeared after TRCC started with "
+                 "only LED coolers, so it has nothing to draw with. Restart "
+                 "TRCC (trcc kill, then open it again) to drive this panel."),
+        kind="render", key=key,
+    ))
 
 
 @dataclass(frozen=True, slots=True)
@@ -411,7 +480,9 @@ class EnsureConnected(Command[ConnectResult]):
                 message=f"{self.key} already connected",
             )
         log.info("EnsureConnected %s: not connected — attaching", self.key)
-        return app.dispatch(ConnectDevice(key=self.key))
+        # The App's one connect path, not a ConnectDevice of its own: the
+        # reconnect watcher may be connecting this panel right now.
+        return app.connect_unit(self.key)
 
 
 @dataclass(frozen=True, slots=True)
@@ -456,15 +527,42 @@ class DisconnectDevice(Command[DisconnectResult]):
         # NOT hoisted into ``App.detach``: that also runs on ConnectDevice's
         # quirk retry and on a failed handshake, where the panel must not be
         # written to at all.  Hotplug removal never reaches either — it goes
-        # ``_on_device_detached`` -> ``_release_stale_device`` -> the transport
+        # ``_on_device_detached`` -> ``release_device`` -> the transport
         # — so an unplugged device is not asked to accept a farewell frame.
         blank = SleepDevice(key=self.key).execute(app)
         if not blank.ok:
             log.debug("DisconnectDevice %s: blank skipped — %s",
                       self.key, blank.message)
         app.detach(self.key)
+        # The user let it go: never bring it back behind their back.
+        app.stop_watching(self.key, forget=True)
         app.events.publish(DeviceDisconnected(key=self.key))
         return DisconnectResult(ok=True, key=self.key, message="Disconnected")
+
+def _take_over_panel(app: App, key: str) -> None:
+    """Hand *key*'s panel to a one-shot push until the next theme load.
+
+    A frame sent once lasted one sensor tick: the active theme re-rendered
+    over it (#306), and so did video, a slideshow rotation and a ``/tick``
+    poll.  So the theme is dropped and any video stopped — both IN MEMORY; the
+    saved theme and background stay — and the key goes into ``App.held``,
+    which every implicit producer checks.  ``LoadTheme`` and detach release it.
+
+    Before the frame is BUILT: ``StopVideo`` wipes the scene cache the build
+    parks its preview in.  Theme before video: ``StopVideo`` publishes
+    ``VideoStopped``, which the render observer turns into a theme render — a
+    wasted frame flashed ahead of the push.  Already held is a no-op, so a
+    script streaming frames pays for the takeover once, not per frame.
+    """
+    if key in app.held:
+        log.debug("_take_over_panel: %s already held", key)
+        return
+    paused = app.active_themes.pop(key, None)
+    app.dispatch(StopVideo(key=key, keep_override=True))
+    app.held.add(key)
+    log.info("_take_over_panel: %s held (theme paused: %s)", key,
+             paused.name if paused is not None else "none active")
+
 
 @dataclass(frozen=True, slots=True)
 class SendFrame(Command[SendResult]):
@@ -478,15 +576,20 @@ class SendFrame(Command[SendResult]):
     """
     LOG_LEVEL: ClassVar[int] = logging.DEBUG
     key: str
-    data: bytes
+    #: Out of the repr — ``App.dispatch`` logs ``dispatch %r`` and this
+    #: is a whole wire frame.
+    data: bytes = field(repr=False)
 
     def execute(self, app: App) -> SendResult:
         log.debug("execute: app=%s", app)
+        if why := _lacks(app, self.key, Capability.FRAME_RENDER):
+            return SendResult(ok=False, key=self.key, message=why)
         try:
             _require_connected_device(app, self.key)
         except (DeviceNotFoundError, DeviceNotConnectedError) as e:
             return SendResult(ok=False, key=self.key, connected=False,
                               message=str(e))
+        _take_over_panel(app, self.key)
         try:
             ok = app.send(self.key, self.data)
         except TransportError as e:
@@ -514,6 +617,7 @@ class SendColor(Command[SendResult]):
     handshake-derived profile → DisplayService.build_solid_color_frame →
     Device.send.
     """
+    USES_DEVICE: ClassVar[bool] = True
     key: str
     r: int
     g: int
@@ -527,6 +631,9 @@ class SendColor(Command[SendResult]):
                     ok=False, key=self.key, bytes_sent=0,
                     message=f"{label} out of range (0-255): {value}",
                 )
+        if why := _lacks(app, self.key, Capability.FRAME_RENDER):
+            return SendResult(ok=False, key=self.key, bytes_sent=0,
+                              message=why)
 
         try:
             device = _require_connected_device(app, self.key)
@@ -534,6 +641,7 @@ class SendColor(Command[SendResult]):
             return SendResult(ok=False, key=self.key, bytes_sent=0,
                               connected=False, message=str(e))
 
+        _take_over_panel(app, self.key)
         try:
             frame = app.display.build_solid_color_frame(
                 info=device.info,
@@ -551,7 +659,10 @@ class SendColor(Command[SendResult]):
 
         bytes_sent = len(frame) if ok else 0
         if ok:
-            app.events.publish(FrameSent(key=self.key, bytes_sent=bytes_sent))
+            app.events.publish(FrameSent(
+                key=self.key, bytes_sent=bytes_sent,
+                surface=app.display.rendered_surface(self.key),
+            ))
         return SendResult(
             ok=ok, key=self.key, bytes_sent=bytes_sent, connected=True,
             message=(f"Sent {bytes_sent} bytes "
@@ -577,6 +688,7 @@ class SleepDevice(Command[SendResult]):
     a device mid-unplug returns ``ok=False`` instead of raising, so it can
     never abort ``App.close`` mid-shutdown.
     """
+    USES_DEVICE: ClassVar[bool] = True
     key: str
 
     def execute(self, app: App) -> SendResult:
@@ -622,15 +734,23 @@ class SendImage(Command[SendResult]):
     Distinct from :class:`LoadImage` — that materialises a single-image
     theme directory under ``user_content_dir/single-image/`` and
     updates ``DeviceSettings.current_theme``.  ``SendImage`` is the
-    no-persist variant: open, resize, encode, send — once, no theme,
-    no settings mutation.  Used by API/CLI ``send-image`` uploads where
-    the caller wants ephemeral display (boot logos, splash screens,
-    quick previews).
+    no-persist variant: nothing written to disk, no settings mutation.
+    Dispatched by CLI ``display send-image`` and API ``/send-image``.
+
+    **The push takes the panel over until the next theme load**
+    (:func:`_take_over_panel`, shared with ``SendColor`` / ``SendFrame``) —
+    sending once lasted one sensor tick (#306).  A theme load, a restart or a
+    reconnect gives the panel back; ``RestoreDeviceState`` does not.  Keepalive
+    resends the pushed frame and :class:`BuildPreview` shows it.  A
+    screencast is refused rather than stopped: stopping one clears its saved
+    region.  (Only here: ``SleepDevice`` goes through ``SendColor``, and
+    ``App.close`` must still blank a panel whose screencast region is saved.)
 
     Acceptable extensions: PNG / JPG / JPEG / BMP / WEBP.  Honors
     per-device brightness + orientation + device-side rotation via
     ``DisplayService.build_image_frame``.
     """
+    USES_DEVICE: ClassVar[bool] = True
     key: str
     path: Path
 
@@ -649,11 +769,23 @@ class SendImage(Command[SendResult]):
                     f"supported: {', '.join(sorted(MEDIA.exts(MediaKind.IMAGE)))}"
                 ),
             )
+        if why := _lacks(app, self.key, Capability.FRAME_RENDER):
+            return SendResult(ok=False, key=self.key, bytes_sent=0,
+                              message=why)
         try:
             device = _require_connected_device(app, self.key)
         except (DeviceNotFoundError, DeviceNotConnectedError) as e:
             return SendResult(ok=False, key=self.key, bytes_sent=0,
                               connected=False, message=str(e))
+        if app.settings.for_device(self.key).screencast_region is not None:
+            log.warning("SendImage: %s is screencasting — push refused",
+                        self.key)
+            return SendResult(
+                ok=False, key=self.key, bytes_sent=0, connected=True,
+                message=f"A screencast owns {self.key} — stop it first",
+            )
+
+        _take_over_panel(app, self.key)
 
         try:
             frame = app.display.build_image_frame(
@@ -673,7 +805,10 @@ class SendImage(Command[SendResult]):
 
         bytes_sent = len(frame) if ok else 0
         if ok:
-            app.events.publish(FrameSent(key=self.key, bytes_sent=bytes_sent))
+            app.events.publish(FrameSent(
+                key=self.key, bytes_sent=bytes_sent,
+                surface=app.display.rendered_surface(self.key),
+            ))
         return SendResult(
             ok=ok, key=self.key, bytes_sent=bytes_sent, connected=True,
             message=(f"Sent {bytes_sent} bytes from {self.path.name}"
@@ -696,6 +831,8 @@ class RenderAndSend(Command[RenderResult]):
     key: str
 
     def execute(self, app: App) -> RenderResult:
+        if why := _lacks(app, self.key, Capability.FRAME_RENDER):
+            return RenderResult(ok=False, key=self.key, message=why)
         try:
             device = _require_connected_device(app, self.key)
         except (DeviceNotFoundError, DeviceNotConnectedError) as e:
@@ -704,9 +841,13 @@ class RenderAndSend(Command[RenderResult]):
 
         theme = app.active_themes.get(self.key)
         if theme is None:
+            # Held is not a failure: every render timer asks each tick, and
+            # ok=False logged a WARNING per tick while a push held the panel.
+            held = self.key in app.held
             return RenderResult(
-                ok=False, key=self.key, connected=True,
-                message="No active theme — dispatch LoadTheme first",
+                ok=held, key=self.key, connected=True,
+                message=("held by a pushed frame" if held
+                         else "No active theme — dispatch LoadTheme first"),
             )
 
         # Personalize raw readings here so the renderer receives the
@@ -714,13 +855,7 @@ class RenderAndSend(Command[RenderResult]):
         # SensorsUpdated subscribers see.  Single conversion site for
         # the entire metrics path — matches legacy's
         # ``PollingMetricsLoop._poll_metrics`` shape.
-        from ...services.metrics_personalize import personalize_readings
-        s = app.settings.app
-        sensors = personalize_readings(
-            app.platform.sensors().read_all(),
-            temp_unit=s.temp_unit,
-            hdd_enabled=s.hdd_enabled,
-        )
+        sensors = _live_sensors(app)
 
         try:
             frame = app.display.build_frame(
@@ -787,13 +922,13 @@ class CurrentFrame(Query[PreviewResult]):
     def execute(self, app: App) -> PreviewResult:
         surface = app.display.rendered_surface(self.key)
         if surface is None:
-            log.debug("CurrentFrame: %s has no cached frame", self.key)
+            frame_log.debug("CurrentFrame: %s has no cached frame", self.key)
             return PreviewResult(
                 ok=True, key=self.key,
                 message="No frame rendered yet",
             )
         width, height = app.renderer.surface_size(surface)
-        log.debug("CurrentFrame: %s → cached %dx%d surface",
+        frame_log.debug("CurrentFrame: %s → cached %dx%d surface",
                   self.key, width, height)
         return PreviewResult(
             ok=True, key=self.key, surface=surface,
@@ -836,7 +971,7 @@ class TickDisplay(Command[RenderResult]):
         if playback is None or not playback.frames:
             # No video on this device — a plain re-render.  Video fields stay
             # None so a UI can tell "not a video" from "frame 0 of a video".
-            log.debug("TickDisplay %s: no playback — plain render", self.key)
+            frame_log.debug("TickDisplay %s: no playback — plain render", self.key)
             return app.dispatch(RenderAndSend(key=self.key))
 
         # ``Playback.advance`` self-guards on ``paused`` (returns the current
@@ -852,6 +987,10 @@ class TickDisplay(Command[RenderResult]):
             playback.interval_ms, playback.paused,
         )
         result = app.dispatch(RenderAndSend(key=self.key))
+        app.events.publish(VideoAdvanced(
+            key=self.key, cursor=playback.cursor,
+            frame_count=playback.frame_count, fps=playback.fps,
+        ))
         return replace(
             result,
             cursor=playback.cursor,
@@ -900,10 +1039,23 @@ class BuildPreview(Query[PreviewResult]):
             device = app.get(self.key)
         except DeviceNotFoundError as e:
             return PreviewResult(ok=False, key=self.key, message=str(e))
+        if why := _lacks(app, self.key, Capability.FRAME_RENDER):
+            return PreviewResult(ok=False, key=self.key, message=why)
 
         theme = app.active_themes.get(self.key)
+        theme_name = theme.name if theme is not None else ""
+        # The frame the panel last got IS the preview, whatever made it: the
+        # theme, a screen cast, a stream, a pushed image (#306).  Re-rendering
+        # the theme instead showed the theme while a cast owned the glass.
+        # Every change that alters the picture drops this frame
+        # (``_invalidate_scene``), and then the theme is rendered below.
+        if _rendered_surface(app, self.key) is not None:
+            frame_log.debug("BuildPreview: %s previews the frame it was sent",
+                            self.key)
+            return self._finish(app, partial(_rendered_surface, app, self.key),
+                                theme_name)
         if theme is None:
-            log.debug("BuildPreview: %s has no active theme", self.key)
+            frame_log.debug("BuildPreview: %s has no active theme", self.key)
             return PreviewResult(
                 ok=True, key=self.key,
                 message="No active theme — nothing to preview",
@@ -912,19 +1064,26 @@ class BuildPreview(Query[PreviewResult]):
         # Same personalization the wire path applies (RenderAndSend, and
         # SaveTheme when it snapshots the thumbnail): sources deliver °C and
         # every disk key, the user's prefs are applied once, here.
-        from ...services.metrics_personalize import personalize_readings
-        s = app.settings.app
-        sensors = personalize_readings(
-            app.platform.sensors().read_all(),
-            temp_unit=s.temp_unit,
-            hdd_enabled=s.hdd_enabled,
-        )
+        sensors = _live_sensors(app)
+        return self._finish(app, partial(
+            app.display.build_preview_surface,
+            info=device.info, theme=theme, sensors=sensors,
+            profile=device.profile,
+        ), theme.name)
 
+    def _finish(self, app: App, build: Callable[[], Any],
+                theme_name: str) -> PreviewResult:
+        """Build the surface, then encode + sample it into the Result.
+
+        One tail for both sources — the frame the panel was sent and the
+        active theme's render — so they cannot answer in different shapes.
+        An empty *theme_name* is a frame with no theme under it (a pushed
+        image).
+        """
+        label = theme_name or "the pushed image"
+        frame_log.debug("BuildPreview %s: finishing a preview of %s", self.key, label)
         try:
-            surface = app.display.build_preview_surface(
-                info=device.info, theme=theme, sensors=sensors,
-                profile=device.profile,
-            )
+            surface = build()
             width, height = app.renderer.surface_size(surface)
             image, media_type = self._encode(app, surface)
             pixels = self._sample(app, surface, width, height)
@@ -937,27 +1096,27 @@ class BuildPreview(Query[PreviewResult]):
             log.warning("BuildPreview %s: render raised — %s: %s",
                         self.key, type(e).__name__, e)
             return PreviewResult(
-                ok=False, key=self.key, theme_name=theme.name,
+                ok=False, key=self.key, theme_name=theme_name,
                 message=f"Preview render failed — {type(e).__name__}: {e}",
             )
 
-        log.debug(
+        frame_log.debug(
             "BuildPreview %s: theme=%s %dx%d encode=%s bytes=%d grid=%s",
-            self.key, theme.name, width, height,
+            self.key, label, width, height,
             self.encode or "none", len(image),
             f"{self.sample_cols}x{len(pixels)}" if pixels else "none",
         )
         return PreviewResult(
             ok=True, key=self.key, surface=surface,
             image=image, media_type=media_type,
-            width=width, height=height, theme_name=theme.name,
+            width=width, height=height, theme_name=theme_name,
             pixels=pixels,
-            message=f"Preview {width}x{height} of {theme.name}",
+            message=f"Preview {width}x{height} of {label}",
         )
 
     def _encode(self, app: App, surface: Any) -> tuple[bytes, str]:
         """Encode *surface* to the requested container, or nothing at all."""
-        log.debug("BuildPreview %s: encode=%s", self.key, self.encode or "none")
+        frame_log.debug("BuildPreview %s: encode=%s", self.key, self.encode or "none")
         if self.encode == "png":
             return app.display.encode_png(surface), "image/png"
         if self.encode == "jpeg":
@@ -978,7 +1137,7 @@ class BuildPreview(Query[PreviewResult]):
         rows = max(2, round(self.sample_cols * height / width) if width else 2)
         if rows % 2:
             rows += 1
-        log.debug("BuildPreview %s: sampling %dx%d grid from %dx%d surface",
+        frame_log.debug("BuildPreview %s: sampling %dx%d grid from %dx%d surface",
                   self.key, self.sample_cols, rows, width, height)
         return app.renderer.get_pixels_rgb(surface, self.sample_cols, rows)
 
@@ -1061,6 +1220,37 @@ class RenderDcStandalone(Command[RenderDcResult]):
                      f"{self.output_path} ({self.width}x{self.height})"),
         )
 
+def _theme_under_background(app: App, key: str) -> str:
+    """A background is the background OF a theme: give *key* one if it has none.
+
+    ``PlayVideo`` and ``SetBackground`` fill the one background slot the
+    active theme composes (the media player and cloud videos arrive through
+    ``PlayVideo``).  With no theme -- after a push (``display color`` drops it),
+    or on a panel whose session never loaded one -- they reported success and
+    the render refused every frame: "No active theme", 0 frames sent, and
+    after a push not even a warning.  The C# has no theme-less state ("there
+    is always a folder"), and a restart shows the saved theme under the saved
+    background, so that is what the panel gets now too.  Loading the theme
+    also ends a push's hold.
+
+    Returns ``""`` once a theme is active, else why none could be shown.
+    """
+    if key in app.active_themes:
+        log.debug("_theme_under_background: %s has a theme", key)
+        return ""
+    from .theme import _show_saved_theme  # theme.py imports this module
+    log.info("_theme_under_background: %s has no theme — showing its saved "
+             "one under the background", key)
+    _show_saved_theme(app, key)
+    if key in app.active_themes:
+        return ""
+    log.warning("_theme_under_background: %s — no theme is installed to show "
+                "a background on", key)
+    return (f"{key} has no theme to show a background on, and none is "
+            "installed — install themes, or use load-video / load-image to "
+            "show a file on its own")
+
+
 @dataclass(frozen=True, slots=True)
 class PlayVideo(Command[VideoResult]):
     """Decode a video into a per-device playback override.
@@ -1076,6 +1266,7 @@ class PlayVideo(Command[VideoResult]):
     ``info.native_resolution`` pre-handshake) so frames are pre-scaled
     for the wire.
     """
+    USES_DEVICE: ClassVar[bool] = True
     key: str
     path: Path
     fps: int = 15
@@ -1115,6 +1306,12 @@ class PlayVideo(Command[VideoResult]):
                         self.key, e)
             return VideoResult(ok=False, key=self.key, path=str(self.path),
                                 message=str(e))
+        if why := _lacks(app, self.key, Capability.FRAME_RENDER):
+            return VideoResult(ok=False, key=self.key, path=str(self.path),
+                               message=why)
+        if why := _theme_under_background(app, self.key):
+            return VideoResult(ok=False, key=self.key, path=str(self.path),
+                               message=why)
 
         if device.profile is not None:
             canvas_size = device.profile.resolution
@@ -1128,15 +1325,13 @@ class PlayVideo(Command[VideoResult]):
         orientation = app.settings.for_device(self.key).orientation
         canvas_size = oriented_resolution(canvas_size, orientation)
 
-        # User-made assets in ``user_content_dir`` (``~/.trcc-user/data/``)
-        # decode at NATIVE so the render pipeline's fit-mode (width /
-        # height / stretch) actually has something to scale.  Program /
-        # cloud assets under ``data_dir`` are pre-authored at the
-        # device's canvas resolution, so they keep the canvas-size
-        # decode (no rescale work for ffmpeg, and ``.zt`` is fixed-size
-        # by format).  Anything outside both trees (ad-hoc playback of
-        # an arbitrary file) defaults to canvas-size too — the user
-        # would need to save it as a theme first to get fit-mode.
+        # The user's videos decode at NATIVE so the render pipeline's
+        # fit-mode (width / height / stretch) actually has something to
+        # scale.  Program / cloud assets under ``data_dir`` are pre-authored
+        # at the device's canvas resolution, so they keep the canvas-size
+        # decode (no rescale work for ffmpeg, and ``.zt`` is fixed-size by
+        # format).  A file picked from anywhere else is the user's too — it
+        # used to decode at canvas size and play stretched (#291).
         #
         # ``Paths.is_user_content`` is the ONE place that question is
         # answered — the render path asks it too, to choose between
@@ -1253,22 +1448,27 @@ class StopVideo(Command[VideoResult]):
     alone.  Teardown — GUI close, device disconnect — has no next render to
     rewind, and clearing there wiped the user's chosen background from
     ``trcc.json`` on every exit (#271).
+
+    The media player's source is the same kind of override and follows the
+    same rule: a stop ends it, a teardown keeps it for the next start.
     """
+    REQUIRES: ClassVar[Capability | None] = Capability.BACKGROUND
     key: str
     keep_override: bool = False
 
     def execute(self, app: App) -> VideoResult:
         had_playback = app.media.playback(self.key) is not None
-        had_override = (
-            app.settings.for_device(self.key).background_path is not None
-        )
+        s = app.settings.for_device(self.key)
+        had_override = (s.background_path is not None
+                        or s.media_player_uri is not None)
         app.media.unload(self.key)
         if had_override and not self.keep_override:
             log.info(
-                "StopVideo: clearing background_path override for %s",
-                self.key,
+                "StopVideo: clearing background_path / media-player override "
+                "for %s", self.key,
             )
             app.settings.set_background_path(self.key, None)
+            app.settings.set_media_player_uri(self.key, None)
         elif had_override:
             log.info(
                 "StopVideo: keeping background_path override for %s "
@@ -1285,30 +1485,33 @@ class StopVideo(Command[VideoResult]):
 
 @dataclass(frozen=True, slots=True)
 class StartScreencast(Command[ScreencastResult]):
-    """Begin a screen-capture session for a device.
+    """Begin a screen-capture session for a device, and drive it.
 
-    Mirrors :class:`PlayVideo` — the GUI ``ScreencastHandler`` is the
-    subscriber that actually runs the Qt capture timer; this Command
-    just publishes :class:`ScreencastStarted` so handler/CLI/API/daemon
-    callers all enter the same one-way event flow.
+    Persists the region as the device's display source, stops any video
+    playback so one source owns the wire, publishes :class:`ScreencastStarted`
+    and registers the capture driver.  The driver is part of the Command, not
+    a second one beside it: ``LoadTheme`` of a saved screencast theme and the
+    session's restore dispatch only this, and while the driver was separate
+    they answered "screencast started" and captured nothing -- in qtgui, the
+    CLI, the API and the daemon.  The gui ran its own timer and was the one
+    face that worked.
 
-    The Command itself is intentionally side-effect-light:
-      * it does NOT touch the wire (no SendFrame here — the handler's
-        per-frame tick drives that),
-      * it does NOT persist anything in :class:`DeviceSettings`
-        (screencast is a transient session, not a saved bg override),
-      * it stops any prior video playback so the override stack matches
-        what the user sees on the device.
+    Re-issuing replaces the driver (same scheduler key), which is how the
+    audio flag changes mid-cast.  The cadence is the C#'s and is not a field:
+    its cast form is driven at one fixed rate (``SCREENCAST_TICK_S``), and a
+    rate only one UI could set was a per-UI asymmetry, removed 2026-10-01.
 
-    Validates region geometry — refuses zero-area or negative sizes so
-    a typo in CLI args is caught at dispatch time instead of being a
-    silent no-op in the handler timer.
+    Validates region geometry — refuses negative or one-sided sizes so a typo
+    in CLI args is caught at dispatch time.  No region (0x0, the default)
+    casts the device's stored one (``screencast_box``: the theme's, or the
+    C#'s default); a given region is stored too, as the C# has one Jp*.
     """
+    USES_DEVICE: ClassVar[bool] = True
     key: str
-    x: int
-    y: int
-    w: int
-    h: int
+    x: int = 0
+    y: int = 0
+    w: int = 0
+    h: int = 0
     audio: bool = False
 
     def execute(self, app: App) -> ScreencastResult:
@@ -1316,17 +1519,6 @@ class StartScreencast(Command[ScreencastResult]):
             "StartScreencast.execute: key=%s region=(%d,%d %dx%d) audio=%s",
             self.key, self.x, self.y, self.w, self.h, self.audio,
         )
-        if self.w <= 0 or self.h <= 0:
-            log.warning(
-                "StartScreencast.execute: invalid region %dx%d for %s",
-                self.w, self.h, self.key,
-            )
-            return ScreencastResult(
-                ok=False, key=self.key,
-                message=(f"invalid screencast region {self.w}x{self.h} "
-                         f"(both dimensions must be > 0)"),
-            )
-
         try:
             device = app.get(self.key)
         except DeviceNotFoundError as e:
@@ -1336,21 +1528,27 @@ class StartScreencast(Command[ScreencastResult]):
             )
             return ScreencastResult(ok=False, key=self.key, message=str(e))
 
-        # An LED controller has no panel to cast to.  Refused HERE, before
-        # anything is written, because this Command PERSISTS the region: it
-        # used to answer ok=True and leave ``screencast_region`` set on an
-        # LED device, which is a wrong-state write rather than a wasted call
-        # — and the capture driver reads exactly that field to decide what to
-        # grab for.  Shaped like ``SetLedColors``' own guard, inverted.
-        if device.is_led:
-            log.warning(
-                "StartScreencast.execute: %s is an LED controller — refused",
-                self.key,
-            )
+        # A device that draws no frames has no panel to cast to.  Refused
+        # HERE, before anything is written, because this Command PERSISTS the
+        # region: it used to answer ok=True and leave ``screencast_region`` set
+        # on an LED device, which is a wrong-state write rather than a wasted
+        # call — and the capture driver reads exactly that field to decide
+        # what to grab for.
+        if why := _lacks(app, self.key, Capability.FRAME_RENDER):
+            log.warning("StartScreencast.execute: refused — %s", why)
+            return ScreencastResult(ok=False, key=self.key, message=why)
+
+        given = (self.x, self.y, self.w, self.h)
+        box = given if (self.w, self.h) != (0, 0) else screencast_box(app, self.key)
+        if box is None or box[2] <= 0 or box[3] <= 0:
+            log.warning("StartScreencast.execute: invalid region %s for %s",
+                        box, self.key)
             return ScreencastResult(
                 ok=False, key=self.key,
-                message=f"{self.key} is an LED controller — it has no panel",
+                message=(f"invalid screencast region {box} "
+                         "(both dimensions must be > 0)"),
             )
+        x, y, w, h = box
 
         # A live video playback overlay would race the screencast tick on
         # the same wire — stop it first so the handler owns the surface
@@ -1362,105 +1560,74 @@ class StartScreencast(Command[ScreencastResult]):
         # background/video override — the toggles are mutually exclusive) so
         # SaveTheme can bake it into a theme's ``screencast`` ref and a reload
         # can resume it.
-        app.settings.set_screencast_region(
-            self.key, (self.x, self.y, self.w, self.h, self.audio),
-        )
+        app.settings.set_screencast_region(self.key, (x, y, w, h, self.audio))
+        if box == given and device.profile is not None:
+            # The C# has ONE Jp*: what was cast is what a save keeps.
+            store_screencast_box(
+                app, self.key, box,
+                app.settings.for_device(self.key).screencast_hide_border)
         # The spectrum is drawn into the wire frame by every face now, so the
         # microphone belongs to the Command, not to whichever UI happened to
-        # subscribe.  ``start()`` answers False when ``sounddevice`` is absent
-        # and that is not an error — the cast runs without bars.
-        if self.audio and not app.audio.running:
-            started = app.audio.start()
-            log.info("StartScreencast.execute: audio capture started=%s "
-                     "(sounddevice present=%s)", started, started)
+        # subscribe.  Written AFTER the region, because the rule reads the
+        # persisted flags and this device's is one of them.
+        _sync_audio(app)
 
         app.events.publish(ScreencastStarted(
-            key=self.key,
-            x=self.x, y=self.y, w=self.w, h=self.h,
-            audio=self.audio,
+            key=self.key, x=x, y=y, w=w, h=h, audio=self.audio,
         ))
-        return ScreencastResult(
-            ok=True, key=self.key, active=True,
-            x=self.x, y=self.y, w=self.w, h=self.h, audio=self.audio,
-            message=(f"screencast started on {self.key} "
-                     f"({self.w}x{self.h} @ {self.x},{self.y})"),
-        )
-
-@dataclass(frozen=True, slots=True)
-class StartScreencastDriver(Command[ScreencastResult]):
-    """Drive ``CaptureScreencastFrame`` on a cadence until stopped.
-
-    Separate from ``StartScreencast`` on purpose.  ``StartScreencast`` only
-    publishes ``ScreencastStarted``, and the GUI's ``ScreencastHandler``
-    subscribes to it and runs its own 150 ms timer — so a GUI session already
-    has a driver.  Registering one there too would put TWO capture loops on the
-    same wire for anyone using the window.
-
-    So the driver is opt-in, and the clients without a timer of their own — the
-    CLI, the REST route, the daemon — ask for it explicitly.  That leaves two
-    drivers in the tree, which is honest rather than ideal: the end state is one
-    driver here and no timer in the GUI, and what blocks it is the GUI's audio
-    spectrum, which needs a ``Renderer`` rectangle primitive before it can move
-    out of the window.
-
-    Idempotent — the scheduler replaces a task registered under the same key.
-
-    ``interval_s`` defaults to the gui's own screencast cadence so a headless
-    cast moves at the same rate as one driven from the window.  It is a field
-    rather than a constant because a caller may already expose the rate: the
-    qtgui panel has an fps slider, and hard-coding here would have silently
-    ignored it.
-    """
-    key: str
-    interval_s: float = SCREENCAST_TICK_S
-
-    def execute(self, app: App) -> ScreencastResult:
-        log.info("StartScreencastDriver.execute: key=%s interval=%.3fs",
-                 self.key, self.interval_s)
-        try:
-            app.get(self.key)
-        except DeviceNotFoundError as e:
-            log.warning("StartScreencastDriver: device %s not found: %s",
-                        self.key, e)
-            return ScreencastResult(ok=False, key=self.key, message=str(e))
-
-        if app.settings.for_device(self.key).screencast_region is None:
-            log.warning(
-                "StartScreencastDriver: %s has no screencast region — "
-                "dispatch StartScreencast first", self.key,
-            )
-            return ScreencastResult(
-                ok=False, key=self.key,
-                message=(f"no screencast session on {self.key} — "
-                         "start one before driving it"),
-            )
-
         from ...services.screencast_driver import ScreencastDriver
 
-        app.add_task(ScreencastDriver(app, self.key, self.interval_s))
+        app.add_task(ScreencastDriver(app, self.key))
         return ScreencastResult(
-            ok=True, key=self.key,
-            message=f"driving screencast on {self.key}",
+            ok=True, key=self.key, active=True,
+            x=x, y=y, w=w, h=h, audio=self.audio,
+            message=f"screencast started on {self.key} ({w}x{h} @ {x},{y})",
         )
 
 
 @dataclass(frozen=True, slots=True)
-class StopScreencastDriver(Command[ScreencastResult]):
-    """Stop the cadence started by :class:`StartScreencastDriver`.
+class SetScreencastRegion(Command[ScreencastResult]):
+    """Set the device's screencast region -- and its hide-border flag.
 
-    Idempotent — removing a task that was never registered is a no-op, which
-    matters because a client may stop a session it did not drive.
+    The C#'s X/Y/W/H fields (UCTouPingXianShi -> FormCZTV cases 65-68) and its
+    border button (case 69): stored per device, written into a saved theme,
+    and followed by a running cast without a restart.  ``x, y, w, h`` is the
+    box on SCREEN; ``hide_border`` None leaves the flag as it is.  Values are
+    0..9999 as the C#'s fields clamp them; a 0 size is stored, as there, and
+    only refused when a cast starts.
     """
+    USES_DEVICE: ClassVar[bool] = True
     key: str
+    x: int
+    y: int
+    w: int
+    h: int
+    hide_border: bool | None = None
 
     def execute(self, app: App) -> ScreencastResult:
-        log.info("StopScreencastDriver.execute: key=%s", self.key)
-        from ...services.screencast_driver import task_key
-
-        app.remove_task(task_key(self.key))
+        log.info("SetScreencastRegion: key=%s (%d,%d %dx%d) hide_border=%s",
+                 self.key, self.x, self.y, self.w, self.h, self.hide_border)
+        box = (self.x, self.y, self.w, self.h)
+        device = app.devices.get(self.key)
+        problem = (
+            f"region values must be 0..9999, got {box}"
+            if not all(0 <= v <= 9999 for v in box)
+            else f"no device {self.key}" if device is None
+            else _lacks(app, self.key, Capability.FRAME_RENDER)
+            or (f"{self.key} has not reported its panel size yet"
+                if device.profile is None else ""))
+        if problem:
+            log.warning("SetScreencastRegion: %s", problem)
+            return ScreencastResult(ok=False, key=self.key, message=problem)
+        s = app.settings.for_device(self.key)
+        hide = s.screencast_hide_border if self.hide_border is None else self.hide_border
+        store_screencast_box(app, self.key, box, hide)
         return ScreencastResult(
             ok=True, key=self.key,
-            message=f"stopped driving screencast on {self.key}",
+            active=app.settings.for_device(self.key).screencast_region is not None,
+            x=self.x, y=self.y, w=self.w, h=self.h,
+            message=(f"screencast region of {self.key} is "
+                     f"{self.w}x{self.h} @ {self.x},{self.y}"),
         )
 
 
@@ -1493,11 +1660,15 @@ class SendScreencastFrame(Command[ScreencastResult]):
         frame_log.debug("SendScreencastFrame.execute: key=%s %dx%d",
                         self.key, self.frame.width, self.frame.height)
         try:
-            device = app.get(self.key)
-        except DeviceNotFoundError as e:
-            log.warning("SendScreencastFrame: device %s not found: %s",
-                        self.key, e)
+            # Connected, not merely attached: a panel whose transport closed is
+            # still attached, and every captured frame was built and sent into
+            # it.  The failed Result is reported once by ``App.dispatch``.
+            device = _require_connected_device(app, self.key)
+        except (DeviceNotFoundError, DeviceNotConnectedError) as e:
+            frame_log.debug("SendScreencastFrame: %s — %s", self.key, e)
             return ScreencastResult(ok=False, key=self.key, message=str(e))
+        if why := _lacks(app, self.key, Capability.FRAME_RENDER):
+            return ScreencastResult(ok=False, key=self.key, message=why)
 
         # The capture is the BACKGROUND; the active theme's mask and metric
         # elements compose on top of it, which is what the C# does for every
@@ -1506,15 +1677,9 @@ class SendScreencastFrame(Command[ScreencastResult]):
         # ``RenderAndSend`` personalises them: the renderer must receive the
         # already-converted, already-filtered dict that every other metrics
         # consumer sees, or a screencast would show °C while the theme shows °F.
-        from ...services.metrics_personalize import personalize_readings
         theme = app.active_themes.get(self.key)
-        app_s = app.settings.app
         try:
-            sensors = personalize_readings(
-                app.platform.sensors().read_all(),
-                temp_unit=app_s.temp_unit,
-                hdd_enabled=app_s.hdd_enabled,
-            )
+            sensors = _live_sensors(app)
         except Exception as e:
             # A sensor fault costs the METRICS on one frame, never the frame.
             log.warning("SendScreencastFrame: sensor read failed for %s (%s) "
@@ -1584,8 +1749,8 @@ class CaptureScreencastFrame(Command[ScreencastResult]):
 
     Reads the region from ``screencast_region`` — set by ``StartScreencast`` —
     so "is a screencast running" has one home rather than a second flag.  No
-    region means no session: that is a skip, not an error, because a periodic
-    driver will dispatch this after the session has been stopped.
+    region means the session is over -- another source took the panel -- and
+    this ends it rather than failing on every tick.
 
     LOG_LEVEL is DEBUG: this fires ~7x a second.
     """
@@ -1606,13 +1771,18 @@ class CaptureScreencastFrame(Command[ScreencastResult]):
 
         region = app.settings.for_device(self.key).screencast_region
         if region is None:
-            frame_log.debug(
-                "CaptureScreencastFrame: %s has no active session — skip",
-                self.key,
-            )
+            # Another source took the panel: ``SetBackground``, ``PlayVideo``
+            # and ``SetMediaPlayer`` clear the region in Settings, which keeps
+            # the display sources exclusive.  The session is over, so it ends
+            # properly here -- driver, capture, and the event the UIs' buttons
+            # follow -- once, instead of warning on every tick forever.
+            log.info("CaptureScreencastFrame: %s has no screencast region — "
+                     "another source took the panel; ending the session",
+                     self.key)
+            app.dispatch(StopScreencast(key=self.key))
             return ScreencastResult(
-                ok=False, key=self.key,
-                message=f"no screencast session on {self.key}",
+                ok=True, key=self.key,
+                message=f"no screencast session on {self.key} — ended",
             )
 
         x, y, w, h = region[0], region[1], region[2], region[3]
@@ -1637,8 +1807,9 @@ class CaptureScreencastFrame(Command[ScreencastResult]):
             # under us (screen locked, portal revoked, grim uninstalled).  A
             # failed frame must not kill the driver that dispatched it, so
             # this reports rather than raises — the next tick tries again.
-            log.warning("CaptureScreencastFrame: capture failed for %s: %s: %s",
-                        self.key, type(e).__name__, e)
+            # Per tick: ``App.dispatch`` warns once per distinct message.
+            frame_log.debug("CaptureScreencastFrame: capture failed for %s: "
+                            "%s: %s", self.key, type(e).__name__, e)
             return ScreencastResult(
                 ok=False, key=self.key,
                 message=f"screencast capture failed: {type(e).__name__}: {e}",
@@ -1652,6 +1823,63 @@ class CaptureScreencastFrame(Command[ScreencastResult]):
             ok=True, key=self.key,
             message=f"captured {w}x{h} for {self.key}",
         )
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureStreamFrame(Command[ScreencastResult]):
+    """One tick of a web media source: its newest frame, onto the panel.
+
+    ``CaptureScreencastFrame``'s twin, with the stream reader in place of the
+    screen grab -- the same ``SendScreencastFrame`` composites it under the
+    theme.  Dispatched by ``StreamDriver`` every ``STREAM_TICK_S``.
+
+    It ends ITSELF when another source took the panel, as the screencast
+    does: the display sources are exclusive in Settings, so the moment
+    ``media_player_uri`` stops naming this stream's URL -- a theme, a video,
+    a cast, a clear -- the reader and the driver stop here, within a tick.
+    """
+    LOG_LEVEL: ClassVar[int] = logging.DEBUG
+    key: str
+
+    def execute(self, app: App) -> ScreencastResult:
+        from ...services.stream_driver import task_key
+
+        reader = app.media.stream(self.key)
+        uri = app.settings.for_device(self.key).media_player_uri
+        if reader is None or uri != reader.url:
+            log.info("CaptureStreamFrame: %s's stream is no longer its source "
+                     "— ending it", self.key)
+            app.media.close_stream(self.key)
+            app.remove_task(task_key(self.key))
+            return ScreencastResult(ok=True, key=self.key,
+                                    message=f"stream on {self.key} ended")
+        if self.key in app.held:
+            frame_log.debug("CaptureStreamFrame: %s held by a pushed image",
+                            self.key)
+            return ScreencastResult(ok=True, key=self.key, message="held")
+        try:
+            frame = reader.latest()
+        except CaptureNotReady as e:
+            frame_log.debug("CaptureStreamFrame: %s", e)
+            return ScreencastResult(ok=True, key=self.key, message=str(e))
+        except OSError as e:
+            log.warning("CaptureStreamFrame: %s — ending the media player", e)
+            app.media.close_stream(self.key)
+            app.remove_task(task_key(self.key))
+            app.settings.set_media_player_uri(self.key, None)
+            _publish_background(app, self.key)
+            app.events.publish(ErrorOccurred(message=str(e), kind="video",
+                                             key=self.key))
+            return ScreencastResult(ok=False, key=self.key, message=str(e))
+        return app.dispatch(SendScreencastFrame(key=self.key, frame=frame))
+
+
+def _casting_keys(app: App) -> list[str]:
+    """Every device that still has a screencast session."""
+    keys = [key for key in app.devices
+            if app.settings.for_device(key).screencast_region is not None]
+    log.debug("_casting_keys: %s", keys)
+    return keys
 
 
 def _any_audio_session(app: App) -> bool:
@@ -1670,27 +1898,64 @@ def _any_audio_session(app: App) -> bool:
     return False
 
 
+def _sync_audio(app: App) -> None:
+    """Hold the microphone exactly while some session still wants it.
+
+    Both screencast lifecycle Commands used to carry their own half of this
+    and neither was the whole rule.  ``StartScreencast`` only ever STARTED
+    (``if self.audio and not app.audio.running``), so re-issuing a live
+    session with ``audio=False`` — which is how every face turns the bars off
+    mid-cast (``trcc_app._on_screencast_audio_toggled``, qtgui's checkbox) —
+    persisted the new flag and left the microphone open.  The spectrum gate is
+    ``app.audio.running``, not that flag, so **the bars kept drawing after the
+    user turned them off**.  DRIVEN against a real ``App``: ``start x1,
+    stop x0`` across ``audio=True`` then ``audio=False``.
+
+    Demand is the persisted truth, so this is asked AFTER the region is
+    written and answers for every device at once — one microphone, many
+    panels.  ``start()`` answers False when ``sounddevice`` is absent and that
+    is not an error: the cast runs without bars.
+    """
+    wanted = _any_audio_session(app)
+    running = app.audio.running
+    log.info("_sync_audio: wanted=%s running=%s", wanted, running)
+    if wanted and not running:
+        log.info("_sync_audio: a session wants audio — starting capture")
+        app.audio.start()
+    elif running and not wanted:
+        log.info("_sync_audio: no session wants audio — stopping capture")
+        app.audio.stop()
+
+
 @dataclass(frozen=True, slots=True)
 class StopScreencast(Command[ScreencastResult]):
     """End the screen-capture session for a device.
 
     Idempotent — calling on a device that has no active session returns
     ``ok=True`` so scripts can use it as a defensive cleanup.  Publishes
-    :class:`ScreencastStopped`; the GUI ``ScreencastHandler`` reacts by
-    stopping its Qt capture timer + tearing down PipeWire/audio plumbing.
+    :class:`ScreencastStopped` for the UIs' buttons.
+
+    Ends everything :class:`StartScreencast` began: the driver, the persisted
+    region, the microphone, and the capture source's session -- a portal
+    stream stays open, streaming a screen nobody is showing, until ``stop``.
+    Only the gui used to release it, from its own capture timer.
     """
     key: str
 
     def execute(self, app: App) -> ScreencastResult:
-        log.info("StopScreencast.execute: key=%s", self.key)
+        log.info("StopScreencast.execute: key=%s — ending the session, its "
+                 "driver and its capture", self.key)
+        from ...services.screencast_driver import task_key
+        app.remove_task(task_key(self.key))
         app.settings.set_screencast_region(self.key, None)
-        # One microphone, many possible panels: release it only once no OTHER
-        # device is still casting with audio, or stopping one screen would
-        # silence the bars on another.
-        if app.audio.running and not _any_audio_session(app):
-            log.info("StopScreencast.execute: last audio session — "
-                     "stopping capture")
-            app.audio.stop()
+        _sync_audio(app)
+        # ONE capture source serves every casting panel; stopping it for this
+        # one ended the others' too (on Wayland, their portal session).
+        if (still := _casting_keys(app)):
+            log.info("StopScreencast: capture kept — still casting on %s",
+                     ", ".join(still))
+        else:
+            app.platform.screen_capture().stop()
         app.events.publish(ScreencastStopped(key=self.key))
         return ScreencastResult(
             ok=True, key=self.key, active=False,
@@ -1708,10 +1973,23 @@ class SetMediaPlayer(Command[MediaPlayerResult]):
     ``DeviceSettings.media_player_uri`` (mutually exclusive with the other
     display sources) so ``SaveTheme`` can bake it into a theme's ``media_player``
     ref.  A LOCAL file starts playback through the same :class:`PlayVideo`
-    pipeline; a web URL is referenced (persisted so a save captures it) — its
-    continuous-streaming playback is a separate runtime feature.  Pass an empty
-    ``uri`` to clear the source.
+    pipeline; a web URL (http, https, rtsp) plays as a live stream on the
+    screencast's chain (:meth:`_stream`).  Pass an empty ``uri`` to clear the
+    source.
+
+    The source is recorded AFTER ``PlayVideo``: that Command writes the file as
+    ``background_path``, and the display sources are exclusive, so recording
+    first let playback erase the record -- every local media player read as a
+    background video, to the save, the restore and every UI's switch.
+
+    Clearing ends it the way the C#'s ``ClosePlayer`` does: the playback stops
+    and a video theme's own video plays again -- the App decides, no UI
+    reloads a theme.  Not a theme reload: a theme SAVED with a media player
+    would resume it and turning it off would never stick.  Every change is
+    announced (``BackgroundChanged``) so every UI follows.
     """
+    USES_DEVICE: ClassVar[bool] = True
+    REQUIRES: ClassVar[Capability | None] = Capability.BACKGROUND
     key: str
     uri: str
 
@@ -1719,11 +1997,7 @@ class SetMediaPlayer(Command[MediaPlayerResult]):
         log.info("SetMediaPlayer.execute: key=%s uri=%r", self.key, self.uri)
         uri = self.uri.strip()
         if not uri:
-            app.settings.set_media_player_uri(self.key, None)
-            return MediaPlayerResult(
-                ok=True, key=self.key, uri="", playing=False,
-                message=f"media-player source cleared for {self.key}",
-            )
+            return self._clear(app)
         try:
             app.get(self.key)
         except DeviceNotFoundError as e:
@@ -1733,14 +2007,7 @@ class SetMediaPlayer(Command[MediaPlayerResult]):
                                      message=str(e))
 
         if "://" in uri:   # a web URL / stream
-            app.settings.set_media_player_uri(self.key, uri)
-            log.info("SetMediaPlayer.execute: %r is a web URL — referenced "
-                     "(streaming playback is a runtime feature)", uri)
-            return MediaPlayerResult(
-                ok=True, key=self.key, uri=uri, playing=False,
-                message=(f"media-player source set to {uri} "
-                         "(referenced; streaming playback pending)"),
-            )
+            return self._stream(app, uri)
 
         local = Path(uri)   # a resource on the computer
         if not local.is_file():
@@ -1749,12 +2016,72 @@ class SetMediaPlayer(Command[MediaPlayerResult]):
                 ok=False, key=self.key, uri=uri,
                 message=f"media-player source does not exist: {uri}",
             )
-        app.settings.set_media_player_uri(self.key, uri)
         play = app.dispatch(PlayVideo(key=self.key, path=local))
+        if play.ok:
+            app.settings.set_media_player_uri(self.key, uri)
+            _publish_background(app, self.key)
         return MediaPlayerResult(
             ok=play.ok, key=self.key, uri=uri, playing=play.ok,
             message=(f"media-player playing {local.name}"
                      if play.ok else play.message),
+        )
+
+    def _stream(self, app: App, uri: str) -> MediaPlayerResult:
+        """Play a web source live -- the screencast's chain, ffmpeg for eyes.
+
+        Only ``STREAM_SCHEMES``: ``file:///…`` has a ``://`` too, and would
+        read any local file past the API's path confinement.  Whatever played
+        before is stopped FIRST -- the URL used to be recorded over it while
+        it kept playing, and a restart then showed nothing.
+        """
+        from ...services.stream_driver import StreamDriver
+
+        scheme = uri.split("://", 1)[0].lower()
+        problem = (
+            f"only {', '.join(sorted(STREAM_SCHEMES))} sources can play, "
+            f"not {scheme}://" if scheme not in STREAM_SCHEMES
+            else "ffmpeg is not installed — it is what plays a web source"
+            if not toolchain.present("ffmpeg")
+            else "the panel has not reported its size yet"
+            if (profile := app.devices[self.key].profile) is None
+            else "")
+        if problem:
+            log.warning("SetMediaPlayer: %s refused %r: %s", self.key, uri,
+                        problem)
+            return MediaPlayerResult(ok=False, key=self.key, uri=uri,
+                                     message=problem)
+        assert profile is not None
+        app.dispatch(StopVideo(key=self.key))
+        app.settings.set_media_player_uri(self.key, uri)
+        app.media.open_stream(self.key, uri, profile.resolution,
+                              round(1 / STREAM_TICK_S))
+        app.add_task(StreamDriver(app, self.key))
+        _publish_background(app, self.key)
+        log.info("SetMediaPlayer: %s streaming %s", self.key, uri)
+        return MediaPlayerResult(ok=True, key=self.key, uri=uri, playing=True,
+                                 message=f"media-player streaming {uri}")
+
+    def _clear(self, app: App) -> MediaPlayerResult:
+        """End the media player: stop it, and the theme's own video resumes."""
+        if app.settings.for_device(self.key).media_player_uri is None:
+            log.info("SetMediaPlayer: %s has no media player — nothing to end",
+                     self.key)
+            return MediaPlayerResult(
+                ok=True, key=self.key, uri="", playing=False,
+                message=f"no media-player source on {self.key}",
+            )
+        log.info("SetMediaPlayer: ending %s's media player", self.key)
+        app.dispatch(StopVideo(key=self.key))
+        theme = app.active_themes.get(self.key)
+        video = app.themes.video_path(theme) if theme is not None else None
+        if video is not None:
+            log.info("SetMediaPlayer: %s's theme plays its own video %s again",
+                     self.key, video.name)
+            app.dispatch(PlayVideo(key=self.key, path=video))
+        _publish_background(app, self.key)
+        return MediaPlayerResult(
+            ok=True, key=self.key, uri="", playing=False,
+            message=f"media-player source cleared for {self.key}",
         )
 
 @dataclass(frozen=True, slots=True)
@@ -1777,6 +2104,8 @@ class SetBackground(Command[BackgroundResult]):
     Stops any prior video first so the new image isn't immediately
     overwritten by the next animation tick.
     """
+    USES_DEVICE: ClassVar[bool] = True
+    REQUIRES: ClassVar[Capability | None] = Capability.BACKGROUND
     key: str
     path: Path
 
@@ -1800,6 +2129,9 @@ class SetBackground(Command[BackgroundResult]):
                 ok=False, key=self.key, path=str(self.path),
                 message=f"background path is not a regular file: {self.path}",
             )
+        if why := _theme_under_background(app, self.key):
+            return BackgroundResult(ok=False, key=self.key, path=str(self.path),
+                                    message=why)
 
         ext = self.path.suffix.lower()
         kind = MEDIA.kind_of(self.path)
@@ -1866,6 +2198,7 @@ class UploadBootAnimation(Command[BootAnimationResult]):
     deciseconds (10ths of a second); firmware caps at 25 ds (2.5 s).
     Defaults to 10 ds (1 s) for any frame without an explicit delay.
     """
+    USES_DEVICE: ClassVar[bool] = True
     key: str
     frame_paths: list[Path]
     delays_ds: list[int]
@@ -1904,11 +2237,13 @@ class UploadBootAnimation(Command[BootAnimationResult]):
         profile = device.profile
         resolution = (profile.resolution if profile
                       else device.info.native_resolution)
+        byte_order = (profile or DEFAULT_PROFILE).byte_order
 
         encoded: list[bytes] = []
         for path in self.frame_paths:
             try:
-                encoded.append(app.display.encode_boot_anim_frame(path, resolution))
+                encoded.append(app.display.encode_boot_anim_frame(
+                    path, resolution, byte_order))
             except (OSError, ValueError) as e:
                 return BootAnimationResult(
                     ok=False, key=self.key,
@@ -1947,14 +2282,14 @@ class SetOrientation(Command[OrientationResult]):
     Validates against the product registry — device need not be
     connected yet (users often configure before plugging in).
     """
+    REQUIRES: ClassVar[Capability | None] = Capability.ORIENTATION
     key: str
     degrees: int
 
     def execute(self, app: App) -> OrientationResult:
         log.debug("execute: app=%s", app)
         try:
-            vid_str, pid_str = self.key.split(":")
-            vid, pid = int(vid_str, 16), int(pid_str, 16)
+            vid, pid, _ = parse_device_key(self.key)
         except ValueError:
             return OrientationResult(
                 ok=False, key=self.key, degrees=self.degrees,
@@ -1991,6 +2326,7 @@ class SetBrightness(Command[BrightnessResult]):
     ``_publish_frame``); we mirror that here by invalidating + dispatching
     ``RenderAndSend`` on the connected-with-active-theme path.
     """
+    REQUIRES: ClassVar[Capability | None] = Capability.BRIGHTNESS
     key: str
     percent: int
 
@@ -2020,6 +2356,7 @@ class SetFitMode(Command[FitModeResult]):
     bottom), ``"height"`` (pillarbox left/right), ``"stretch"`` (fill,
     distort).
     """
+    REQUIRES: ClassVar[Capability | None] = Capability.BACKGROUND
     key: str
     mode: str
 
@@ -2049,6 +2386,7 @@ class EnableOverlay(Command[OverlayResult]):
     just the bg+mask renders. Useful for users who want a clean wallpaper
     without sensor readouts.
     """
+    REQUIRES: ClassVar[Capability | None] = Capability.OVERLAY
     key: str
     enabled: bool
 
@@ -2072,6 +2410,7 @@ class SetSplitMode(Command[SplitModeResult]):
     rendering consults the device profile + resolution to decide whether
     to composite the overlay.
     """
+    REQUIRES: ClassVar[Capability | None] = Capability.FRAME_RENDER
     key: str
     mode: int
 
@@ -2093,6 +2432,140 @@ class SetSplitMode(Command[SplitModeResult]):
         )
 
 @dataclass(frozen=True, slots=True)
+class SetGameMode(Command[GameModeResult]):
+    """Switch game mode and/or set its CPU threshold -- the C#'s
+    ``buttonGame`` / ``textBoxCPU`` (UCThemeLocal.cs:620-727).
+
+    While on, CPU usage above the threshold for 11 seconds running hands the
+    panel to a black, overlay-only frame until it falls back.  Kept per theme
+    folder, as the C#'s ``Theme.dc`` keeps it.  ``None`` leaves that half as
+    it is; the threshold is 0-99, the C#'s two-digit box.
+    """
+    REQUIRES: ClassVar[Capability | None] = Capability.FRAME_RENDER
+    key: str
+    enabled: bool | None = None
+    threshold: int | None = None
+
+    def execute(self, app: App) -> GameModeResult:
+        log.info("SetGameMode: key=%s enabled=%s threshold=%s",
+                 self.key, self.enabled, self.threshold)
+        refusal = (
+            "give enabled, threshold or both"
+            if self.enabled is None and self.threshold is None
+            else f"threshold must be 0-99 -- got {self.threshold}"
+            if self.threshold is not None and not 0 <= self.threshold <= 99
+            else None)
+        if refusal is not None:
+            log.warning("SetGameMode %s: refused -- %s", self.key, refusal)
+            s = app.settings.for_device(self.key)
+            return GameModeResult(
+                ok=False, key=self.key, enabled=s.game_enabled,
+                threshold=s.game_threshold, message=refusal)
+        app.settings.set_game_mode(
+            self.key, enabled=self.enabled, threshold=self.threshold)
+        _publish_game_mode(app, self.key)
+        _drive_game_mode(app, self.key)
+        s = app.settings.for_device(self.key)
+        return GameModeResult(
+            ok=True, key=self.key, enabled=s.game_enabled,
+            threshold=s.game_threshold,
+            message=(f"game mode {'on' if s.game_enabled else 'off'} for "
+                     f"{self.key} (CPU > {s.game_threshold}%)"),
+        )
+
+@dataclass(frozen=True, slots=True)
+class TickGameMode(Command[GameModeTickResult]):
+    """One game-mode reading: read the row, step the hysteresis, act.
+
+    The C#'s once-a-second check (FormCZTV.cs:2853-2913), turned by
+    ``GameModeTask``.  The row's text is what the C# parses: it strips "%" and
+    reads an integer, so a percentage or a bare number counts -- truncated, as
+    the C# formats load values (UCSystemInfo.cs:871-873) -- and a temperature,
+    clock, fan or power row reads 0 and never engages.
+
+    Engaging and releasing draw nothing, as in the C#.  While engaged, every
+    reading sends the game frame.  On release the panel's own picture is
+    rendered back: a static theme has no producer that would redraw it.
+
+    LOG_LEVEL is DEBUG: this fires every second.
+    """
+    LOG_LEVEL: ClassVar[int] = logging.DEBUG
+    REQUIRES: ClassVar[Capability | None] = Capability.FRAME_RENDER
+    key: str
+
+    def execute(self, app: App) -> GameModeTickResult:
+        from ...services.game_mode import GameModeGate, GameVerdict
+
+        s = app.settings.for_device(self.key)
+        gate = app.game_gates.setdefault(self.key, GameModeGate())
+        reading = self._reading(app) if s.game_enabled else 0
+        verdict = gate.step(s.game_enabled, reading, s.game_threshold)
+        frame_log.debug("TickGameMode: %s read %d (> %d?) -> %s", self.key,
+                        reading, s.game_threshold, verdict.value)
+        ok, message = True, verdict.value
+        match verdict:
+            case GameVerdict.ENGAGE:
+                app.events.publish(GameModeEngaged(key=self.key, engaged=True))
+            case GameVerdict.RELEASE:
+                app.events.publish(GameModeEngaged(key=self.key, engaged=False))
+                # The game frame took the scene's preview; with the same
+                # theme, readings and minute, a render back would be a full
+                # cache hit that resends the theme and leaves the preview
+                # black.  Drop the scene so it is composed again.
+                _invalidate_scene(app, self.key)
+                render = app.dispatch(RenderAndSend(key=self.key))
+                log.info("TickGameMode: %s released -- panel rendered back "
+                         "(ok=%s)", self.key, render.ok)
+            case GameVerdict.HOLD:
+                ok, message = self._send_game_frame(app)
+        return GameModeTickResult(
+            ok=ok, key=self.key, reading=reading, verdict=verdict.value,
+            engaged=gate.engaged, message=message)
+
+    def _reading(self, app: App) -> int:
+        """The row as the C# parses its text: an integer, else 0."""
+        row = _game_row(app)
+        if row is None or not row.sensor_id:
+            frame_log.debug("TickGameMode: %s has no bound row -- reads 0",
+                            self.key)
+            return 0
+        if row.unit not in ("%", ""):
+            frame_log.debug("TickGameMode: %s row %r is in %r, which the C# "
+                            "cannot parse -- reads 0", self.key,
+                            row.sensor_id, row.unit)
+            return 0
+        raw = app.last_raw_readings
+        value = (raw.get(row.sensor_id) if raw is not None
+                 else app.platform.sensors().read_one(row.sensor_id))
+        frame_log.debug("TickGameMode: %s %s = %s", self.key, row.sensor_id,
+                        value)
+        return 0 if value is None else int(value)
+
+    def _send_game_frame(self, app: App) -> tuple[bool, str]:
+        """Build the overlay-on-black frame and put it on the wire."""
+        try:
+            device = _require_connected_device(app, self.key)
+        except (DeviceNotFoundError, DeviceNotConnectedError) as e:
+            frame_log.debug("TickGameMode: %s -- %s", self.key, e)
+            return False, str(e)
+        try:
+            sensors = _live_sensors(app)
+        except Exception as e:
+            log.warning("TickGameMode: sensor read failed for %s (%s) -- "
+                        "the game frame goes out without metrics", self.key, e)
+            sensors = {}
+        data = app.display.build_game_frame(
+            info=device.info, theme=app.active_themes.get(self.key),
+            sensors=sensors, profile=device.profile)
+        app.send(self.key, data)
+        app.events.publish(FrameSent(
+            key=self.key, bytes_sent=len(data),
+            surface=app.display.rendered_surface(self.key)))
+        frame_log.debug("TickGameMode: %s game frame %d bytes",
+                        self.key, len(data))
+        return True, f"game frame {len(data)} bytes"
+
+@dataclass(frozen=True, slots=True)
 class ApplyMask(Command[MaskApplyResult]):
     """Set a user-supplied mask image that overrides the active theme's mask.
 
@@ -2102,6 +2575,8 @@ class ApplyMask(Command[MaskApplyResult]):
     Stores the **resolved absolute file path** so subsequent renders
     aren't affected by ``os.chdir`` between calls.
     """
+    USES_DEVICE: ClassVar[bool] = True
+    REQUIRES: ClassVar[Capability | None] = Capability.MASK
     key: str
     path: Path
 
@@ -2149,7 +2624,7 @@ class ApplyMask(Command[MaskApplyResult]):
         # the mask's own elements are parsed; a mask with no readable DC
         # leaves the layer empty and the render falls back exactly as before.
         # Safe on every caller: LoadTheme's internal ApplyMask runs after
-        # LoadTheme has already established the layer, and RestoreLastTheme
+        # LoadTheme has already established the layer, and RestoreDeviceState
         # never calls ApplyMask.
         # NO pre-clear.  The repopulate below REPLACES the layer wholesale
         # when the mask carries a layout, so clearing first buys nothing — and
@@ -2203,6 +2678,10 @@ class ApplyMask(Command[MaskApplyResult]):
                 log.warning("ApplyMask: %s DC unreadable (%s) — keeping "
                             "theme's overlay layout", mask_dc, e)
             else:
+                # The C# reads Jp* from every DC it loads, a mask's included
+                # (FormCZTV.cs:6805, outside the readMyMode gate).
+                seed_screencast_rect(app, self.key, dc,
+                                     f"mask {mask_dir.name}")
                 mask_elements = dc.get("elements") or []
                 if mask_elements:
                     # Store on DeviceSettings — not theme.config — so the
@@ -2240,6 +2719,7 @@ class ApplyMask(Command[MaskApplyResult]):
 @dataclass(frozen=True, slots=True)
 class SetMaskPosition(Command[MaskPositionResult]):
     """Set the mask offset within the canvas, or pass None to reset to (0, 0)."""
+    REQUIRES: ClassVar[Capability | None] = Capability.MASK
     key: str
     x: int | None
     y: int | None
@@ -2273,6 +2753,7 @@ class SetMaskPosition(Command[MaskPositionResult]):
 @dataclass(frozen=True, slots=True)
 class SetMaskVisible(Command[MaskVisibilityResult]):
     """Toggle the mask overlay visibility for a device."""
+    REQUIRES: ClassVar[Capability | None] = Capability.MASK
     key: str
     visible: bool
 
@@ -2289,6 +2770,13 @@ class SetMaskVisible(Command[MaskVisibilityResult]):
                      f"for {self.key}"),
         )
 
+def _publish_background(app: App, key: str) -> None:
+    """Tell every UI (and the render observer) that *key*'s background changed."""
+    path = app.settings.for_device(key).background_path or ""
+    log.debug("_publish_background: %s path=%r", key, path)
+    app.events.publish(BackgroundChanged(key=key, path=path))
+
+
 @dataclass(frozen=True, slots=True)
 class SetBackgroundMode(Command[BackgroundModeResult]):
     """Pick what fills the LCD behind overlays.
@@ -2296,19 +2784,25 @@ class SetBackgroundMode(Command[BackgroundModeResult]):
     Modes: ``'theme'`` (theme background), ``'color'`` (solid fill),
     ``'transparent'`` (no background, used by screencast overlay).
     """
+    REQUIRES: ClassVar[Capability | None] = Capability.BACKGROUND
     key: str
     mode: str
 
     def execute(self, app: App) -> BackgroundModeResult:
-        log.debug("execute: app=%s", app)
+        log.info("SetBackgroundMode: %s mode=%s", self.key, self.mode)
         try:
             app.settings.set_background_mode(self.key, self.mode)  # type: ignore[arg-type]
         except ValueError as e:
+            log.warning("SetBackgroundMode: %s refused mode %r — %s",
+                        self.key, self.mode, e)
             return BackgroundModeResult(
                 ok=False, key=self.key, mode=self.mode, message=str(e),
             )
-        # Drop the scene cache so the next tick re-renders with the new bg.
-        app.display.invalidate(self.key)
+        # Drop the scene cache so the next tick re-renders with the new bg,
+        # and tell every UI -- this published nothing, so no other window
+        # could show the change.
+        _invalidate_scene(app, self.key)
+        _publish_background(app, self.key)
         return BackgroundModeResult(
             ok=True, key=self.key, mode=self.mode,
             message=f"Background mode set to {self.mode}",
@@ -2317,23 +2811,66 @@ class SetBackgroundMode(Command[BackgroundModeResult]):
 @dataclass(frozen=True, slots=True)
 class SetOverlayBackground(Command[OverlayBackgroundResult]):
     """Set the solid color used when background_mode='color'."""
+    REQUIRES: ClassVar[Capability | None] = Capability.BACKGROUND
     key: str
     color: tuple[int, int, int]
 
     def execute(self, app: App) -> OverlayBackgroundResult:
-        log.debug("execute: app=%s", app)
+        log.info("SetOverlayBackground: %s color=%s", self.key, self.color)
         try:
             app.settings.set_overlay_background(self.key, self.color)
         except ValueError as e:
+            log.warning("SetOverlayBackground: %s refused color %s — %s",
+                        self.key, self.color, e)
             return OverlayBackgroundResult(
                 ok=False, key=self.key, color=self.color, message=str(e),
             )
-        app.display.invalidate(self.key)
+        _invalidate_scene(app, self.key)
+        _publish_background(app, self.key)
         r, g, b = self.color
         return OverlayBackgroundResult(
             ok=True, key=self.key, color=self.color,
             message=f"Overlay background set to #{r:02x}{g:02x}{b:02x}",
         )
+
+@dataclass(frozen=True, slots=True)
+class RememberColor(Command[RecentColorsResult]):
+    """Push a colour onto *key*'s recent-colour row and return the row.
+
+    The C#'s ``UCXiTongXianShiBackupColorSave``: when the user moves to
+    another element (or closes the editor) having changed the colour, that
+    colour goes to the front and the oldest drops off.  ONE entry per edit,
+    not per drag step -- which is why the UI says when an edit ended, and
+    the App keeps the row so every UI sees the same one.
+    """
+    REQUIRES: ClassVar[Capability | None] = Capability.OVERLAY
+    key: str
+    color: tuple[int, int, int]
+
+    def execute(self, app: App) -> RecentColorsResult:
+        log.info("RememberColor: %s color=%s", self.key, self.color)
+        try:
+            app.settings.remember_color(self.key, self.color)
+        except ValueError as e:
+            log.warning("RememberColor: %s refused %s — %s", self.key,
+                        self.color, e)
+            return RecentColorsResult(ok=False, key=self.key, message=str(e))
+        colors = tuple(app.settings.recent_colors(self.key))
+        return RecentColorsResult(ok=True, key=self.key, colors=colors,
+                                  message=f"Remembered {self.color}")
+
+
+@dataclass(frozen=True, slots=True)
+class RecentColors(Query[RecentColorsResult]):
+    """*key*'s recent-colour row, newest first, padded with Silver."""
+    key: str
+
+    def execute(self, app: App) -> RecentColorsResult:
+        colors = tuple(app.settings.recent_colors(self.key))
+        log.debug("RecentColors: %s -> %s", self.key, colors[:2])
+        return RecentColorsResult(ok=True, key=self.key, colors=colors,
+                                  message=f"{len(colors)} recent colours")
+
 
 @dataclass(frozen=True, slots=True)
 class AddOverlayElement(Command[OverlayElementResult]):
@@ -2343,6 +2880,7 @@ class AddOverlayElement(Command[OverlayElementResult]):
     have to think about it.  Returned in the result so subsequent
     Update/Delete Commands can reference it.
     """
+    REQUIRES: ClassVar[Capability | None] = Capability.OVERLAY
     key: str
     type: str = "text"
     x: int = 0
@@ -2368,8 +2906,7 @@ class AddOverlayElement(Command[OverlayElementResult]):
                 message=f"Invalid element type {self.type!r} (expected "
                         "'text' / 'metric' / 'clock')",
             )
-        import uuid
-        eid = self.element_id or f"el_{uuid.uuid4().hex[:8]}"
+        eid = self.element_id or new_overlay_id()
         existing = {
             e.id for e in
             (app.settings.for_device(self.key).user_overlay_elements or ())
@@ -2389,7 +2926,7 @@ class AddOverlayElement(Command[OverlayElementResult]):
             source=self.source,  # type: ignore[arg-type]
         )
         app.settings.add_user_overlay_element(self.key, element)
-        app.display.invalidate(self.key)
+        _invalidate_scene(app, self.key)
         app.events.publish(OverlayChanged(key=self.key, enabled=True))
         return OverlayElementResult(
             ok=True, key=self.key, element=_element_to_entry(element),
@@ -2399,6 +2936,7 @@ class AddOverlayElement(Command[OverlayElementResult]):
 @dataclass(frozen=True, slots=True)
 class UpdateOverlayElement(Command[OverlayElementResult]):
     """Mutate fields on an existing user-edited overlay element."""
+    REQUIRES: ClassVar[Capability | None] = Capability.OVERLAY
     key: str
     element_id: str
     x: int | None = None
@@ -2429,7 +2967,7 @@ class UpdateOverlayElement(Command[OverlayElementResult]):
             return OverlayElementResult(
                 ok=False, key=self.key, element=None, message=str(e),
             )
-        app.display.invalidate(self.key)
+        _invalidate_scene(app, self.key)
         app.events.publish(OverlayChanged(key=self.key, enabled=True))
         return OverlayElementResult(
             ok=True, key=self.key, element=_element_to_entry(element),
@@ -2439,6 +2977,7 @@ class UpdateOverlayElement(Command[OverlayElementResult]):
 @dataclass(frozen=True, slots=True)
 class DeleteOverlayElement(Command[OverlayElementDeleteResult]):
     """Remove a user-edited overlay element by id."""
+    REQUIRES: ClassVar[Capability | None] = Capability.OVERLAY
     key: str
     element_id: str
 
@@ -2451,51 +2990,11 @@ class DeleteOverlayElement(Command[OverlayElementDeleteResult]):
                 ok=False, key=self.key, element_id=self.element_id,
                 message=str(e),
             )
-        app.display.invalidate(self.key)
+        _invalidate_scene(app, self.key)
         app.events.publish(OverlayChanged(key=self.key, enabled=True))
         return OverlayElementDeleteResult(
             ok=True, key=self.key, element_id=self.element_id,
             message=f"Deleted overlay element {self.element_id}",
-        )
-
-@dataclass(frozen=True, slots=True)
-class FlashOverlayElement(Command[OverlayElementResult]):
-    """Briefly highlight one element so the user can locate it on screen.
-
-    Implementation note: the flash is a UI affordance, not a wire-level
-    blink.  The Command returns the element (with its current state) and
-    publishes an ``OverlayChanged`` event with ``flash_element_id`` set;
-    the GUI subscribes and animates a highlight box for ``duration_ms``.
-    Headless UIs that ignore the event get no visible effect — that's
-    correct (CLI/API users have nothing to flash *at*).
-    """
-    key: str
-    element_id: str
-    duration_ms: int = 1500
-
-    def execute(self, app: App) -> OverlayElementResult:
-        # Resolve against the EFFECTIVE layout on screen (user > mask >
-        # theme), not just the user layer — a mask/theme supplies the live
-        # elements while the user layer is empty, so a user-only lookup
-        # never matched them (the "element 'N' not found" flash bug).
-        # Same helper ResolveOverlay uses, so the id a UI was given there is
-        # the id looked up here.
-        log.debug("execute: app=%s", app)
-        for entry in resolve_overlay_layout(app, self.key).elements:
-            if entry.id == self.element_id:
-                app.events.publish(OverlayChanged(
-                    key=self.key, enabled=True,
-                    flash_element_id=self.element_id,
-                    flash_duration_ms=self.duration_ms,
-                ))
-                return OverlayElementResult(
-                    ok=True, key=self.key, element=entry,
-                    message=f"Flashing overlay element {self.element_id} "
-                            f"for {self.duration_ms}ms",
-                )
-        return OverlayElementResult(
-            ok=False, key=self.key, element=None,
-            message=f"Overlay element {self.element_id!r} not found",
         )
 
 @dataclass(frozen=True, slots=True)
@@ -2522,12 +3021,21 @@ class DeviceCanvas(Query[DeviceCanvasResult]):
         w, h, source = native_canvas(app, self.key)
         log.debug("DeviceCanvas: key=%s -> %dx%d via %s",
                   self.key, w, h, source)
-        if source == "unknown":
-            return DeviceCanvasResult(
-                ok=False, key=self.key, source=source,
-                message=(f"no canvas known for {self.key} — attach the "
-                         "device, or use a key in the product registry"),
-            )
+        if not (w and h):
+            # A registry row of 0x0 answered ok=True, and the qtgui browsers
+            # authored themes and crops for a 0x0 panel.  Say WHY there is
+            # no size: an unknown key, a device that draws no frames, or one
+            # whose size only its handshake knows (0416:5302 covers several).
+            why = (f"no canvas known for {self.key} — attach the device, or "
+                   "use a key in the product registry"
+                   if source == "unknown" else
+                   _lacks(app, self.key, Capability.FRAME_RENDER)
+                   or f"{self.key}'s size is known only after it answers a "
+                   "handshake — connect it first")
+            log.info("DeviceCanvas: %s has no canvas (%s) — %s",
+                     self.key, source, why)
+            return DeviceCanvasResult(ok=False, key=self.key, source=source,
+                                      message=why)
         return DeviceCanvasResult(
             ok=True, key=self.key, width=w, height=h, source=source,
             message=f"{w}x{h} native for {self.key} (from {source})",
@@ -2643,11 +3151,8 @@ class ResolveThemeDirectories(Query[ThemeDirectoriesResult]):
 
     def execute(self, app: App) -> ThemeDirectoriesResult:
         log.debug("ResolveThemeDirectories: key=%s", self.key)
-        from ...services.theme_directories import resolve_theme_directories
-
-        device = app.devices.get(self.key)
-        profile = device.profile if device is not None else None
-        if profile is None:
+        dirs = _theme_directories(app, self.key)
+        if dirs is None:
             log.warning(
                 "ResolveThemeDirectories: %s has no profile — cannot resolve "
                 "directories without a canvas size", self.key,
@@ -2657,14 +3162,6 @@ class ResolveThemeDirectories(Query[ThemeDirectoriesResult]):
                 message=f"no canvas for {self.key} — connect and handshake first",
             )
 
-        canvas = profile.resolution
-        orientation = app.settings.for_device(self.key).orientation
-        dirs = resolve_theme_directories(
-            app.libraries(self.key),
-            canvas_size=canvas,
-            lcd_size=oriented_resolution(canvas, orientation),
-            is_rotated=orientation in (90, 270),
-        )
         return ThemeDirectoriesResult(
             ok=True, key=self.key,
             catalog_size=dirs.catalog_size,
@@ -2678,54 +3175,6 @@ class ResolveThemeDirectories(Query[ThemeDirectoriesResult]):
 
 
 @dataclass(frozen=True, slots=True)
-class OrientedThemeTarget(Query[OrientedThemeTargetResult]):
-    """After a rotation swaps the catalog, which theme should be reloaded.
-
-    Folds together the two steps the GUI used to take — dispatch
-    ``ResolveThemeDirectories``, then call ``oriented_theme_reload_target``
-    with the paths that came back.  That split was deliberate (the service
-    function is shaped to accept a Result's string paths), but it leaves the
-    decision on the client, and the decision is a filesystem question: it asks
-    whether a same-name variant EXISTS in the new catalog.  A daemon-mode UI
-    would answer it against its own disk, where the theme library is not.
-
-    Empty ``target`` means keep the current theme — either it is already in the
-    new catalog, or no variant exists there (a custom theme, or the #136
-    portrait fallback).  The caller reports ``catalog_size`` either way, so it
-    travels with the answer rather than needing a second dispatch.
-    """
-    key: str
-    active_theme: Path
-
-    def execute(self, app: App) -> OrientedThemeTargetResult:
-        log.debug("OrientedThemeTarget: key=%s active=%s",
-                  self.key, self.active_theme)
-        from ...services.theme_directories import oriented_theme_reload_target
-
-        dirs = ResolveThemeDirectories(key=self.key).execute(app)
-        if not dirs.ok:
-            log.warning("OrientedThemeTarget: %s", dirs.message)
-            return OrientedThemeTargetResult(
-                ok=False, key=self.key, message=dirs.message,
-            )
-
-        target = oriented_theme_reload_target(
-            self.active_theme,
-            Path(dirs.user_theme_dir),
-            Path(dirs.theme_dir),
-        )
-        log.info("OrientedThemeTarget: %s in %dx%d -> %s",
-                 self.active_theme.name, *dirs.catalog_size, target)
-        return OrientedThemeTargetResult(
-            ok=True, key=self.key,
-            target=str(target) if target is not None else "",
-            catalog_size=dirs.catalog_size,
-            message=(f"reload {target.name}" if target is not None
-                     else "no oriented variant — keep current theme"),
-        )
-
-
-@dataclass(frozen=True, slots=True)
 class ResolveOverlay(Query[OverlayLayoutResult]):
     """Ask what is on the device's screen — the read side of overlay.
 
@@ -2735,10 +3184,9 @@ class ResolveOverlay(Query[OverlayLayoutResult]):
     find out what a device is displaying.
 
     Every element comes back with an id, minted positionally where a theme
-    supplied none — see ``services.overlay.effective_overlay_layout``.  That
-    id is what :class:`FlashOverlayElement` and
-    :class:`UpdateOverlayElement` take, and both resolve through the same
-    helper, so an id handed to a UI here is addressable there.
+    supplied none — see ``services.overlay.effective_overlay_layout``.  The
+    working layer's ids are what :class:`UpdateOverlayElement` and
+    :class:`DeleteOverlayElement` take.
 
     Always ``ok=True``.  An empty layout is a normal answer, not a failure —
     a device with no theme loaded genuinely has nothing on screen, and
@@ -2764,6 +3212,7 @@ class SetOverlayConfig(Command[OverlayConfigResult]):
     Useful when the GUI ships a full edit (drag-out from a panel).
     Each ``elements`` entry is a flat dict matching ``OverlayElement.to_dict``.
     """
+    REQUIRES: ClassVar[Capability | None] = Capability.OVERLAY
     key: str
     elements: tuple[dict, ...] = ()
 
@@ -2784,7 +3233,7 @@ class SetOverlayConfig(Command[OverlayConfigResult]):
                 )
             parsed.append(element)
         app.settings.set_user_overlay_elements(self.key, parsed)
-        app.display.invalidate(self.key)
+        _invalidate_scene(app, self.key)
         # Report the device's actual toggle, not a hardcoded True.  This
         # Command sets the LAYOUT; whether the overlay is switched on is
         # ``DeviceSettings.overlay_enabled``'s to say (the single authority —
@@ -2815,6 +3264,8 @@ class PauseVideo(Command[PauseVideoResult]):
             )
         playback.pause(self.paused)
         state = "paused" if self.paused else "playing"
+        log.info("PauseVideo: %s %s", self.key, state)
+        app.events.publish(VideoPauseChanged(key=self.key, paused=self.paused))
         return PauseVideoResult(
             ok=True, key=self.key, paused=self.paused,
             message=f"Video {state}",
@@ -2890,7 +3341,7 @@ class SeekVideo(Command[SeekVideoResult]):
     frame: int
 
     def execute(self, app: App) -> SeekVideoResult:
-        log.debug("execute: app=%s", app)
+        log.info("SeekVideo: key=%s frame=%d", self.key, self.frame)
         playback = app.media.playback(self.key)
         if playback is None:
             return SeekVideoResult(
@@ -2904,7 +3355,13 @@ class SeekVideo(Command[SeekVideoResult]):
                 message=f"frame must be >= 0, got {self.frame}",
             )
         playback.seek(self.frame)
-        app.display.invalidate(self.key)
+        _invalidate_scene(app, self.key)
+        # Every UI's progress bar follows the jump -- while paused no tick
+        # announces the new position, so the seek has to.
+        app.events.publish(VideoAdvanced(
+            key=self.key, cursor=playback.cursor,
+            frame_count=playback.frame_count, fps=playback.fps,
+        ))
         return SeekVideoResult(
             ok=True, key=self.key,
             cursor=playback.cursor, frame_count=playback.frame_count,
@@ -2941,8 +3398,20 @@ class LcdSnapshot(Query[LcdSnapshotResult]):
     key: str
 
     def execute(self, app: App) -> LcdSnapshotResult:
+        from ...services._clock import icu_date_pattern
+        from ..geometry import oriented_canvas
+        from ._helpers import device_overlay_layout
+
         log.debug("execute: app=%s", app)
         s = app.settings.for_device(self.key)
+        device = app.devices.get(self.key)
+        profile = device.profile if device is not None else None
+        # The format is each clock element's own; report the first of each
+        # kind, which is what a one-clock theme shows.
+        clocks: dict[str, str] = {}
+        for e in device_overlay_layout(app, self.key):
+            if e.get("type") == "clock":
+                clocks.setdefault(str(e.get("source")), str(e.get("format", "")))
         return LcdSnapshotResult(
             ok=True, key=self.key,
             orientation=s.orientation,
@@ -2954,14 +3423,25 @@ class LcdSnapshot(Query[LcdSnapshotResult]):
             mask_position=s.mask_position,
             fit_mode=s.fit_mode.value,
             split_mode=s.split_mode,
-            time_format=s.time_format,
-            date_format=s.date_format,
+            time_format="12h" if "%I" in clocks.get("time", "") else "24h",
+            date_format=icu_date_pattern(clocks.get("date", "")),
+            screencast_region=s.screencast_region,
+            display_source=("screencast" if s.screencast_region is not None
+                            else "media" if s.media_player_uri
+                            else "background"),
+            media_player_uri=s.media_player_uri,
+            screencast_rect=screencast_box(app, self.key),
+            screencast_hide_border=s.screencast_hide_border,
+            screencast_canvas=(None if profile is None
+                               else oriented_canvas(profile, s.orientation)),
             temp_unit=s.temp_unit,
             slideshow_enabled=s.slideshow_enabled,
             slideshow_interval_s=s.slideshow_interval_s,
             slideshow_themes=tuple(s.slideshow_themes),
             background_mode=s.background_mode,
             overlay_background=s.overlay_background,
+            game_enabled=s.game_enabled,
+            game_threshold=s.game_threshold,
             message=f"LCD snapshot for {self.key}",
         )
 
@@ -3081,9 +3561,13 @@ class DeviceState(Query[DeviceStateResult]):
             wire=info.wire.value, kind=info.kind.value,
             model=info.model or "",
             button_image=info.button_image or "",
-            native_resolution=info.native_resolution,
+            catalog_product=(found.product
+                             if (found := find_product(info.vid, info.pid))
+                             else ""),
+            catalog_resolution=info.native_resolution,
             connected=device.is_connected,
             is_led=device.is_led,
+            needs_keepalive=device.needs_keepalive,
             resolution=profile.resolution if profile else None,
             jpeg=profile.jpeg if profile else None,
             rotate=profile.rotate if profile else None,

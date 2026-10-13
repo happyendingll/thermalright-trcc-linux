@@ -31,14 +31,16 @@ import os
 import platform as py_platform
 import sys
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 from ...core.errors import HandshakeError, TransportError
-from ...core.models import Kind, ProductInfo
+from ...core.models import DeviceInfo, Kind, ProductInfo, format_device_key
 from ...core.ports import Paths, Platform
 from ...core.registry import find_product
+from ...core.variants import get_variant_override
 from ...services.settings import resolve_config_path
 from ..device import DEVICES
 from ..infra.logging import log_chain, tail_log, tail_log_actions
@@ -110,8 +112,13 @@ def build_debug_report(
     settings_path: Path | None = None,
     log_tail_lines: int = 1000,
     log_action_lines: int = 500,
+    held: Mapping[str, Mapping[str, str]] | None = None,
+    probe: bool = True,
 ) -> DebugReport:
-    """Collect every section into a DebugReport."""
+    """Collect every section into a DebugReport.
+
+    *held* and *probe*: see :func:`_collect_devices`.
+    """
     log.info("build_debug_report: gathering sections "
              "(log_tail=%d actions=%d)", log_tail_lines, log_action_lines)
     timestamp = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -127,7 +134,7 @@ def build_debug_report(
 
     info = _collect_platform_info(platform)
     path_table = _collect_paths(platform)
-    devices, devices_err = _collect_devices(platform)
+    devices, devices_err = _collect_devices(platform, held=held, probe=probe)
     sensors, sensors_err = _collect_sensors(platform)
     powercap = _collect_powercap()
     live_settings = settings_path or resolve_config_path(platform.paths())
@@ -198,9 +205,19 @@ def _collect_paths(platform: Platform) -> dict[str, str]:
 
 def _collect_devices(
     platform: Platform,
+    held: Mapping[str, Mapping[str, str]] | None = None,
+    probe: bool = True,
 ) -> tuple[list[dict[str, str]], str]:
-    """Scan + enrich with product-registry metadata; return (rows, error)."""
-    log.debug("_collect_devices: called")
+    """Scan + enrich with product-registry metadata; return (rows, error).
+
+    *held* maps a device key to the handshake the running App reported for
+    it: that device is never probed, because a probe is a second handle on a
+    panel the App is driving.  *probe* False probes nothing at all -- what
+    the caller asks for when an App is running but did not answer, since it
+    may still hold every panel.
+    """
+    held = held or {}
+    log.debug("_collect_devices: held=%s probe=%s", sorted(held), probe)
     try:
         infos = platform.scan_devices()
     except (OSError, RuntimeError) as e:
@@ -232,7 +249,7 @@ def _collect_devices(
         # identical in every log we have (#150) -- and remote_wakeup explains
         # why two panels of the same product behave differently: one that
         # cannot wake the host is never autosuspended at all.
-        power = platform.usb_power_state(info.vid, info.pid)
+        power = platform.usb_power_state(info.vid, info.pid, info.unit)
         if power is not None:
             row["power"] = (
                 f"control={power.control} status={power.runtime_status} "
@@ -245,15 +262,50 @@ def _collect_devices(
         # geometry.  Without this the report only has them if the connect-time
         # log line survived in the tail, which on a long session it never does.
         if product is not None:
-            handshake = _probe_handshake(platform, product)
+            handshake = _device_handshake(platform, product, info,
+                                          held, probe)
             if handshake is not None:
                 row.update({f"hs_{k}": v for k, v in handshake.items()})
+                row["product"] = _identified_name(info, product, handshake)
         rows.append(row)
     return rows, ""
 
 
+def _device_handshake(
+    platform: Platform, product: ProductInfo, info: DeviceInfo,
+    held: Mapping[str, Mapping[str, str]], probe: bool,
+) -> dict[str, str] | None:
+    """The App's answer for a panel it holds, else a live probe if allowed."""
+    if (from_app := held.get(info.key)) is not None:
+        log.info("_device_handshake: %s held by the running App — its "
+                 "handshake, no second probe", info.key)
+        return dict(from_app)
+    if not probe:
+        log.info("_device_handshake: %s not probed — a running App did not "
+                 "answer and may hold it", info.key)
+        return None
+    return _probe_handshake(platform, product, info.unit)
+
+
+def _identified_name(info: DeviceInfo, product: ProductInfo,
+                     handshake: dict[str, str]) -> str:
+    """The cooler the handshake names, with the catalog's guess beside it.
+
+    One USB id covers many coolers, so the catalog name is often wrong -- the
+    report printed "GrandVision 360 AIO" directly above its own probe line
+    ``handshake: PM=4 SUB=5``, which identifies a Peerless Vision 360 (#272).
+    Resolved exactly as ConnectDevice resolves it: the variant override.
+    """
+    override = get_variant_override(info.vid, info.pid,
+                                    int(handshake["pm"]), int(handshake["sub"]))
+    name = override.display_name if override is not None else ""
+    log.info("_identified_name: %s pm=%s sub=%s -> %r", info.key,
+             handshake["pm"], handshake["sub"], name or product.product)
+    return f"{name} (catalog: {product.product})" if name else product.product
+
+
 def _probe_handshake(
-    platform: Platform, product: ProductInfo,
+    platform: Platform, product: ProductInfo, unit: str = "",
 ) -> dict[str, str] | None:
     """Connect the device, capture its handshake bytes, then disconnect.
 
@@ -270,7 +322,7 @@ def _probe_handshake(
     failure.  A diagnostic must never abort the report, so every failure is
     swallowed into the fallback.
     """
-    key = f"{product.vid:04x}:{product.pid:04x}"
+    key = format_device_key(product.vid, product.pid, unit)
     log.info("_probe_handshake: %s wire=%s", key, product.wire.value)
     if product.kind is not Kind.LCD:
         log.info("_probe_handshake: %s is %s, not LCD — no frame handshake",
@@ -279,7 +331,10 @@ def _probe_handshake(
     device = None
     try:
         cls = DEVICES[product.wire]
-        transport = platform.open_transport(product.wire, product.vid, product.pid)
+        # The unit's OWN port: unit-less, both of two identical coolers
+        # probed the first one and the report showed one panel twice (#287).
+        transport = platform.open_transport(product.wire, product.vid,
+                                            product.pid, unit=unit)
         device = cls(product, transport)
         result = device.connect()
     except (OSError, HandshakeError, TransportError, RuntimeError) as e:

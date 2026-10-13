@@ -5,24 +5,34 @@ render.  Every Command has one concrete Result type.
 """
 from __future__ import annotations
 
+import logging
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from .models import (
     DEFAULT_REFRESH_INTERVAL_S,
+    IN_PROCESS_ONLY,
     OVERLAY_DEFAULT_CLOCK_SOURCE,
     OVERLAY_DEFAULT_COLOR,
     OVERLAY_DEFAULT_FORMAT,
     OVERLAY_DEFAULT_SIZE,
     DeviceInfo,
+    FollowColors,
+    FollowMapping,
     HandshakeResult,
     HardwareMetrics,
     LedHandshakeResult,
     PanelConfig,
     ProductInfo,
+    RamAccessState,
+    RgbFollowMode,
+    RgbLight,
     SensorReading,
     WebPreviewInfo,
 )
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,8 +44,28 @@ class Result:
 
 @dataclass(frozen=True, slots=True)
 class DiscoverResult(Result):
+    """What a scan recognised.  ``devices[i]`` is the UNIT of ``products[i]``.
+
+    Aligned by construction: ``products`` names the model, ``devices`` carries
+    the key that addresses THIS unit -- they differ only for two of the same
+    cooler, where the key gains ``@port`` and the product cannot (#287).
+    """
     products: list[ProductInfo] = field(default_factory=list)
     devices: list[DeviceInfo] = field(default_factory=list)
+    #: Keys whose USB id covers several coolers, told apart only by the
+    #: handshake this scan never does -- a face must not print the catalog
+    #: name for these as if it named the cooler (#176, #272).
+    several_coolers: list[str] = field(default_factory=list)
+
+    def units(self) -> Iterator[tuple[str, ProductInfo]]:
+        """``(key, product)`` per unit — the key a face must show and target.
+
+        ``product.key`` names the MODEL, so a face that listed or connected it
+        collapsed two identical coolers into one (#287).  Every face iterates
+        this instead of pairing the two lists itself.
+        """
+        log.debug("DiscoverResult.units: %d unit(s)", len(self.devices))
+        return zip((d.key for d in self.devices), self.products, strict=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +73,10 @@ class ConnectResult(Result):
     key: str = ""
     handshake: HandshakeResult | None = None
     led_handshake: LedHandshakeResult | None = None
+    # The cooler the handshake named, and the catalog's name for its USB id --
+    # one id covers many coolers, so the two differ for most of them (#272).
+    product: str = ""
+    catalog_product: str = ""
     # OS-correct guidance when ``ok`` is False (e.g. "run as administrator").
     # ``list[str]`` (not tuple) so it round-trips the reflective IPC encoder
     # as a JSON array with no decode coercion.
@@ -119,8 +153,8 @@ class PreviewResult(Result):
     would be the same render three times.
 
     ``surface`` is the live Renderer surface (``QImage`` under ``QtRenderer``)
-    and is **in-process only** — ``ipc._to_wire`` drops it to ``None`` with a
-    warning, the same contract ``FrameSent.surface`` already has.  A daemon
+    and is **in-process only** — declared so, it never crosses IPC and the far
+    side reads ``None``, the same contract ``FrameSent.surface`` has.  A daemon
     client asks with ``encode="png"`` and reads :attr:`image` instead.
 
     ``ok=True`` with ``surface=None`` means "nothing to preview yet" (no theme
@@ -129,8 +163,8 @@ class PreviewResult(Result):
     a device that isn't attached or a render that raised.
     """
     key: str = ""
-    surface: Any = None
-    image: bytes = b""
+    surface: Any = field(default=None, metadata=IN_PROCESS_ONLY)
+    image: bytes = field(default=b"", repr=False)
     media_type: str = ""
     width: int = 0
     height: int = 0
@@ -195,9 +229,6 @@ class DaemonResult(Result):
     on.
     """
     running: bool = False
-    #: True when THIS call started it.  Lets a UI say "started the background
-    #: service" rather than "connected", which are different events to a user.
-    spawned: bool = False
     socket_path: str = ""
     #: The daemon's OWN pid and uptime — 0 when the answering process is not
     #: the daemon, which is honest rather than reporting the caller's.  They
@@ -205,6 +236,10 @@ class DaemonResult(Result):
     #: INSIDE the daemon: ``os.getpid()`` there IS the daemon.
     pid: int = 0
     uptime_seconds: int = 0
+    #: The answering process's ``__version__`` -- the daemon's, over the
+    #: socket.  ``""`` from a daemon older than this field, which a client
+    #: reads as "older" and replaces (``daemon.ensure_daemon``).
+    version: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,20 +284,6 @@ class EnsureDataDownloadResult(Result):
     themes_ok: bool = False
     web_ok: bool = False
     masks_ok: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class ExportConfigResult(Result):
-    """Per-device JSON snapshot written to disk."""
-    key: str = ""
-    output_path: str = ""
-
-
-@dataclass(frozen=True, slots=True)
-class ImportConfigResult(Result):
-    """Per-device JSON snapshot restored from disk."""
-    key: str = ""
-    input_path: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,6 +343,22 @@ class SplitModeResult(Result):
 
 
 @dataclass(frozen=True, slots=True)
+class GameModeResult(Result):
+    key: str = ""
+    enabled: bool = False
+    threshold: int = 75
+
+
+@dataclass(frozen=True, slots=True)
+class GameModeTickResult(Result):
+    """One game-mode reading: what it read, and what it decided."""
+    key: str = ""
+    reading: int = 0
+    verdict: str = "idle"
+    engaged: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class MaskApplyResult(Result):
     key: str = ""
     path: str = ""
@@ -337,21 +374,6 @@ class MaskPositionResult(Result):
 class MaskVisibilityResult(Result):
     key: str = ""
     visible: bool = True
-
-
-@dataclass(frozen=True, slots=True)
-class OrientedThemeTargetResult(Result):
-    """Which theme to reload after a rotation, and the catalog it came from.
-
-    ``target`` is empty when the active theme is already in the new catalog or
-    has no same-name variant there — the caller keeps what it has and the
-    render pipeline pixel-rotates.  ``catalog_size`` is carried because the one
-    caller reports it either way.
-    """
-
-    key: str = ""
-    target: str = ""
-    catalog_size: tuple[int, int] = (0, 0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -447,10 +469,18 @@ class DeviceStateResult(Result):
     kind: str = ""
     model: str = ""
     button_image: str = ""
-    native_resolution: tuple[int, int] = (0, 0)
+    # The CATALOG's answer for this USB id -- one id covers many coolers, so
+    # neither is the panel's (480x480 on a 320x240 Mjolnir).  ``product`` and
+    # ``resolution`` are the identified cooler and its handshake.  This was
+    # ``native_resolution``, and a UI labelled it "native res".
+    catalog_product: str = ""
+    catalog_resolution: tuple[int, int] = (0, 0)
     # Live connection state.
     connected: bool = False
     is_led: bool = False
+    # The panel blanks when frames stop (a registry fact or a firmware quirk),
+    # so a face that exits after one frame must say so (#228, #267).
+    needs_keepalive: bool = False
     # Handshake-derived — None until the device has answered.
     resolution: tuple[int, int] | None = None
     pm_byte: int | None = None
@@ -561,9 +591,9 @@ class ScreencastResult(Result):
 @dataclass(frozen=True, slots=True)
 class MediaPlayerResult(Result):
     """Result of ``SetMediaPlayer`` — the media-player source (a local URI or a
-    web URL/stream).  ``playing`` is True when a local source started playback;
-    a web URL is referenced (persisted so a SaveTheme captures it) but its
-    streaming playback is a separate runtime feature.  ``uri`` echoes the source
+    web URL/stream).  ``playing`` is True when the source started: a local file
+    through the video pipeline, a web URL (http/https/rtsp) as a live stream.
+    ``uri`` echoes the source
     for a daemon/API client reading the response over the wire.
     """
     key: str = ""
@@ -577,6 +607,55 @@ class BootAnimationResult(Result):
     key: str = ""
     frames_uploaded: int = 0
     frames_total: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class RgbLightsResult(Result):
+    """The lights the RGB page lists, from the last scan -- no bus traffic.
+
+    ``scanned`` is whether the RAM has been looked for yet; ``openrgb_error``
+    why OpenRGB's devices could not be listed, if they could not.
+    """
+    lights: tuple[RgbLight, ...] = ()
+    scanned: bool = False
+    openrgb_error: str = ""
+    ram_access: RamAccessState = RamAccessState.UNSUPPORTED
+
+
+@dataclass(frozen=True, slots=True)
+class RamLightingResult(Result):
+    """Whether TRCC may reach RGB memory, and how to change it from here.
+
+    ``command`` is empty when this App can switch it itself (a password
+    prompt); otherwise it is the terminal command that will.
+    """
+    state: RamAccessState = RamAccessState.UNSUPPORTED
+    command: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class RgbFollowResult(Result):
+    """What follows the cooler (#160): the setting and what it is doing.
+
+    ``mode`` is what follows -- OpenRGB at ``host``:``port``, or Corsair RAM
+    directly.  ``devices`` are those that follow; ``lead`` the cooler they
+    follow; ``error`` why the follower could not be reached, if it could not.
+    """
+    mode: RgbFollowMode = RgbFollowMode.OFF
+    host: str = ""
+    port: int = 0
+    #: The device that leads -- empty for the first LED cooler -- how an
+    #: LCD's picture maps onto the followers, and which lights follow (refs;
+    #: empty for every one).
+    source: str = ""
+    mapping: FollowMapping = FollowMapping.HALVES
+    targets: tuple[str, ...] = ()
+    #: How a region of that picture becomes a light's colour.
+    colors: FollowColors = FollowColors.VIVID
+    connected: bool = False
+    devices: tuple[str, ...] = ()
+    lead: str = ""
+    error: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -611,6 +690,9 @@ class AutostartResult(Result):
     #: empty when autostart is off.  All four UIs ship; reporting only
     #: enabled/disabled cannot say which one login will bring up.
     target: str = ""
+    #: Whether autostart has ever been chosen, on OR off, from any UI.  The
+    #: gui's first-launch enable reads this, so a user's "off" stays off.
+    configured: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -649,13 +731,11 @@ class PlatformInfoResult(Result):
     # what this Result already is, and the gui asking for it was reaching
     # ``app.platform`` — a crash under TRCC_DAEMON=1 (#249).
     no_devices_hint: str = ""
-    # Does closing the window hide to the tray instead of quitting?  A per-OS
-    # convention (macOS keeps the app running, Linux/Windows follow the tray),
-    # so it is platform identity like every field above — added here for the
-    # same reason ``no_devices_hint`` was, and closing the same reach: BOTH
-    # Qt skins read ``app.platform.minimize_on_close()`` directly, which is an
-    # AttributeError under TRCC_DAEMON=1.
-    minimize_on_close: bool = False
+    # What draws the App's desktop (``DisplayServer`` value: x11, wayland,
+    # native, headless).  A UI decides from it whether a window can place
+    # itself on screen -- the screencast frame cannot on Wayland -- and under
+    # the shared App it cannot ask the platform itself.
+    display_server: str = ""
 
 
 # =========================================================================
@@ -728,9 +808,29 @@ class LcdSnapshotResult(Result):
     mask_position: tuple[int, int] | None = None
     fit_mode: str = "fit"
     split_mode: int = 0
+    #: The first time and date element's own format ("" with no date element);
+    #: the format belongs to each clock element, as the C#'s myModeSub.
     time_format: str = "24h"
     date_format: str = ""
     temp_unit: str = "C"
+    #: The running screencast, ``(x, y, w, h, audio)``, or None when this
+    #: device is not casting -- ``StopScreencast`` clears it with the driver.
+    screencast_region: tuple[int, int, int, int, bool] | None = None
+    #: Which display source is on the panel -- the C#'s one UI-mode choice
+    #: (background / screencast / video player, ``FormCZTV.ThemeSetting``).
+    #: Derived once, here, from the three exclusive settings, so every UI's
+    #: switches agree.  ``background_mode`` says whether a background is drawn.
+    display_source: Literal["background", "screencast", "media"] = "background"
+    #: What the media player plays -- a local file or a web URL -- or None.
+    media_player_uri: str | None = None
+    #: The device's screencast region on screen, cast or not (the theme's, or
+    #: the C#'s default) -- None until the panel reports its size.
+    screencast_rect: tuple[int, int, int, int] | None = None
+    #: The C#'s ``myYcbk``: hide the on-screen region frame.
+    screencast_hide_border: bool = True
+    #: The canvas a cast frame fills, ``(w, h)`` at the current orientation --
+    #: the aspect a region locks to.  None until the panel reports its size.
+    screencast_canvas: tuple[int, int] | None = None
     # Slideshow config.  Absent until 2026-08-25, which made this Result
     # unable to answer its own docstring: the gui restoring slideshow state
     # had to keep reaching for ``settings.for_device`` — a crash under
@@ -748,6 +848,10 @@ class LcdSnapshotResult(Result):
     # callers need sends them around it.
     background_mode: str = "theme"
     overlay_background: tuple[int, int, int] = (0, 0, 0)
+    #: Game mode: whether it is switched on, and the CPU % above which it
+    #: takes the panel (the C#'s isGame / myCPU).
+    game_enabled: bool = False
+    game_threshold: int = 75
 
 
 @dataclass(frozen=True, slots=True)
@@ -778,7 +882,7 @@ class LedSnapshotResult(Result):
     temp_source: str = "cpu"
     load_source: str = "cpu"
     zone_sync: bool = False
-    zone_sync_interval_ticks: int = 13
+    zone_sync_interval_ticks: int = 12
     selected_zone: int = 0
     zone_count: int = 0
     segment_count: int = 0
@@ -793,11 +897,6 @@ class LedSnapshotResult(Result):
     # carry them, so ``led_panel`` kept reaching ``app.settings.for_led`` — an
     # AttributeError under TRCC_DAEMON=1.  A UI reaches past the bus exactly
     # when the Result is short a field.
-    #
-    # ``segment_on`` is the per-segment mask, NOT a bool: ``segment_count``
-    # above is ``len()`` of it, so the Command already read this list and threw
-    # the contents away.  Tuple, because a Result is frozen.
-    segment_on: tuple[bool, ...] = ()
     clock_24h: bool = True
     week_sunday: bool = False
     memory_ratio: int = 2
@@ -843,6 +942,13 @@ class BackgroundResult(Result):
 class OverlayBackgroundResult(Result):
     key: str = ""
     color: tuple[int, int, int] = (0, 0, 0)
+
+
+@dataclass(frozen=True, slots=True)
+class RecentColorsResult(Result):
+    """The overlay colour editor's recent row, newest first, always full."""
+    key: str = ""
+    colors: tuple[tuple[int, int, int], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1295,6 +1401,14 @@ class DoctorResultPayload(Result):
 class DebugReportPayload(Result):
     output_path: str = ""
     rendered_text: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ApiTlsResult(Result):
+    """The files ``trcc api --tls`` serves.  Strings, so it crosses the socket."""
+    cert: str = ""
+    key: str = ""
+    fingerprint: str = ""
 
 
 # Update check + upgrade

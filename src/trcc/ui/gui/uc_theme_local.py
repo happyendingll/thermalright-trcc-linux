@@ -13,9 +13,12 @@ Features:
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QIcon
+from PySide6.QtCore import Qt, Signal, SignalInstance
+from PySide6.QtGui import QIcon, QIntValidator
 from PySide6.QtWidgets import QLabel, QLineEdit, QPushButton
 
 from ...core.models import LocalThemeItem
@@ -126,49 +129,44 @@ class UCThemeLocal(BaseThemeBrowser):
     Background image provides header. Filter buttons are transparent overlays.
     """
 
-    MODE_ALL = 0
-    MODE_DEFAULT = 1
-    MODE_USER = 2
-
     MAX_SLIDESHOW = 6  # Windows LunBoArrayCount = 6
 
     CMD_THEME_SELECTED = 16
-    CMD_FILTER_CHANGED = 3
     CMD_SLIDESHOW = 48
     CMD_DELETE = 32
+    #: The C#'s delegate code for both game-mode controls (UCThemeLocal.cs:627,
+    #: :726); here it carries the one half that changed.
+    CMD_GAME_MODE = 64
 
     slideshow_changed = Signal(bool, int, list)  # enabled, interval, theme_indices
     delete_requested = Signal(object)  # LocalThemeItem
+    # The C#'s buttonDaoChu / buttonDaoRu (UCThemeLocal 441,28 / 482,28) --
+    # the window owns the file dialogs and the device the theme goes to.
+    export_requested = Signal()
+    import_requested = Signal()
 
     def __init__(self, parent=None):
-        self.filter_mode = self.MODE_ALL
         # Slideshow interaction state lives in a toolkit-free model; this
         # panel renders it (badges, button icon) and exposes a public API
         # so the handler never reaches into private attrs.
         self._slideshow_model = SlideshowModel()
         self._all_themes = []   # Full unfiltered theme list
-        log.info("UCThemeLocal.__init__: filter=%s slideshow=False",
-                 self.MODE_ALL)
+        self._current_path: Path | None = None   # the theme on the panel
+        log.info("UCThemeLocal.__init__: slideshow=False")
         super().__init__(parent)
 
     def _create_filter_buttons(self):
-        """Three filter buttons: All, Default, User + slideshow controls."""
+        """The "All" button + slideshow, export and import controls.
+
+        The C# also builds buttonDefault / buttonUser and HIDES both, for
+        good (``UCThemeLocal.cs:821``, ``:836``, never shown), so the list is
+        always every theme.
+        """
         btn_normal, btn_active = self._load_filter_assets()
-        self._filter_buttons = []
         self._btn_refs = [btn_normal, btn_active]
-
-        configs = [
-            (Layout.LOCAL_BTN_ALL, self.MODE_ALL),
-            (Layout.LOCAL_BTN_DEFAULT, self.MODE_DEFAULT),
-            (Layout.LOCAL_BTN_USER, self.MODE_USER),
-        ]
-        for (x, y, w, h), mode in configs:
-            btn = self._make_filter_button(x, y, w, h, btn_normal, btn_active,
-                self._on_filter_clicked)
-            btn.setProperty('filter_mode', mode)
-            self._filter_buttons.append(btn)
-
-        self._filter_buttons[0].setChecked(True)
+        self.all_btn = self._make_filter_button(
+            *Layout.LOCAL_BTN_ALL, btn_normal, btn_active, self._on_all_clicked)
+        self.all_btn.setChecked(True)
 
         # Slideshow toggle — Windows: buttonLunbo (531, 28) 40x17
         self._lunbo_off = Assets.load_pixmap('theme_local_carousel.png', 40, 17)
@@ -197,18 +195,38 @@ class UCThemeLocal(BaseThemeBrowser):
         )
         self.timer_input.editingFinished.connect(self._on_timer_changed)
 
-        # Export button — Windows: buttonThemeOut (651, 27) 60x18 (empty handler)
-        export_px = Assets.load_pixmap('theme_local_export_all.png', 60, 18)
-        self.export_btn = QPushButton(self)
-        self.export_btn.setGeometry(651, 27, 60, 18)
-        self.export_btn.setFlat(True)
-        self.export_btn.setStyleSheet(Styles.FLAT_BUTTON)
-        self.export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.export_btn.setToolTip("Export all themes")
-        if not export_px.isNull():
-            self.export_btn.setIcon(QIcon(export_px))
-            self.export_btn.setIconSize(self.export_btn.size())
-            self.export_btn._img_ref = export_px  # type: ignore[attr-defined]
+        # Windows: buttonDaoChu (441, 28) / buttonDaoRu (482, 28), 40x18 --
+        # moved here from FormCZTV in 2.1.6.  (The C#'s buttonThemeOut
+        # "export all" at 651,27 is hidden with an empty handler: not built.)
+        self.export_btn = self._icon_button(
+            441, 'app_export.png', "Export the panel's theme",
+            self.export_requested)
+        self.import_btn = self._icon_button(
+            482, 'app_import.png', "Import a theme", self.import_requested)
+
+        self.game = GameModeControls(self)
+
+    def _icon_button(self, x: int, image: str, tip: str,
+                     signal: SignalInstance | Callable[..., Any]) -> QPushButton:
+        """A flat 40x18 picture button on the header row (y=28)."""
+        log.debug("_icon_button: %s at x=%d", image, x)
+        btn = QPushButton(self)
+        btn.setGeometry(x, 28, 40, 18)
+        btn.setFlat(True)
+        btn.setStyleSheet(Styles.FLAT_BUTTON)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setToolTip(tip)
+        pix = Assets.load_pixmap(image, 40, 18)
+        if not pix.isNull():
+            btn.setIcon(QIcon(pix))
+            btn.setIconSize(btn.size())
+        btn.clicked.connect(signal)
+        return btn
+
+    def show_game_mode(self, enabled: bool, threshold: int) -> None:
+        """Show the App's game mode on the panel's two controls -- READ only."""
+        log.debug("UCThemeLocal.show_game_mode: %s/%d", enabled, threshold)
+        self.game.show(enabled, threshold)
 
     def _create_thumbnail(self, item_info: LocalThemeItem) -> ThemeThumbnail:
         return ThemeThumbnail(item_info)
@@ -216,31 +234,17 @@ class UCThemeLocal(BaseThemeBrowser):
     def _no_items_message(self) -> str:
         return "No themes found"
 
-    def _on_filter_clicked(self, *_qt_args):
-        """Filter-button slot — reads filter mode from sender's property."""
-        sender = self.sender()
-        if sender is None:
-            log.debug("UCThemeLocal._on_filter_clicked: sender is None")
-            return
-        mode = sender.property('filter_mode')
-        log.info("UCThemeLocal._on_filter_clicked: mode=%s", mode)
-        if mode is not None:
-            self._set_filter(mode)
-
-    def _set_filter(self, mode):
-        log.info("UCThemeLocal._set_filter: %s -> %s",
-                 self.filter_mode, mode)
-        self.filter_mode = mode
-        for i, btn in enumerate(self._filter_buttons):
-            btn.setChecked(i == mode)
-        self._render_filtered()   # re-filter the cache; no disk re-walk
-        self.invoke_delegate(self.CMD_FILTER_CHANGED, mode)
+    def _on_all_clicked(self, *_qt_args) -> None:
+        """The C#'s buttonAll: show every theme (it is the only list)."""
+        log.info("UCThemeLocal._on_all_clicked")
+        self.all_btn.setChecked(True)
+        self._render_filtered()   # no disk re-walk
 
     def set_themes(self, entries: list[ThemeListEntry]) -> None:
         """Render the browser from ListThemes entries — the universal Command
         result — instead of walking the disk in the View.
 
-        ``origin`` ("user"/"shipped") drives the user/default filter (the
+        ``origin`` ("user"/"shipped") says which themes may be deleted (the
         canonical, location-derived classification); ``preview`` is the tile
         image.  Same data feeds CLI/API/qtgui. (#theme-collision)
         """
@@ -256,29 +260,39 @@ class UCThemeLocal(BaseThemeBrowser):
         self._render_filtered()
 
     def _render_filtered(self) -> None:
-        """Clear + repopulate the grid from the cached ``self._all_themes`` for
-        the current filter mode.  No disk access — re-runnable on a filter click
-        (the filter buttons no longer re-walk the disk)."""
+        """Clear + repopulate the grid from the cached ``self._all_themes``.
+        No disk access — re-runnable on an "All" click."""
+        log.debug("_render_filtered: %d theme(s)", len(self._all_themes))
         self._clear_grid()
         if not self._all_themes:
             self._show_empty_message()
             return
-        if self.filter_mode == self.MODE_DEFAULT:
-            theme_dirs = [t for t in self._all_themes if not t.is_user]
-        elif self.filter_mode == self.MODE_USER:
-            theme_dirs = [t for t in self._all_themes if t.is_user]
-        else:
-            theme_dirs = list(self._all_themes)
-
-        # Tag each with its global index in the unfiltered list
-        for t in theme_dirs:
-            try:
-                t.index = self._all_themes.index(t)
-            except ValueError:
-                t.index = 0
+        theme_dirs = list(self._all_themes)
+        for index, t in enumerate(theme_dirs):
+            t.index = index
 
         self._populate_grid(theme_dirs)
         self._apply_decorations()
+        self._highlight_current()
+
+    def show_current_theme(self, path: Path | None) -> None:
+        """Highlight the theme the panel is showing — sends nothing.
+
+        Remembered, because every re-list (a filter click, a rotation, a
+        theme saved) rebuilds the tiles and drops the highlight.
+        """
+        log.info("UCThemeLocal.show_current_theme: %s → %s",
+                 self._current_path, path)
+        self._current_path = path
+        self._highlight_current()
+
+    def _highlight_current(self) -> None:
+        current = next((w.item_info for w in self.item_widgets
+                        if isinstance(w, BaseThumbnail)
+                        and Path(w.item_info.path) == self._current_path), None)
+        log.debug("_highlight_current: %s → %s", self._current_path,
+                  current.name if current else None)
+        self._select_item(current)
 
     def _populate_grid(self, items: list):
         """Override to connect delete and slideshow signals on thumbnails."""
@@ -295,19 +309,14 @@ class UCThemeLocal(BaseThemeBrowser):
                 continue
 
             info = widget.item_info
-            idx = info.index
             slideshow_on = self._slideshow_model.enabled
 
-            # Delete buttons: not shown in slideshow mode (Windows behavior)
-            if not slideshow_on:
-                # Windows: MODE_ALL/DEFAULT shows delete only on index >= 5
-                # MODE_USER shows delete on ALL themes
-                if self.filter_mode == self.MODE_USER or idx >= 5:
-                    widget.set_deletable(True)
-                else:
-                    widget.set_deletable(False)
-            else:
-                widget.set_deletable(False)
+            # Delete: the user's own themes, never in slideshow mode.  The C#
+            # spells it "index >= 5" because its first five are always the
+            # shipped Theme1-5; ours ship 5 or 10 per resolution, or none
+            # when the download failed, so the position is not the fact --
+            # where the theme lives is.  DeleteTheme refuses the rest anyway.
+            widget.set_deletable(info.is_user and not slideshow_on)
 
             # Slideshow badges
             widget.set_slideshow_mode(slideshow_on)
@@ -396,8 +405,6 @@ class UCThemeLocal(BaseThemeBrowser):
                     break
         return result
 
-    def get_selected_theme(self):
-        return self.selected_item
 
     def forget_slideshow_theme(self, name: str) -> None:
         """Drop a deleted theme from the slideshow array.
@@ -408,3 +415,72 @@ class UCThemeLocal(BaseThemeBrowser):
         """
         log.info("UCThemeLocal.forget_slideshow_theme: %r", name)
         self._slideshow_model.remove_theme(name)
+
+
+class GameModeControls:
+    """Game mode's two controls on the local-theme panel -- the C#'s
+    ``buttonGame`` (228, 28) 40x18 and ``textBoxCPU`` (336, 29) 24x16, two
+    digits, default 75 (UCThemeLocal.cs:910-935).
+
+    Each sends only its own half through the panel's delegate, and neither
+    changes its own look: the App's ``GameModeChanged`` comes back through
+    :meth:`show`, so they show what the App holds.
+    """
+
+    def __init__(self, panel: UCThemeLocal) -> None:
+        log.debug("GameModeControls.__init__: panel=%s", type(panel).__name__)
+        self._panel = panel
+        self.enabled = False
+        self.threshold = 75
+        self._off_px = Assets.load_pixmap('theme_local_game.png', 40, 18)
+        self._on_px = Assets.load_pixmap('theme_local_game_active.png', 40, 18)
+        self.button = panel._icon_button(
+            228, 'theme_local_game.png',
+            "Game mode: while CPU usage stays above the threshold, the panel "
+            "shows only its overlay", self._on_clicked)
+        self.cpu_input = QLineEdit(str(self.threshold), panel)
+        self.cpu_input.setGeometry(336, 29, 24, 16)
+        self.cpu_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.cpu_input.setMaxLength(2)
+        self.cpu_input.setValidator(QIntValidator(0, 99, self.cpu_input))
+        self.cpu_input.setToolTip("Game mode: CPU usage % that takes the panel")
+        self.cpu_input.setStyleSheet(
+            "QLineEdit { background: #232227; color: white; border: none; "
+            "font-family: 'Microsoft YaHei'; font-size: 9pt; }"
+        )
+        self.cpu_input.editingFinished.connect(self._on_threshold_edited)
+
+    def _on_clicked(self, *_qt_args) -> None:
+        """Ask for the switch the other way (Windows: buttonGame_Click)."""
+        log.info("GameModeControls._on_clicked: shown=%s -> asking %s",
+                 self.enabled, not self.enabled)
+        self._panel.invoke_delegate(self._panel.CMD_GAME_MODE, None,
+                                    {"enabled": not self.enabled})
+
+    def _on_threshold_edited(self) -> None:
+        """Send a typed threshold (Windows: textBoxCPU_TextChanged).
+
+        Sent when the edit is finished, not per keystroke as the C# does --
+        "7" on the way to "75" would be a threshold the user never meant.
+        An emptied box shows the saved value again.
+        """
+        text = self.cpu_input.text().strip()
+        log.info("GameModeControls._on_threshold_edited: %r (shown %d)",
+                 text, self.threshold)
+        if not text or int(text) == self.threshold:
+            self.cpu_input.setText(str(self.threshold))
+            return
+        self._panel.invoke_delegate(self._panel.CMD_GAME_MODE, None,
+                                    {"threshold": int(text)})
+
+    def show(self, enabled: bool, threshold: int) -> None:
+        """Show the App's game mode -- READ only (Windows: buttonGame_Set)."""
+        log.info("GameModeControls.show: %s/%d -> %s/%d", self.enabled,
+                 self.threshold, enabled, threshold)
+        self.enabled, self.threshold = enabled, threshold
+        px = self._on_px if enabled else self._off_px
+        if not px.isNull():
+            self.button.setIcon(QIcon(px))
+        if not self.cpu_input.hasFocus():
+            self.cpu_input.setText(str(threshold))
+

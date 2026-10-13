@@ -5,8 +5,7 @@ User flow (designed for non-technical readers):
 * See a table of every user overlay element on that device.
 * "Add element…" opens a dialog: pick text / metric / clock, set
   position + color + size + extras, OK.
-* Double-click a row (or click Edit) to modify; Delete removes;
-  Flash briefly highlights the element on a connected device's screen.
+* Double-click a row (or click Edit) to modify; Delete removes.
 
 Single-layout model (matches the legacy GUI): the device renders ONE
 overlay layout (``resolve_overlay_elements``: user edits > applied mask
@@ -17,10 +16,10 @@ does not add a duplicate on top of the theme.
 """
 from __future__ import annotations
 
-import dataclasses
 import logging
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -43,11 +42,10 @@ from PySide6.QtWidgets import (
 from ....core.commands import (
     AddOverlayElement,
     DeleteOverlayElement,
-    FlashOverlayElement,
-    LcdSnapshot,
     ListFonts,
+    RecentColors,
+    RememberColor,
     ResolveOverlay,
-    SetOverlayConfig,
     UpdateOverlayElement,
 )
 from ..base import BasePanel
@@ -91,11 +89,9 @@ class OverlayEditorPanel(BasePanel):
         self._edit_btn.clicked.connect(self._on_edit)
         self._delete_btn = QPushButton("Delete", self)
         self._delete_btn.clicked.connect(self._on_delete)
-        self._flash_btn = QPushButton("Flash on screen", self)
-        self._flash_btn.clicked.connect(self._on_flash)
 
         button_row = QHBoxLayout()
-        for btn in (self._add_btn, self._edit_btn, self._delete_btn, self._flash_btn):
+        for btn in (self._add_btn, self._edit_btn, self._delete_btn):
             button_row.addWidget(btn)
         button_row.addStretch(1)
 
@@ -126,27 +122,11 @@ class OverlayEditorPanel(BasePanel):
         key = self._key()
         if key is None:
             return
-        # Single-layout model: the editable user layer IS the device's whole
-        # overlay layout.  If the user hasn't edited yet, adopt the active
-        # theme/mask layout into it so the rows shown are what renders and an
-        # incremental Add/Edit/Delete operates on the full layout (the render
-        # draws the user layer as a REPLACEMENT, not on top of the theme).
+        # What the device shows, read and never written: opening or
+        # switching to a device must not change it.  This used to adopt the
+        # theme's layout into the user layer here (a SetOverlayConfig on every
+        # refresh); ``LoadTheme`` adopts it itself, for every UI.
         layout = self.dispatch(ResolveOverlay(key=key))
-        # ``source`` names the WINNING layer, and that is why the seed guard
-        # reads it rather than testing the element list for truthiness.  The
-        # two states a truthiness test collapses are exactly the ones #276
-        # turned on: a user layer of ``[]`` means "the user emptied it" and
-        # must NOT be re-seeded, while no user layer at all reports "theme".
-        # Testing ``not elements`` re-seeded the emptied layer from the theme,
-        # so the last element a user deleted came straight back.
-        if layout.source != "user" and layout.elements:
-            log.info("refresh: adopting the active %s layout into the "
-                     "editable user layer for %s (%d element(s))",
-                     layout.source, key, len(layout.elements))
-            self.dispatch(SetOverlayConfig(
-                key=key, elements=tuple(self._entry_to_dict(e) for e in layout.elements),
-            ))
-            layout = self.dispatch(ResolveOverlay(key=key))
         self._list.clear()
         for element in layout.elements:
             text = self._format_element_row(element)
@@ -162,19 +142,6 @@ class OverlayEditorPanel(BasePanel):
             self._status.setText(
                 f"{len(layout.elements)} element(s) on {key}.",
             )
-
-    @staticmethod
-    def _entry_to_dict(entry) -> dict:
-        """``OverlayElementEntry`` -> the flat dict ``SetOverlayConfig`` takes.
-
-        ``asdict`` rather than a hand-written mapping: the two shapes already
-        agree, and a hand-written one is where a field goes missing silently —
-        ``font`` was added to ``to_dict`` once and not read back, so every
-        user element lost its font on restart.  Round-tripped in tests for
-        text, metric AND clock elements rather than only the one to hand.
-        """
-        log.debug("_entry_to_dict: entry=%s", entry)
-        return dataclasses.asdict(entry)
 
     @staticmethod
     def _format_element_row(element) -> str:
@@ -259,16 +226,27 @@ class OverlayEditorPanel(BasePanel):
         dialog = _ElementDialog(self, prefill=current)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        values = dialog.values()
+        # Only what the user changed.  Every field used to go back: a value
+        # the dialog had clamped (size 256 -> 200) or one another UI changed
+        # while the dialog was open was written over without being touched.
+        changed = dialog.changed_values()
+        if changed.pop("type", None) is not None:
+            log.warning("_on_edit: %s — an element's type cannot be changed "
+                        "by an edit; the rest is applied", eid)
+        if not changed:
+            log.info("_on_edit: %s — nothing changed, nothing sent", eid)
+            self._status.setText("No change.")
+            return
+        # Every field named, None where untouched: the Command leaves a None
+        # field as it is, so only the changes are applied.
         result = self.dispatch(UpdateOverlayElement(
             key=key, element_id=eid,
-            x=values["x"], y=values["y"],
-            color=values["color"], size=values["size"],
-            font=values["font"], bold=values["bold"],
-            italic=values["italic"],
-            text=values["text"], metric=values["metric"],
-            format=values["format"], show_unit=values["show_unit"],
-            source=values["source"],
+            x=changed.get("x"), y=changed.get("y"),
+            color=changed.get("color"), size=changed.get("size"),
+            font=changed.get("font"), bold=changed.get("bold"),
+            italic=changed.get("italic"), text=changed.get("text"),
+            metric=changed.get("metric"), format=changed.get("format"),
+            show_unit=changed.get("show_unit"), source=changed.get("source"),
         ))
         self._status.setText(result.message)
         if result.ok:
@@ -296,25 +274,6 @@ class OverlayEditorPanel(BasePanel):
         if result.ok:
             self.refresh()
 
-    def _on_flash(self) -> None:
-        log.info("_on_flash")
-        key = self._key()
-        eid = self._selected_id()
-        if key is None or eid is None:
-            return
-        # LcdSnapshot guard — flash only makes sense on a connected device.
-        snapshot = self.dispatch(LcdSnapshot(key=key))
-        if not snapshot.ok:
-            self._status.setText(
-                f"Connect to {key} first (Devices panel) before flashing.",
-            )
-            return
-        result = self.dispatch(FlashOverlayElement(
-            key=key, element_id=eid, duration_ms=1500,
-        ))
-        self._status.setText(result.message)
-
-
 # =========================================================================
 # Add/edit dialog
 # =========================================================================
@@ -323,7 +282,7 @@ class OverlayEditorPanel(BasePanel):
 class _ElementDialog(QDialog):
     """Modal form for adding or editing one overlay element."""
 
-    def __init__(self, parent: BasePanel, *, prefill=None) -> None:
+    def __init__(self, parent: OverlayEditorPanel, *, prefill=None) -> None:
         log.debug("__init__: parent=%s", parent)
         super().__init__(parent)
         # The owning panel, held rather than rediscovered through
@@ -337,6 +296,9 @@ class _ElementDialog(QDialog):
         )
         self.setModal(True)
         self._prefill = prefill
+        #: The C#'s myColorChange: a colour chosen here, by the picker or the
+        #: eyedropper, is remembered when the dialog is accepted.
+        self._color_edited = False
         self._build()
 
     def _build(self) -> None:
@@ -438,6 +400,15 @@ class _ElementDialog(QDialog):
         if self._prefill is not None:
             self._apply_prefill(self._prefill)
         self._refresh_visibility()
+        #: What the dialog showed when it opened -- an edit sends what differs.
+        self._opened = self.values()
+
+    def changed_values(self) -> dict:
+        """The fields the user changed since the dialog opened."""
+        now = self.values()
+        changed = {k: v for k, v in now.items() if self._opened.get(k) != v}
+        log.debug("changed_values: %s", sorted(changed))
+        return changed
 
     def _apply_prefill(self, element) -> None:
         log.debug("_apply_prefill: element=%s", element)
@@ -481,12 +452,28 @@ class _ElementDialog(QDialog):
 
     def _pick_color(self) -> None:
         log.debug("_pick_color")
-        from PySide6.QtGui import QColor
+        # The App's recent row, as the dialog's custom colours: the same row
+        # the classic window shows on its 11 swatches.
+        if (key := self._panel._key()) is not None:
+            recent = self._panel.dispatch(RecentColors(key=key))
+            for slot, rgb in enumerate(recent.colors if recent.ok else ()):
+                QColorDialog.setCustomColor(slot, QColor(*rgb))
         current = QColor(self._color)
         picked = QColorDialog.getColor(current, self, "Pick element color")
         if picked.isValid():
             self._color = picked.name()
             self._color_label.setText(self._color)
+            self._color_edited = True
+
+    def accept(self) -> None:
+        """OK: the edit ended, so a colour chosen in it is remembered."""
+        log.debug("accept: color_edited=%s color=%s", self._color_edited,
+                  self._color)
+        if self._color_edited and (key := self._panel._key()) is not None:
+            c = QColor(self._color)
+            self._panel.dispatch(RememberColor(
+                key=key, color=(c.red(), c.green(), c.blue())))
+        super().accept()
 
     def _pick_color_from_screen(self) -> None:
         """Freeze the desktop and let the user pick a pixel colour."""
@@ -501,6 +488,7 @@ class _ElementDialog(QDialog):
         log.info("_on_eyedropper_picked: r=%s g=%s b=%s", r, g, b)
         self._color = f"#{r:02x}{g:02x}{b:02x}"
         self._color_label.setText(self._color)
+        self._color_edited = True
 
     def _pick_metric(self) -> None:
         """Open a modal sensor-picker dialog; commit the chosen sensor id."""

@@ -91,8 +91,11 @@ def test_led_send_reconnects_on_eio_then_succeeds() -> None:
     transport.fail_writes = 1                            # first write of the send fails
 
     assert led.send(_payload()) is True
-    # initial connect opened once; the reconnect opened again.
-    assert transport.open_calls >= 2
+    # initial connect opened once; the reconnect opened ONCE more.  It opened
+    # twice -- ``_reconnect`` opened, then ``connect()`` opened again: a
+    # second libusb handle claiming the interface while the first still held
+    # it, invisible here because a fake's open() is a flag.
+    assert transport.open_calls == 2
 
 
 def test_led_send_escalates_to_disconnect_after_threshold() -> None:
@@ -169,7 +172,7 @@ def test_scsi_send_reconnects_on_eio_then_succeeds() -> None:
     transport.fail_send = 1                          # first CDB of the send raises EIO
 
     assert scsi.send(b"\x00" * 100) is True
-    assert transport.open_calls >= 2
+    assert transport.open_calls == 2                     # connect + reconnect
 
 
 # ── Step 4: per-OS permission hint is injected, not sniffed in core ──────────
@@ -236,3 +239,37 @@ def test_attach_gives_the_device_the_platforms_permission_hint(
     assert platform.permission_denied_hint() in warning, (
         "the platform's own hint must reach the permission-denied warning; "
         f"got: {warning}")
+
+
+def test_a_closed_transport_is_refused_loudly_once_per_closed_spell(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``send() called before connect()`` once per spell, not once per frame.
+
+    MUTATION CHECK: drop the ``_refusing`` guard and five refusals log five
+    ERRORs -- the line that rotated its own cause away on 2026-10-06.
+    """
+    import logging
+
+    from trcc.core.errors import TransportError
+
+    scsi, transport = _connected_scsi()
+
+    def refusals() -> int:
+        return sum(1 for r in caplog.records if r.levelno == logging.ERROR
+                   and "send() called before connect()" in r.getMessage())
+
+    with caplog.at_level(logging.INFO):
+        transport.close()
+        for _ in range(5):
+            with pytest.raises(TransportError):
+                scsi.send(b"\x00" * 100)
+        assert refusals() == 1
+
+        transport.open()
+        assert scsi.send(b"\x00" * 100) is True
+        transport.close()
+        with pytest.raises(TransportError):
+            scsi.send(b"\x00" * 100)
+
+    assert refusals() == 2, "a new closed spell is reported again"

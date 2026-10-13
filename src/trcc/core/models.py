@@ -5,15 +5,24 @@ import logging
 import uuid
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from .logs import per_frame
 
 log = logging.getLogger(__name__)
 frame_log = per_frame(__name__)
+
+# ── The IPC boundary ─────────────────────────────────────────────────────
+#: Field metadata for a value that exists only in this process -- a live
+#: renderer surface.  ``ipc`` leaves the field off the wire and the far side
+#: gets its default: declared, so it is not a surprise to warn about.  Warning
+#: per value wrote a WARNING for every frame a daemon client watched.
+IN_PROCESS_ONLY_KEY = "in_process_only"
+IN_PROCESS_ONLY: Mapping[str, bool] = MappingProxyType({IN_PROCESS_ONLY_KEY: True})
 
 # ── Autostart ────────────────────────────────────────────────────────────
 #: The UIs that can start with the computer, each mapped to the extra argv it
@@ -81,6 +90,8 @@ class Capability(str, Enum):
     ORIENTATION = "orientation"     # rotate the displayed image
     EFFECTS = "effects"             # animated LED modes (breathe, rainbow…)
     LED_ZONES = "led_zones"         # per-zone LED color / brightness
+    THEME = "theme"                 # load / save / restore a theme
+    BACKGROUND = "background"       # the panel's background picture / media
 
 
 _LCD_CAPABILITIES = frozenset({
@@ -90,11 +101,14 @@ _LCD_CAPABILITIES = frozenset({
     Capability.OVERLAY,
     Capability.MASK,
     Capability.ORIENTATION,
+    Capability.THEME,
+    Capability.BACKGROUND,
 })
 
+# No BRIGHTNESS: that capability is the PANEL's (``SetBrightness``).  An LED's
+# brightness is its own Command family, gated by ``_not_an_led``.
 _LED_CAPABILITIES = frozenset({
     Capability.COLOR_FILL,
-    Capability.BRIGHTNESS,
     Capability.EFFECTS,
     Capability.LED_ZONES,
 })
@@ -289,20 +303,6 @@ class UsbPowerState:
 
 
 @dataclass(frozen=True, slots=True)
-class PanelCutout:
-    """Rectangular cutout on the panel (e.g. smartphone-display camera notch).
-
-    Hardware fact — registry data, not user preference.  Populated on a
-    ``VariantOverride`` when the panel has an obstructed region the
-    render pipeline should mask.
-    """
-    x: int
-    y: int
-    w: int
-    h: int
-
-
-@dataclass(frozen=True, slots=True)
 class ProductInfo:
     """One row in the hardware registry.
 
@@ -310,7 +310,7 @@ class ProductInfo:
     vendor/product strings, wire protocol, native resolution, supported
     rotations, LED style if applicable.
 
-    ``button_image`` / ``panel_cutout`` carry registry-default values;
+    ``button_image`` carries a registry-default value;
     ``ConnectDevice`` resolves a ``VariantOverride`` after handshake and
     swaps the field via ``dataclasses.replace`` when the device's
     PM/SUB fingerprint identifies a more specific variant.
@@ -335,12 +335,11 @@ class ProductInfo:
     volatile_frames: bool = False
     model: str = "CZTV"                 # GUI sidebar button-image lookup
     button_image: str = "A1CZTV"        # asset base name (no .png)
-    panel_cutout: PanelCutout | None = None  # set post-handshake
 
     @property
     def key(self) -> str:
-        """Stable identifier: '0402:3922'."""
-        key = f"{self.vid:04x}:{self.pid:04x}"
+        """Stable identifier: '0402:3922' — the MODEL, never a unit."""
+        key = format_device_key(self.vid, self.pid)
         frame_log.debug("ProductInfo.key: %s", key)
         return key
 
@@ -352,8 +351,11 @@ class ProductInfo:
         Keyed by ``kind`` so a standard product declares nothing extra;
         an unknown kind yields the empty set (no Command applies).
         """
-        log.debug("capabilities")
-        return CAPABILITIES_BY_KIND.get(self.kind, frozenset())
+        capabilities = CAPABILITIES_BY_KIND.get(self.kind, frozenset())
+        frame_log.debug("ProductInfo.capabilities: %s %s -> %s",
+                        format_device_key(self.vid, self.pid), self.kind.value,
+                        sorted(c.value for c in capabilities))
+        return capabilities
 
 
 # =========================================================================
@@ -386,6 +388,33 @@ class DisplaySession:
     desktops: tuple[str, ...] = ()
 
 
+def format_device_key(vid: int, pid: int, unit: str = "") -> str:
+    """A device's public key: ``vid:pid``, or ``vid:pid@unit`` for a twin (#287).
+
+    The ONE place the format is written.  ``DeviceInfo.key``, ``Device.key``
+    and the scan-cache lookup all build it here, and :func:`parse_device_key`
+    is its exact inverse — the key is made in three places and read in six,
+    and a format spelled more than once is how one of them drifts.
+    """
+    frame_log.debug("format_device_key: %04x:%04x unit=%r", vid, pid, unit)
+    base = f"{vid:04x}:{pid:04x}"
+    return f"{base}@{unit}" if unit else base
+
+
+def parse_device_key(key: str) -> tuple[int, int, str]:
+    """``(vid, pid, unit)`` from a device key; raises ``ValueError`` if malformed.
+
+    The unit stays opaque — split off at ``@`` and handed back untouched,
+    never interpreted.  It used to be dropped by five ``key.split(":")`` sites,
+    each of which rejected ``87ad:70db@1-13`` as invalid, so a second identical
+    cooler could be scanned but never connected, rotated or sized (#287).
+    """
+    frame_log.debug("parse_device_key: %s", key)
+    ids, _, unit = key.partition("@")
+    vid, pid = ids.split(":")
+    return int(vid, 16), int(pid, 16), unit
+
+
 @dataclass(frozen=True, slots=True)
 class DeviceInfo:
     """Live device, produced by Platform.scan_devices().
@@ -400,11 +429,24 @@ class DeviceInfo:
     path: str | None = None
     serial: str | None = None
     bcd_device: int = 0
+    #: Set ONLY when another unit shares this VID/PID — see
+    #: :func:`trcc.adapters.system._base.disambiguate`.  Empty is the normal
+    #: case and keeps :attr:`key` at the plain ``vid:pid`` every config file,
+    #: CLI invocation and API route in the wild already uses.
+    unit: str = ""
 
     @property
     def key(self) -> str:
+        """The device's public identity — settings key, CLI arg, API path.
+
+        ``vid:pid`` unless a second unit of the same model is plugged in, in
+        which case the port is appended: ``87ad:70db@1-13`` (#287).  The
+        suffix is OPAQUE — split off, never interpreted — and only ever
+        appears when it has to, so a user with one cooler sees the same
+        string they always have and their ``trcc.json`` keeps matching.
+        """
         frame_log.debug("key")
-        return f"{self.vid:04x}:{self.pid:04x}"
+        return format_device_key(self.vid, self.pid, self.unit)
 
     @property
     def quirks(self) -> DeviceQuirks:
@@ -430,6 +472,10 @@ class DeviceQuirks:
     short_handshake: bool = False   # accept the firmware's short (<20-byte) reply
     portrait_native: bool = False   # device self-orients: 240×320 raster, no pre-rotate
     keepalive_stream: bool = False  # never skip an unchanged frame (panel blanks when idle)
+    # Never reconnect: a close→reopen wedges the panel until a replug.  A
+    # GUESS from the fingerprint until the panel answers: one that takes the
+    # ordinary handshake survives a reopen, and HidLcd drops it (#283).
+    single_session: bool = False
 
 
 _NO_QUIRKS = DeviceQuirks()
@@ -439,10 +485,11 @@ DEVICE_QUIRKS: dict[tuple[int, int, int], DeviceQuirks] = {
     # Frozen Warframe SE, firmware bcdDevice 4.07 (#228, adamkoehler1990):
     # reverse-engineered — needs HID output reports (pyusb bulk is ignored),
     # no init packet, an 8-byte handshake reply, a portrait-native 240×320
-    # raster (no pre-rotate), and a continuous frame stream (blanks when idle).
+    # raster (no pre-rotate), a continuous frame stream (blanks when idle),
+    # and one session -- a reopen wedges it.
     (0x0416, 0x5302, 0x0407): DeviceQuirks(
         hid_reports=True, skip_init=True, short_handshake=True,
-        portrait_native=True, keepalive_stream=True,
+        portrait_native=True, keepalive_stream=True, single_session=True,
     ),
 }
 
@@ -467,7 +514,10 @@ class HandshakeResult:
     pm_byte: int = 0
     sub_byte: int = 0
     fbl: int | None = None
-    raw_response: bytes = b""
+    #: Dropped from the repr: %s on this dataclass is a log record, and a
+    #: handshake reply rendered whole made one 230 KB.  Sites that want the
+    #: bytes log ``Blob(result.raw_response)`` explicitly.
+    raw_response: bytes = field(default=b"", repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -478,7 +528,7 @@ class LedHandshakeResult:
     style: LedStyle | None = None
     model_name: str = ""
     style_sub: int = 0
-    raw_response: bytes = b""
+    raw_response: bytes = field(default=b"", repr=False)
 
 
 # =========================================================================
@@ -489,7 +539,8 @@ class LedHandshakeResult:
 @dataclass(frozen=True, slots=True)
 class RawFrame:
     """Decoded video frame — RGB24 bytes.  Handed to Renderer."""
-    data: bytes
+    #: Out of the repr — a decoded RGB24 frame is megabytes.
+    data: bytes = field(repr=False)
     width: int
     height: int
 
@@ -525,6 +576,7 @@ class ThemeDir:
       td.preview  → Theme.png     (panel thumbnail; never rendered)
       td.dc       → config1.dc    (binary overlay layout)
       td.zt       → Theme.zt      (legacy JPEG-sequence animation)
+      ThemeDir.video(".mp4") → Theme.mp4 (any animated background, by suffix)
       td.json     → trcc.json     (next/-native JSON config)
       td.legacy_json → config.json (legacy JSON, read for fallback)
     """
@@ -563,18 +615,21 @@ class ThemeDir:
 
     @property
     def preview(self) -> Path:
-        log.debug("preview")
-        return self.path / self.PREVIEW
+        path = self.path / self.PREVIEW
+        frame_log.debug("ThemeDir.preview: %s", path)
+        return path
 
     @property
     def dc(self) -> Path:
-        log.debug("dc")
-        return self.path / self.DC
+        path = self.path / self.DC
+        frame_log.debug("ThemeDir.dc: %s", path)
+        return path
 
     @property
     def json(self) -> Path:
-        log.debug("json")
-        return self.path / self.JSON
+        path = self.path / self.JSON
+        frame_log.debug("ThemeDir.json: %s", path)
+        return path
 
     @property
     def legacy_json(self) -> Path:
@@ -585,6 +640,15 @@ class ThemeDir:
     def zt(self) -> Path:
         log.debug("zt")
         return self.path / self.ZT
+
+    @staticmethod
+    def video(ext: str) -> str:
+        """The member name an animated background with suffix *ext* takes
+        in a theme dir -- ``Theme.mp4``, ``Theme.gif``, ... (``Theme.zt`` is
+        the C#'s own; the rest keep their container)."""
+        name = f"Theme{ext.lower()}"
+        log.debug("ThemeDir.video: %s -> %s", ext, name)
+        return name
 
     def __truediv__(self, other: str) -> Path:
         log.debug("__truediv__: other=%s", other)
@@ -658,8 +722,6 @@ class DeviceSettings:
     orientation: int = 0
     brightness: int = 100
     current_theme: str | None = None
-    time_format: Literal["12h", "24h"] = "24h"
-    date_format: str = "yyyy/MM/dd"
     temp_unit: TempUnit = "C"
     overlay_enabled: bool = True
     mask_position: tuple[int, int] | None = None
@@ -667,7 +729,12 @@ class DeviceSettings:
     # Split-mode (Dynamic Island) style for 1600×720 widescreen panels.
     # 0 = off (no split overlay), 1/2/3 = style A/B/C.  Ignored by
     # rendering on devices whose profile.resolution isn't widescreen.
-    split_mode: int = 0
+    # Default 2 until someone chooses: the C# starts at style 2
+    # (``FormLCD.cs:232`` ``myLddVal = 2``).  It was 0 here, and only the gui
+    # made it 2 -- by WRITING it on open -- so a panel driven by qtgui, the
+    # CLI or the API showed no Dynamic Island, and the gui overrode a chosen
+    # "off".  A saved value, 0 included, loads unchanged.
+    split_mode: int = 2
     # User-supplied mask path that overrides the active theme's mask.
     # None = use the theme's bundled mask (or no mask if the theme has none).
     mask_path: str | None = None
@@ -682,6 +749,15 @@ class DeviceSettings:
     # ref and a reload can resume it.  Mutually exclusive with a video/image
     # background (the toggles are).
     screencast_region: tuple[int, int, int, int, bool] | None = None
+    # The device's screencast REGION, cast or not -- the C#'s JpX, JpY, JpW,
+    # JpH, kept as the theme's DC stores them (``core.geometry.screencast_axes``
+    # turns them into a screen box).  Seeded from every theme and mask DC the
+    # device loads (FormCZTV.cs:6805), edited by ``SetScreencastRegion``,
+    # written back on save.  ``None`` = never seeded: the C#'s default applies.
+    screencast_rect: tuple[int, int, int, int] | None = None
+    # The C#'s ``myYcbk``: HIDE the on-screen region frame.  True by default,
+    # as in the C# (FormCZTV.cs:316).
+    screencast_hide_border: bool = True
     # Active media-player source URI — the display source when the media-player
     # toggle is on.  A URI: a local path OR a URL/stream (http, https, rtsp, …).
     # ``None`` = not playing media.  Persisted like ``background_path`` so
@@ -698,6 +774,12 @@ class DeviceSettings:
     background_mode: Literal["theme", "color", "transparent"] = "theme"
     # Solid color used when ``background_mode == 'color'`` (RGB 0-255).
     overlay_background: tuple[int, int, int] = (0, 0, 0)
+    # The overlay colour editor's remembered colours, newest first, at most
+    # RECENT_COLOR_SLOTS -- the C#'s button1..11 row, saved per device to
+    # ``USBLCD\Device\Color.dc`` (UCXiTongXianShiColor.cs:198-275).  Only the
+    # colours actually remembered are kept; a read pads the row with
+    # RECENT_COLOR_DEFAULT, the C#'s designer colour.
+    recent_colors: list[tuple[int, int, int]] = field(default_factory=list)
     # The device's WORKING overlay layer — the one layout that is edited,
     # rendered and saved, mirroring the C#'s single ``UCXiTongXianShiSubArray``
     # (2.1.6 FormCZTV.cs).  A source change (theme load, mask apply, save)
@@ -709,12 +791,55 @@ class DeviceSettings:
     # what made a deleted last element reappear (#276).  Config schema 2; a v1
     # config's ``[]`` is migrated to ``None`` (``settings._migrate_device``).
     user_overlay_elements: list[OverlayElement] | None = None
+    # The theme catalog folder that layer was laid out in (``theme854480``) —
+    # the C#'s ``ThemeML``, which keys every layout by resolution AND
+    # orientation.  A re-root into another folder (a rotation, or the same key
+    # on another panel) takes that folder's own layout, as the C# reload does.
+    # ``None``: not recorded, a config from before 2026-09-30.
+    user_overlay_catalog: str | None = None
     # Slideshow config — rotates through ``slideshow_themes`` every
     # ``slideshow_interval_s`` seconds while ``slideshow_enabled`` is true.
     # Cursor + timing live in SlideshowService (transient, not persisted).
     slideshow_enabled: bool = False
     slideshow_interval_s: float = 60.0
     slideshow_themes: list[str] = field(default_factory=list)
+    # Game mode -- the C#'s ``isGame`` / ``myCPU`` (UCThemeLocal.cs:122-123):
+    # while on, a CPU usage above ``game_threshold`` percent for 11 seconds
+    # running swaps the panel to a black, overlay-only frame.  The threshold
+    # box holds two digits, so 0-99.
+    game_enabled: bool = False
+    game_threshold: int = 75
+    # Per-orientation memory -- the C#'s per-folder ``Theme.dc``.  The fields
+    # above are the folder the panel is in (``active_catalog``); every OTHER
+    # folder this panel has shown keeps its own theme, brightness, split mode,
+    # slideshow and game mode in ``orientation_slots``, swapped back in when the panel
+    # returns there (FormCZTV.ReadFileThemeSub / ChangeFileTheme).  ``None``:
+    # not recorded yet -- the next connect or rotation records it.
+    active_catalog: str | None = None
+    orientation_slots: dict[str, OrientationState] = field(default_factory=dict)
+    # Whether the active folder's values are the user's.  ``None``: they are
+    # (restored from its slot, or a config from before this) -- kept on
+    # leaving.  A value: the folder was entered with nothing saved, and holds
+    # what it showed then; leaving keeps a slot only if something changed
+    # since.  The C# keeps a folder's ``Theme.dc`` only once a user action
+    # writes it, so an untouched folder reads as empty and carries over.
+    entered_with: OrientationState | None = None
+
+
+@dataclass
+class OrientationState:
+    """What a panel keeps per theme folder -- the C#'s 48-byte ``Theme.dc``
+    (theme, slideshow, split mode, brightness, game mode; FormCZTV.cs:6213-6231).
+    Always taken from a :class:`DeviceSettings`, so its defaults are that
+    class's."""
+    current_theme: str | None = DeviceSettings.current_theme
+    brightness: int = DeviceSettings.brightness
+    split_mode: int = DeviceSettings.split_mode
+    slideshow_enabled: bool = DeviceSettings.slideshow_enabled
+    slideshow_interval_s: float = DeviceSettings.slideshow_interval_s
+    slideshow_themes: list[str] = field(default_factory=list)
+    game_enabled: bool = DeviceSettings.game_enabled
+    game_threshold: int = DeviceSettings.game_threshold
 
 
 # =========================================================================
@@ -772,8 +897,8 @@ def element_family(data: Mapping[str, Any]) -> str:
       the family arrives as ``name``;
     * ``OverlayElement.to_dict`` writes ``name``, while ``dataclasses.asdict``
       persists the dataclass FIELD name, ``font``;
-    * ``ui/presentation/overlay_serialization`` NESTS it under
-      ``font["name"]`` for the editor's keyed shape.
+    * the gui editor's old keyed shape NESTED it under ``font["name"]``;
+      that shape is gone, and the nested read stays for data written by it.
 
     ``from_dict`` and the render path each resolved this privately, with
     OPPOSITE precedence, and handed back different families for one input --
@@ -789,6 +914,18 @@ def element_family(data: Mapping[str, Any]) -> str:
     family = str(data.get("name") or nested or "")
     frame_log.debug("element_family: %r", family)
     return family
+
+
+def new_overlay_id() -> str:
+    """A fresh, unique overlay element id — THE one place ids are minted.
+
+    Every UI that creates an element and every Command that accepts one
+    without an id draws from here, so two producers cannot pick colliding
+    schemes (the gui's positional ``el_0..`` re-mint did exactly that).
+    """
+    element_id = f"el_{uuid.uuid4().hex[:8]}"
+    log.debug("new_overlay_id: %s", element_id)
+    return element_id
 
 
 @dataclass
@@ -833,7 +970,7 @@ class OverlayElement:
 
     def to_dict(self) -> dict:
         """Flat dict — the shape ``OverlayService.render`` consumes."""
-        log.debug("to_dict")
+        frame_log.debug("OverlayElement.to_dict: %s (%s)", self.id, self.type)
         out: dict = {
             "id": self.id,
             "type": self.type,
@@ -868,7 +1005,7 @@ class OverlayElement:
         """
         log.debug("from_dict: data=%s", data)
         return cls(
-            id=str(data.get("id") or "") or f"el_{uuid.uuid4().hex[:8]}",
+            id=str(data.get("id") or "") or new_overlay_id(),
             type=data.get("type", "text"),
             x=int(data.get("x", 0)),
             y=int(data.get("y", 0)),
@@ -905,6 +1042,9 @@ ACTION_ICON_IMAGES: dict[str, str] = {
     "VideoLoad": "display_mode_icon_livestream.png",
     "GIF":       "display_mode_icon_gif.png",
     "Network":   "display_mode_icon_network.png",
+    # The media player's web source -- no C# twin (its player opens files only);
+    # the C#'s network art, since the C# names its load icon 直播 (live).
+    "VideoUrl":  "display_mode_icon_network.png",
 }
 
 
@@ -999,6 +1139,7 @@ class Metric:
     field: str        #: ``HardwareMetrics`` attribute — "cpu_temp"
     sensor_id: str    #: render / DC vocabulary — "cpu:temp"
     fmt: str          #: default format string — "{value:.0f}°C"
+    label: str        #: the C# dashboard row's name — "TEMP"
 
     @property
     def pair(self) -> tuple[int, int]:
@@ -1080,41 +1221,63 @@ _RPM = "{value:.0f} RPM"
 #: it below, so a name cannot drift from the pair that selects it.
 METRICS = MetricCatalog(
     (
+        # One row per C# dashboard row: a DC pair is "panel ``main``, row
+        # ``sub``" (UCXiTongXianShiSub.cs:221-245 reads that row's label and
+        # value), so the rows follow the C#'s defaults in
+        # UCSystemInfoOptions.InitUCSystemInfoOptionsOneVal, case main+1.
         # CPU (main_count=0)
-        Metric(0, 1, "cpu_temp", "cpu:temp", _TEMP),
-        Metric(0, 2, "cpu_percent", "cpu:usage", _PCT),
-        Metric(0, 3, "cpu_freq", "cpu:freq", _MHZ),
-        Metric(0, 4, "cpu_power", "cpu:power", _WATT),
+        Metric(0, 1, "cpu_temp", "cpu:temp", _TEMP, "TEMP"),
+        Metric(0, 2, "cpu_percent", "cpu:usage", _PCT, "Usage"),
+        Metric(0, 3, "cpu_freq", "cpu:freq", _MHZ, "Clock"),
+        Metric(0, 4, "cpu_power", "cpu:power", _WATT, "Power"),
         # GPU (main_count=1)
-        Metric(1, 1, "gpu_temp", "gpu:primary:temp", _TEMP),
-        Metric(1, 2, "gpu_usage", "gpu:primary:usage", _PCT),
-        Metric(1, 3, "gpu_clock", "gpu:primary:clock", _MHZ),
-        Metric(1, 4, "gpu_power", "gpu:primary:power", _WATT),
+        Metric(1, 1, "gpu_temp", "gpu:primary:temp", _TEMP, "TEMP"),
+        Metric(1, 2, "gpu_usage", "gpu:primary:usage", _PCT, "Usage"),
+        Metric(1, 3, "gpu_clock", "gpu:primary:clock", _MHZ, "Clock"),
+        Metric(1, 4, "gpu_power", "gpu:primary:power", _WATT, "Power"),
         # MEM (main_count=2)
-        Metric(2, 1, "mem_percent", "memory:percent", _PCT),
-        Metric(2, 2, "mem_clock", "memory:clock", _MHZ),
-        Metric(2, 3, "mem_available", "memory:available", "{value:.0f} MB"),
-        Metric(2, 4, "mem_temp", "memory:temp", _TEMP),
+        Metric(2, 1, "mem_temp", "memory:temp", _TEMP, "TEMP"),
+        Metric(2, 2, "mem_percent", "memory:percent", _PCT, "Usage"),
+        Metric(2, 3, "mem_clock", "memory:clock", _MHZ, "Clock"),
+        Metric(2, 4, "mem_available", "memory:available", "{value:.0f} MB",
+               "Available"),
         # HDD (main_count=3)
-        Metric(3, 1, "disk_read", "disk:read", "{value:.0f} MB/s"),
-        Metric(3, 2, "disk_write", "disk:write", "{value:.0f} MB/s"),
-        Metric(3, 3, "disk_activity", "disk:activity", _PCT),
-        Metric(3, 4, "disk_temp", "disk:temp", _TEMP),
+        Metric(3, 1, "disk_temp", "disk:temp", _TEMP, "TEMP"),
+        Metric(3, 2, "disk_activity", "disk:activity", _PCT, "Activity"),
+        Metric(3, 3, "disk_read", "disk:read", "{value:.0f} MB/s", "Read"),
+        Metric(3, 4, "disk_write", "disk:write", "{value:.0f} MB/s", "Write"),
         # NET (main_count=4)
-        Metric(4, 1, "net_down", "net:down", "{value:.0f} KB/s"),
-        Metric(4, 2, "net_up", "net:up", "{value:.0f} KB/s"),
-        Metric(4, 3, "net_total_down", "net:total_down", "{value:.0f} MB"),
-        Metric(4, 4, "net_total_up", "net:total_up", "{value:.0f} MB"),
+        Metric(4, 1, "net_up", "net:up", "{value:.0f} KB/s", "UP rate"),
+        Metric(4, 2, "net_down", "net:down", "{value:.0f} KB/s", "DL rate"),
+        Metric(4, 3, "net_total_up", "net:total_up", "{value:.0f} MB",
+               "Total UP"),
+        Metric(4, 4, "net_total_down", "net:total_down", "{value:.0f} MB",
+               "Total DL"),
         # FAN (main_count=5)
-        Metric(5, 1, "fan_cpu", "fan:cpu", _RPM),
-        Metric(5, 2, "fan_gpu", "fan:gpu", _RPM),
-        Metric(5, 3, "fan_ssd", "fan:ssd", _RPM),
-        Metric(5, 4, "fan_sys2", "fan:sys2", _RPM),
+        Metric(5, 1, "fan_cpu", "fan:cpu", _RPM, "CPUFAN"),
+        Metric(5, 2, "fan_gpu", "fan:gpu", _RPM, "GPUFAN"),
+        Metric(5, 3, "fan_ssd", "fan:ssd", _RPM, "FAN1"),
+        Metric(5, 4, "fan_sys2", "fan:sys2", _RPM, "FAN2"),
     ),
     # Fan-LCD sentinel: the C# maps main_count 10000 to the cooler's own fan
     # RPM (UCXiTongXianShiSubTimer: label1="FAN", label2=RPM, label3="RPM").
     aliases={(10000, 1): "fan:cpu"},
 )
+
+
+def percent_only(readings: Mapping[str, float], sensor_id: str) -> float | None:
+    """The duty percent of a fan slot that has no RPM, else ``None``.
+
+    GPUFAN is RPM, but a driver may expose only a duty cycle; the sensors then
+    fill ``fan:gpu:percent`` instead of ``fan:gpu`` (``SensorEnumerator.
+    fan_slots``).  Every face showing the slot asks this, so the one rule --
+    draw that value with "%", never under "RPM" (#145) -- lives once.
+    """
+    if sensor_id in readings:
+        return None
+    duty = readings.get(f"{sensor_id}:percent")
+    frame_log.debug("percent_only: %s -> %s", sensor_id, duty)
+    return duty
 
 #: Seconds between screencast frames — one cadence, so a headless cast moves
 #: at the same rate as one driven from the window.  Lives in core because both
@@ -1133,12 +1296,31 @@ METRICS = MetricCatalog(
 #: against the oracle, and 2.5x slower than the app being ported.
 SCREENCAST_TICK_S = 0.06
 
+#: The C#'s screencast region before any theme sets one -- JpX, JpY, JpW, JpH
+#: (FormCZTV.cs:324-330), in the DC's own axes.
+SCREENCAST_DEFAULT_RECT: tuple[int, int, int, int] = (0, 0, 240, 320)
+
+#: The media player's cadence for a web source: 62.5 ms, the C# player's own
+#: step (``UCBoFangQiKongZhi.cs:1129``, ``nowTimerVal += 62.5``) -- 16 fps.
+STREAM_TICK_S = 0.0625
+
+#: The URL schemes the media player will open.  An allow-list, not a deny-list:
+#: ``file:///…`` contains ``://`` too, and would read any local file past the
+#: API's path confinement, so everything not named here is refused.
+STREAM_SCHEMES: frozenset[str] = frozenset({"http", "https", "rtsp"})
+
 #: How often the slideshow driver ASKS whether a rotation is due.  It is a poll
 #: interval, not the slideshow interval: ``AdvanceSlideshow`` owns due-ness and
 #: reads it from ``DeviceSettings.slideshow_interval_s``, so this only bounds
 #: how late a switch can be.  One second against a default 30-second slideshow
 #: is 3% late at worst, and the poll itself is a settings read.
 SLIDESHOW_POLL_S = 1.0
+
+#: How often game mode reads its row: the C#'s check runs every 64th tick
+#: (FormCZTV.cs:2849) of a 15 ms timer (Form1.cs:502), which Windows fires at
+#: its 15.625 ms resolution -- the C# counts it so itself (FormCZTV.cs:2997).
+#: One second; its 11-reading counts are 11 seconds each way.
+GAME_MODE_TICK_S = 1.0
 
 
 # =========================================================================
@@ -1286,10 +1468,204 @@ ZT_FPS: int = 24
 #: the timestamp table is cumulative and rounding early accumulates.
 ZT_FRAME_INTERVAL_MS: float = 1000.0 / ZT_FPS
 
+#: The trimmer's frame-rate choice.  The C#'s two buttons set
+#: ``originalImageHz`` to 15 or 24 (``UCVideoCut.cs:2712-2723``), starting at
+#: 15 (:120), and it reaches the encoder's ``-r``, the ``.zt`` timestamps and
+#: the preview's rate.  :data:`ZT_FPS` stays the fixed rate of a whole-video
+#: bake, as the C#'s ``My_Video_To_Theme`` (``FormCZTV.cs:2663-2682``) is.
+CUTTER_FPS_CHOICES: tuple[int, ...] = (15, 24)
+CUTTER_DEFAULT_FPS: int = 15
+
 #: Longest clip the exporter will encode — the legacy soft cap.  UIs clamp
 #: their trim handles to it so a user cannot ask for a clip the encoder
 #: will refuse.
 ZT_MAX_DURATION_MS: int = 300_000
+
+
+class RgbFollowMode(str, Enum):
+    """What follows the LED cooler's colours (#160) -- one at a time.
+
+    ``OPENRGB``: the devices of an OpenRGB SDK server.  ``RAM``: Corsair RGB
+    memory, driven directly over the SMBus with no OpenRGB running.  One
+    choice, so TRCC and OpenRGB never drive the same sticks at once.
+    """
+    OFF = "off"
+    OPENRGB = "openrgb"
+    RAM = "ram"
+
+
+class FollowMapping(str, Enum):
+    """How an LCD's picture lights the devices that follow it.
+
+    ``HALVES``: the panel split into a column per device, left to right; each
+    device shows its column top to bottom.  ``SINGLE``: the whole panel as one
+    column, top to bottom, the same on every device.
+    """
+    HALVES = "halves"
+    SINGLE = "single"
+
+
+class FollowColors(str, Enum):
+    """How a region of an LCD's picture becomes one light's colour.
+
+    ``VIVID``: its brightest pixels -- a small yellow star in a red sky still
+    shows.  ``SMOOTH``: all of it, averaged -- steadier, but small bright
+    details drown.  Picked between on the maintainer's sticks, 2026-10-10.
+    """
+    VIVID = "vivid"
+    SMOOTH = "smooth"
+
+
+@dataclass(frozen=True, slots=True)
+class RgbMirrorDevice:
+    """One device of another RGB system that follows the cooler (#160).
+
+    ``index`` is the device's place in that system's list -- what every
+    later request names it by.  ``led_count`` is how many colours it takes.
+    ``ref`` names it across scans, which ``index`` cannot: a rescan renumbers.
+    Corsair RAM's is its bus and address, ``i2c-3/0x19``; empty where the
+    other system has no stable name.
+    """
+    index: int
+    name: str
+    led_count: int
+    ref: str = ""
+
+
+class RamAccessState(str, Enum):
+    """Whether this user may reach RGB memory's bus (the chipset SMBus).
+
+    ``ON``: TRCC's opt-in grant is installed and in effect.  ``ELSEWHERE``:
+    access comes from another rule (OpenRGB's, say), not TRCC's.  ``OFF``: no
+    access; enabling grants it.  ``NOT_APPLIED``: TRCC's grant is installed but
+    this session did not get it (log out and back in).  ``NO_BUS``: no chipset
+    SMBus here.  ``UNSUPPORTED``: not on this OS yet.
+    """
+    ON = "on"
+    ELSEWHERE = "elsewhere"
+    OFF = "off"
+    NOT_APPLIED = "not-applied"
+    NO_BUS = "no-bus"
+    UNSUPPORTED = "unsupported"
+
+
+@dataclass(frozen=True, slots=True)
+class RamAccessStatus:
+    """The state, said in words, and how to change it from here.
+
+    ``command`` is empty when this App can enable it itself (a password
+    prompt); otherwise it is the terminal command that will.
+    """
+    state: RamAccessState
+    message: str
+    command: str = ""
+
+
+class RamEffect(str, Enum):
+    """An effect Corsair RGB memory runs by itself, saved on the stick."""
+    STATIC = "static"
+    COLOR_SHIFT = "color-shift"
+    COLOR_PULSE = "color-pulse"
+    RAINBOW = "rainbow"
+    RAINBOW_WAVE = "rainbow-wave"
+    COLOR_WAVE = "color-wave"
+    VISOR = "visor"
+    RAIN = "rain"
+    MARQUEE = "marquee"
+    SEQUENTIAL = "sequential"
+
+
+class EffectSpeed(str, Enum):
+    """The three speeds the stick knows."""
+    SLOW = "slow"
+    MEDIUM = "medium"
+    FAST = "fast"
+
+
+class EffectDirection(str, Enum):
+    """Which way an effect moves along the stick."""
+    UP = "up"
+    DOWN = "down"
+    LEFT = "left"
+    RIGHT = "right"
+    VERTICAL = "vertical"
+    HORIZONTAL = "horizontal"
+
+
+@dataclass(frozen=True, slots=True)
+class EffectTraits:
+    """What an effect takes -- the controls a UI shows for it.
+
+    ``colors`` is how many it needs (0-2); ``random`` whether the stick can
+    pick them itself; ``directions`` the ways it can move, the first being
+    its default.
+    """
+    speed: bool
+    colors: int
+    random: bool
+    brightness: bool
+    directions: tuple[EffectDirection, ...] = ()
+
+
+_UD = (EffectDirection.DOWN, EffectDirection.UP)
+_UDLR = (*_UD, EffectDirection.LEFT, EffectDirection.RIGHT)
+
+#: Each effect's controls, as OpenRGB's ``RGBController_CorsairDRAM.cpp``
+#: declares them (credited in ``adapters/rgb/corsair_dram.py``).
+EFFECT_TRAITS: dict[RamEffect, EffectTraits] = {
+    RamEffect.STATIC: EffectTraits(speed=False, colors=1, random=False,
+                                   brightness=False),
+    RamEffect.COLOR_SHIFT: EffectTraits(True, 2, True, True),
+    RamEffect.COLOR_PULSE: EffectTraits(True, 2, True, True),
+    RamEffect.RAINBOW: EffectTraits(True, 0, False, False),
+    RamEffect.RAINBOW_WAVE: EffectTraits(True, 0, False, False, _UDLR),
+    RamEffect.COLOR_WAVE: EffectTraits(True, 2, True, True, _UDLR),
+    RamEffect.VISOR: EffectTraits(
+        True, 2, True, True,
+        (EffectDirection.VERTICAL, EffectDirection.HORIZONTAL)),
+    RamEffect.RAIN: EffectTraits(True, 2, True, True, _UD),
+    RamEffect.MARQUEE: EffectTraits(True, 1, False, True),
+    RamEffect.SEQUENTIAL: EffectTraits(True, 1, True, True, _UD),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class RamEffectSettings:
+    """One effect, as the user set it.  ``direction`` None is the effect's
+    default; ``colors`` holds as many as its traits ask for."""
+    effect: RamEffect
+    speed: EffectSpeed = EffectSpeed.MEDIUM
+    direction: EffectDirection | None = None
+    colors: tuple[tuple[int, int, int], ...] = ()
+    random_colors: bool = False
+    brightness: int = 255
+
+
+class LightKind(str, Enum):
+    """What drives a light: TRCC itself (RGB memory) or OpenRGB."""
+    RAM = "ram"
+    OPENRGB = "openrgb"
+
+
+@dataclass(frozen=True, slots=True)
+class RgbLight:
+    """One light the RGB page lists: a RAM stick, or one of OpenRGB's devices.
+
+    ``ref`` names it across scans (a stick's ``i2c-3/0x19``, an OpenRGB
+    device's name).  ``effect`` is, for a RAM stick, the effect TRCC last
+    saved on it -- what TRCC set, not read back from the stick.
+    """
+    ref: str
+    name: str
+    led_count: int
+    kind: LightKind
+    effect: RamEffectSettings | None = None
+
+
+#: The overlay colour editor's recent-colour row: 11 swatches, Silver until
+#: a colour is remembered (``UCXiTongXianShiColor.cs:931``, ``Color.Silver``).
+RECENT_COLOR_SLOTS: int = 11
+RECENT_COLOR_DEFAULT: tuple[int, int, int] = (192, 192, 192)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1305,6 +1681,9 @@ class VideoExportRequest:
     the exporter fit-resizes to them exactly, because the firmware does
     not crop.
 
+    ``fps`` is the trimmer's 15/24 choice; a whole-video bake keeps
+    :data:`ZT_FPS`.
+
     ``fit_mode`` is the trimmer's W/H button.  ``None`` is the load path —
     fit inside, never crop — which is what a user who never touches those
     buttons already gets, so nobody's export changes.  It is the enum rather
@@ -1317,6 +1696,8 @@ class VideoExportRequest:
     target_h: int
     rotation: int = 0
     fit_mode: FitMode | None = None
+    #: Frames per second extracted, and so the rate the timestamps encode.
+    fps: int = ZT_FPS
 
 
 # DC file (main_count, sub_count) → ``HardwareMetrics`` field name.
@@ -1341,15 +1722,14 @@ CATEGORY_NAMES: dict[int, str] = {
 }
 
 
-# Per-category sub-metric labels (matches the legacy uc_theme_setting grid).
-SUB_METRICS: dict[int, dict[int, str]] = {
-    0: {1: "Temp",  2: "Usage", 3: "Freq",     4: "Power"},
-    1: {1: "Temp",  2: "Usage", 3: "Clock",    4: "Power"},
-    2: {1: "Used%", 2: "Clock", 3: "Used",     4: "Free"},
-    3: {1: "Read",  2: "Write", 3: "Activity", 4: "Temp"},
-    4: {1: "Down",  2: "Up",    3: "Total",    4: "Ping"},
-    5: {1: "RPM",   2: "PWM%",  3: "Temp",     4: "Speed"},
-}
+# Per-category row names, as the C# dashboard names its rows.
+# DERIVED — do not hand-edit; add a row to METRICS above.  The hand-kept copy
+# this replaced named rows the C# never had ("Ping", "PWM%") and, for MEM, HDD
+# and NET, put them in the order METRICS itself had wrong (2026-10-07).
+SUB_METRICS: dict[int, dict[int, str]] = {}
+for _metric in METRICS.by_dc_pair.values():
+    SUB_METRICS.setdefault(_metric.main, {})[_metric.sub] = _metric.label
+del _metric
 
 
 # Category → cell text colour (matches Windows TRCC palette).
@@ -1363,11 +1743,13 @@ CATEGORY_COLORS: dict[int, str] = {
 }
 
 
-# Time / date format tables (mirror legacy ``trcc.core.models.constants``).
+# Time / date patterns by the C#'s per-element ``myModeSub``
+# (UCXiTongXianShiSub.cs:248-285).  A clock element carries its OWN pattern;
+# these are the ones the Windows app can set, and the index a DC file stores.
 TIME_FORMATS: dict[int, str] = {
-    0: "%H:%M",  # 24-hour (14:58)
-    1: "%I:%M",  # 12-hour with leading zero (02:58); stripped at format time
-    2: "%H:%M",  # 24-hour (same as 0 in legacy)
+    0: "%H:%M",     # 24-hour (14:58)
+    1: "%I:%M %p",  # 12-hour, C# "hh:mm tt" (02:58 PM)
+    2: "%H:%M",     # 24-hour (same as 0 in the C#)
 }
 
 DATE_FORMATS: dict[int, str] = {
@@ -1377,6 +1759,29 @@ DATE_FORMATS: dict[int, str] = {
     3: "%m/%d",
     4: "%d/%m",
 }
+
+
+def format_index(table: Mapping[int, str], pattern: str) -> int:
+    """The ``myModeSub`` whose pattern is *pattern*; 0 for one the table lacks.
+
+    What a DC file can store and what the editor's format button shows.  A
+    pattern the C# cannot set (``%d.%m.%Y`` from the CLI) reads as 0.
+    """
+    index = next((i for i, f in table.items() if f == pattern), 0)
+    log.debug("format_index: %r -> %d", pattern, index)
+    return index
+
+
+def format_clock(pattern: str, moment: datetime) -> str:
+    """*moment* in a clock element's strftime *pattern*.
+
+    ``%p`` is always AM/PM: the C# formats with InvariantCulture, and
+    ``strftime``'s ``%p`` follows the process locale, which can be empty.
+    """
+    meridiem = "AM" if moment.hour < 12 else "PM"
+    text = moment.strftime(pattern.replace("%p", meridiem))
+    frame_log.debug("format_clock: %r -> %r", pattern, text)
+    return text
 
 
 WEEKDAYS_BY_LANG: dict[str, list[str]] = {
@@ -1418,16 +1823,11 @@ def format_metric(
     from datetime import datetime as _dt
 
     if metric == "date":
-        now = _dt.now()
-        fmt = DATE_FORMATS.get(date_format, DATE_FORMATS[0])
-        return now.strftime(fmt)
+        return format_clock(DATE_FORMATS.get(date_format, DATE_FORMATS[0]),
+                            _dt.now())
     if metric == "time":
-        now = _dt.now()
-        fmt = TIME_FORMATS.get(time_format, TIME_FORMATS[0])
-        result = now.strftime(fmt)
-        if time_format == 1:
-            result = result.lstrip("0")
-        return result
+        return format_clock(TIME_FORMATS.get(time_format, TIME_FORMATS[0]),
+                            _dt.now())
     if metric == "weekday":
         weekdays = (
             WEEKDAYS_BY_LANG.get(lang or "en")
@@ -1506,7 +1906,12 @@ class OverlayElementConfig:
     Distinct from next/'s native :class:`OverlayElement` (which uses
     string types like "text" / "metric" / "clock"); the editor
     converts back and forth at the bus boundary.
+
+    ``id`` is the App element this cell shows, so an edit names the element
+    it changes instead of re-sending the whole layout.  "" until the grid
+    adds the cell (``OverlayModel.add`` mints it).
     """
+    id: str = ""
     mode: OverlayMode = OverlayMode.TIME
     mode_sub: int = 0
     x: int = 100
@@ -1518,42 +1923,58 @@ class OverlayElementConfig:
     font_size: int = 36
     font_style: int = 0
     text: str = ""
+    #: The sensor a HARDWARE cell shows, when the DC pair table cannot name it
+    #: (a board probe, a voltage, one DIMM) -- the pair is then (0, 0).
+    metric: str = ""
 
 
-# =========================================================================
-# Activity-sidebar sensor catalog
-# =========================================================================
 
 
-# Per-category sensor definitions used by the legacy activity sidebar
-# (right-rail strip of live sensor values).  ``(key_suffix, label, unit,
-# metric_key)`` — metric_key matches a ``HardwareMetrics`` attribute.
-SENSORS: dict[str, list[tuple[str, str, str, str]]] = {
-    "cpu":     [("temp",      "TEMP",      "°C",   "cpu_temp"),
-                ("usage",     "Usage",     "%",    "cpu_percent"),
-                ("clock",     "Clock",     "MHz",  "cpu_freq"),
-                ("power",     "Power",     "W",    "cpu_power")],
-    "gpu":     [("temp",      "TEMP",      "°C",   "gpu_temp"),
-                ("usage",     "Usage",     "%",    "gpu_usage"),
-                ("clock",     "Clock",     "MHz",  "gpu_clock"),
-                ("power",     "Power",     "W",    "gpu_power")],
-    "memory":  [("temp",      "TEMP",      "°C",   "mem_temp"),
-                ("usage",     "Usage",     "%",    "mem_percent"),
-                ("clock",     "Clock",     "MHz",  "mem_clock"),
-                ("available", "Available", "MB",   "mem_available")],
-    "hdd":     [("temp",      "TEMP",      "°C",   "disk_temp"),
-                ("activity",  "Activity",  "%",    "disk_activity"),
-                ("read",      "Read",      "MB/s", "disk_read"),
-                ("write",     "Write",     "MB/s", "disk_write")],
-    "network": [("upload",    "UP rate",   "KB/s", "net_up"),
-                ("download",  "DL rate",   "KB/s", "net_down"),
-                ("total_up",  "Total UP",  "MB",   "net_total_up"),
-                ("total_dl",  "Total DL",  "MB",   "net_total_down")],
-    "fan":     [("cpu_fan",   "CPUFAN",    "RPM",  "fan_cpu"),
-                ("gpu_fan",   "GPUFAN",    "RPM",  "fan_gpu"),
-                ("ssd_fan",   "SSDFAN",    "RPM",  "fan_ssd"),
-                ("fan2",      "FAN2",      "RPM",  "fan_sys2")],
+#: The dashboard's FAN panel, and the slot each of its four rows fills -- the
+#: C#'s CPUFAN, GPUFAN, FAN1, FAN2 (overlay pairs (5,1)..(5,4)).  Its rows are
+#: user-rebindable (UCSystemInfoOptions.cs:335-345), and a row bound to one
+#: fan IS the choice of which header fills that slot (#145).
+FAN_PANEL_CATEGORY = 6
+FAN_PANEL_SLOTS: tuple[str, ...] = ("fan:cpu", "fan:gpu", "fan:ssd", "fan:sys2")
+
+#: What a fan's NAME must contain to claim a slot by default, before
+#: spinning order fills the rest.  The dashboard and the panel used to apply
+#: two different rules here and could disagree; this is now the only one.
+FAN_SLOT_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "fan:cpu": ("cpu",),
+    "fan:ssd": ("ssd", "nvme", "m.2"),
+    "fan:sys2": ("sys", "chassis", "case", "pump"),
 }
+
+
+#: Drawing format by unit, for a metric no METRICS row names -- a board probe,
+#: a voltage, one DIMM.  The DC table has a format for its 24 pairs only.
+_UNIT_FORMATS: dict[str, str] = {
+    "°C": _TEMP, "%": _PCT, "MHz": _MHZ, "W": _WATT, "RPM": _RPM,
+    "V": "{value:.2f} V", "MB": "{value:.0f} MB",
+    "MB/s": "{value:.1f} MB/s", "KB/s": "{value:.0f} KB/s",
+}
+#: The unit an id's last segment implies, when the caller has no unit -- a
+#: DC read back from disk carries only the id.
+_SUFFIX_UNITS: tuple[tuple[str, str], ...] = (
+    (":temp", "°C"), (":rpm", "RPM"), (":usage", "%"), (":percent", "%"),
+    (":clock", "MHz"), (":freq", "MHz"), (":power", "W"),
+)
+
+
+def default_metric_format(sensor_id: str, unit: str = "") -> str:
+    """How a metric is drawn when nothing chose a format: its METRICS row's,
+    else by its unit, else by what its id says it measures.  Never taken from
+    a file -- a format string is code (``{value.__class__}``), so one read
+    out of a shared theme would be an injection."""
+    try:
+        fmt = METRICS[sensor_id].fmt
+    except KeyError:
+        unit = unit or ("V" if sensor_id.startswith("volt:") else next(
+            (u for suffix, u in _SUFFIX_UNITS if sensor_id.endswith(suffix)), ""))
+        fmt = _UNIT_FORMATS.get(unit, "{value:.0f}")
+    frame_log.debug("default_metric_format: %s (%s) -> %s", sensor_id, unit, fmt)
+    return fmt
 
 
 # Category ID → sensor-dashboard background image asset.
@@ -1582,6 +2003,34 @@ class PanelConfig:
     category_id: int
     name: str
     sensors: list[SensorBinding] = field(default_factory=list)
+
+    #: Category 0 is "custom" — see :data:`CATEGORY_IMAGES`, where it maps to
+    #: ``sysinfo_custom.png``.  Every other id is a fixed hardware family.
+    CUSTOM_CATEGORY: ClassVar[int] = 0
+
+    @classmethod
+    def custom(cls, name: str = "Custom", rows: int = 4) -> PanelConfig:
+        """A new, empty user panel — the ONE definition of what that means.
+
+        What a freshly added panel IS (category 0, four unbound rows labelled
+        "Sensor 1".."Sensor 4") is domain policy, not widget code.  It lived as
+        a literal inside ``ui/gui/uc_system_info.py`` because gui was the only
+        face that could add a panel; the moment a second face can, that
+        literal becomes a copy that drifts
+        ([[feedback_one_fact_expressed_twice_will_drift]]).
+
+        ``rows`` defaults to four because every entry in ``_SENSOR_FAMILIES``
+        has exactly four and the grid art has four slots — it is a parameter
+        so a caller can say so, not an invitation to vary it.
+        """
+        log.info("PanelConfig.custom: name=%r rows=%d category=%d",
+                 name, rows, cls.CUSTOM_CATEGORY)
+        return cls(
+            category_id=cls.CUSTOM_CATEGORY,
+            name=name,
+            sensors=[SensorBinding(f"Sensor {i + 1}", "", "")
+                     for i in range(rows)],
+        )
 
 
 @dataclass(slots=True)
@@ -1780,22 +2229,6 @@ def is_safe_archive_member(name: str) -> bool:
     return not (Path(name).is_absolute() or '..' in name.split('/'))
 
 
-# ``category_keysuffix`` → overlay ``(main_count, sub_count)``.
-# Used by the activity sidebar's click-to-add-element flow.
-SENSOR_TO_OVERLAY: dict[str, tuple[int, int]] = {
-    "cpu_temp": (0, 1),     "cpu_usage": (0, 2),
-    "cpu_clock": (0, 3),    "cpu_power": (0, 4),
-    "gpu_temp": (1, 1),     "gpu_usage": (1, 2),
-    "gpu_clock": (1, 3),    "gpu_power": (1, 4),
-    "memory_temp": (2, 1),  "memory_usage": (2, 2),
-    "memory_clock": (2, 3), "memory_available": (2, 4),
-    "hdd_temp": (3, 1),     "hdd_activity": (3, 2),
-    "hdd_read": (3, 3),     "hdd_write": (3, 4),
-    "network_upload": (4, 1),   "network_download": (4, 2),
-    "network_total_up": (4, 3), "network_total_dl": (4, 4),
-    "fan_cpu_fan": (5, 1),  "fan_gpu_fan": (5, 2),
-    "fan_ssd_fan": (5, 3),  "fan_fan2": (5, 4),
-}
 
 
 # =========================================================================
@@ -1859,3 +2292,16 @@ def memory_form_factor(code: int | None) -> str:
     """SMBIOS form-factor code → module form factor (``"Unknown"`` if unmapped)."""
     log.debug("memory_form_factor: code=%s", code)
     return MEMORY_FORM_FACTOR.get(code or 0, "Unknown")
+
+
+# =========================================================================
+# TLS for the LAN API
+# =========================================================================
+
+
+@dataclass(frozen=True, slots=True)
+class TlsFiles:
+    """What the API serves over TLS, and what a client pins (SHA-256 of the cert)."""
+    cert: Path
+    key: Path
+    fingerprint: str

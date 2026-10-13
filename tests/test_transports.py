@@ -106,6 +106,32 @@ def test_usb_bot_scsi_wraps_bulk_with_cbw_csw(fake_bulk) -> None:
     assert data == b"payload"
 
 
+@pytest.mark.parametrize("errno_val, gone", [(19, True), (110, False)])
+def test_usb_bot_scsi_raises_only_when_the_device_is_gone(
+    fake_bulk, monkeypatch: pytest.MonkeyPatch, errno_val: int, gone: bool,
+) -> None:
+    """A transfer failing with ENODEV is a gone panel: raised, so the recovery
+    threshold marks it lost.  It was folded into False like a timeout, and a
+    dead panel stayed "connected" (#254).  A timeout stays soft."""
+    from trcc.core.errors import TransportError
+
+    def fail(*_a: object, **_k: object) -> int:
+        raise TransportError("transfer failed") from OSError(errno_val, "x")
+
+    transport = UsbBotScsiTransport(fake_bulk)
+    transport.open()
+    monkeypatch.setattr(fake_bulk, "write", fail)
+
+    if gone:
+        with pytest.raises(TransportError):
+            transport.send_cdb(b"\xF5" + b"\x00" * 15, b"x")
+        with pytest.raises(TransportError):
+            transport.read_cdb(b"\xF5" + b"\x00" * 15, 8)
+    else:
+        assert transport.send_cdb(b"\xF5" + b"\x00" * 15, b"x") is False
+        assert transport.read_cdb(b"\xF5" + b"\x00" * 15, 8) == b""
+
+
 def test_usb_bot_scsi_fails_on_non_zero_csw(fake_bulk) -> None:
     """CSW status != 0 must make send_cdb return False."""
     fake_bulk.read_script = [b"USBS" + b"\x00" * 8 + b"\x01"]   # status=1
@@ -245,38 +271,24 @@ def test_open_errors_covers_apmortons_non_oserror(monkeypatch) -> None:
     assert _HIDException in errors
 
 
-@pytest.mark.parametrize("rules_installed,expected", [
-    (False, "trcc system setup"),
-    (True, "not permissions"),
-])
-def test_transport_open_wraps_absent_device_in_permission_error(
-    monkeypatch, rules_installed: bool, expected: str,
-) -> None:
-    """A device that cannot be opened surfaces as PermissionError_ — and the
-    hint must match REALITY, not always blame udev.
+def test_transport_open_wraps_absent_device_in_permission_error(monkeypatch) -> None:
+    """A device that cannot be opened surfaces as PermissionError_ -- stating
+    WHAT happened and naming no OS.
 
-    hidapi reports "open failed" for an absent device, for EACCES, and for a
-    panel mid-reboot alike, so the exception text is the only diagnosis a
-    reporter gets.  It used to say "missing udev rules (run `trcc system
-    setup`)" unconditionally — and #267's own report says
-    ``[OK] udev-rules installed`` while being told to install them.  That
-    sends a user to fix something that is not broken.
-
-    **The condition is monkeypatched, deliberately.**  Reading the real
-    ``/etc/udev/rules.d`` here would make the assertion depend on whether the
-    machine running the suite happens to have TRCC installed — green on CI,
-    red on a maintainer's desk, for reasons having nothing to do with the
-    code.
+    It used to append "missing udev rules" (or, after #267, "udev rules ARE
+    installed") -- Linux advice, from a transport every OS uses, decided by
+    probing a Linux path.  On Windows it therefore always said the rules were
+    missing.  The advice is the Platform's now (``permission_denied_hint``),
+    and its per-OS tests live beside the platforms (#173).
     """
     from trcc.adapters.device import transport as t
-    from trcc.core.errors import PermissionError_
+    from trcc.core.errors import PermissionError_, TransportError
 
     class _Failing(_CythonDeviceStub):
         def open(self, vid, pid, serial):
             raise OSError("open failed")
 
     monkeypatch.setattr(t, "HIDAPI_AVAILABLE", True)
-    monkeypatch.setattr(t, "_udev_rules_present", lambda: rules_installed)
     monkeypatch.setattr(t, "_HID_OPEN_RETRY_S", 0.0)   # no real sleeping
 
     class _Mod:
@@ -285,8 +297,13 @@ def test_transport_open_wraps_absent_device_in_permission_error(
     monkeypatch.setattr(t, "hidapi", _Mod)
     transport = t.HidApiTransport(0x0416, 0x5302)
 
-    with pytest.raises(PermissionError_, match=expected):
+    with pytest.raises(PermissionError_) as raised:
         transport.open()
+    message = str(raised.value)
+    assert "cannot open HID device 0416:5302" in message
+    assert "udev" not in message and "WinUSB" not in message
+    assert isinstance(raised.value, TransportError), (
+        "a denied open must be caught wherever a transport failure is")
 
 
 def test_a_hid_open_is_retried_before_it_is_called_a_failure() -> None:

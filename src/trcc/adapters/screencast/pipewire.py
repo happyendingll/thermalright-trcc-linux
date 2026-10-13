@@ -10,9 +10,8 @@ on GNOME, KDE and other Wayland compositors, where the X11 paths in
 capture backend is an adapter; it sat in the view layer because that is where
 somebody happened to be working when they fixed Wayland capture.  The cost was
 that only the GUI got the fix: the CLI, the REST route and qtgui had no
-Wayland capture at all, and ``StartScreencastDriver`` could not become the one
-capture loop because deleting the GUI's timer would have taken PipeWire with
-it.
+Wayland capture at all, and the core driver could not become the one capture
+loop because deleting the GUI's timer would have taken PipeWire with it.
 
 **Verified here; NOT verified end to end.**  The dev box is X11/XFCE and its
 ``xdg-desktop-portal`` is ``inactive (dead)`` and will not start, so the
@@ -41,6 +40,7 @@ chain -- which is exactly what every face does today.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 import time
@@ -49,7 +49,7 @@ from typing import Any
 
 from ...core._frames import unpad_rows
 from ...core.logs import per_frame
-from ...core.models import RawFrame
+from ...core.models import SCREENCAST_TICK_S, RawFrame
 from ...core.ports import CaptureNotReady, ScreenCapture
 
 log = logging.getLogger(__name__)
@@ -167,8 +167,10 @@ class PipeWireScreenCast:
         self._glib_loop = None
         self._glib_thread = None
         self._frame_lock = threading.Lock()
-        #: What the portal said it is streaming, from the Start response.
+        #: What the portal said it is streaming, from the Start response --
+        #: in the compositor's LOGICAL coordinates, not buffer pixels.
         self._stream_size: tuple[int, int] | None = None
+        self._stream_position: tuple[int, int] | None = None
         self._latest_frame = None  # (width, height, bytes_rgb)
         self._running = False
         self._session_ready = threading.Event()
@@ -184,6 +186,15 @@ class PipeWireScreenCast:
     def is_running(self) -> bool:
         log.debug("is_running")
         return self._running
+
+    @property
+    def granted(self) -> tuple[tuple[int, int], tuple[int, int]] | None:
+        """The shared area's logical ``(position, size)``, or None if unreported."""
+        frame_log.debug("granted: position=%s size=%s",
+                        self._stream_position, self._stream_size)
+        if self._stream_size is None:
+            return None
+        return self._stream_position or (0, 0), self._stream_size
 
     def start(self, timeout: float = 30.0) -> bool:
         """Start a portal screen capture session.
@@ -465,10 +476,15 @@ class PipeWireScreenCast:
         size = props.get("size")
         self._stream_size = ((int(size[0]), int(size[1]))
                              if size is not None else None)
-        log.info("PipeWire node ID: %d — the portal granted %s (source_type=%s)",
+        position = props.get("position")
+        self._stream_position = ((int(position[0]), int(position[1]))
+                                 if position is not None else None)
+        log.info("PipeWire node ID: %d — the portal granted %s at %s "
+                 "(source_type=%s)",
                  self._node_id,
                  f"{self._stream_size[0]}x{self._stream_size[1]}"
                  if self._stream_size else "an unreported size",
+                 self._stream_position or "an unreported position",
                  props.get("source_type", "?"))
 
         # Get PipeWire file descriptor
@@ -533,14 +549,9 @@ class PipeWireScreenCast:
                 "(Debian/Ubuntu) or gst-plugin-pipewire (Arch), then check "
                 "it with: gst-inspect-1.0 pipewiresrc",
             )
-        # Pipeline: pipewiresrc → videoconvert → RGB → appsink
-        pipeline_str = (
+        pipeline_str = capture_pipeline(
             f"pipewiresrc fd={self._pipewire_fd} path={self._node_id} "
-            f"do-timestamp=true keepalive-time=1000 ! "
-            f"videoconvert ! "
-            f"video/x-raw,format=RGB ! "
-            f"appsink name=sink emit-signals=true max-buffers=2 drop=true"
-        )
+            f"do-timestamp=true keepalive-time=1000")
 
         self._pipeline = Gst.parse_launch(pipeline_str)
         self._appsink = self._pipeline.get_by_name('sink')
@@ -630,6 +641,68 @@ class PipeWireScreenCast:
     def __del__(self):
         log.debug("__del__")
         self.stop()
+
+
+#: The most frames a second worth converting: just above the cast's own tick.
+#: Derived, so a change to the tick cannot leave this behind.
+CAPTURE_MAX_FPS = math.ceil(1 / SCREENCAST_TICK_S)
+
+
+def capture_pipeline(source: str) -> str:
+    """*source* → at most ``CAPTURE_MAX_FPS`` → packed RGB → ``appsink``.
+
+    The rate limit comes BEFORE ``videoconvert``: PipeWire delivers a frame
+    whenever the screen changes, up to its refresh rate, while the cast takes
+    one every ``SCREENCAST_TICK_S``.  Converting and copying the rest of a
+    60 Hz screen at full size only to drop it cost ~70% of the pipeline --
+    measured 2026-10-07 on a live 1920x1080 60 fps source: 23 G instructions
+    per 10 s and 598 frames into Python, against 7-9 G and 200 frames with
+    the limit.  ``videorate max-rate`` only ever DROPS, so a still screen
+    still sends nothing
+    (gst-inspect: "max-rate … implies drop-only").
+    """
+    log.debug("capture_pipeline: max %d fps from %s", CAPTURE_MAX_FPS,
+              source.split(" ", 1)[0])
+    return (
+        f"{source} ! "
+        f"videorate max-rate={CAPTURE_MAX_FPS} ! "
+        f"videoconvert ! "
+        f"video/x-raw,format=RGB ! "
+        f"appsink name=sink emit-signals=true max-buffers=2 drop=true"
+    )
+
+
+def map_region_to_buffer(
+    x: int, y: int, width: int, height: int,
+    granted: tuple[tuple[int, int], tuple[int, int]] | None,
+    buffer_size: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    """A region in global logical desktop coordinates → stream-buffer pixels.
+
+    Every other capture backend takes the region as global logical
+    coordinates (Qt's root-window grab, ``grim -g``), and so does the picker.
+    The portal stream is the odd one: its ``position`` and ``size`` are
+    logical ("compositor coordinate space", the ScreenCast portal spec), but
+    its BUFFER is in device pixels -- mutter makes it ``logical x scale``
+    (meta-stream-source-monitor.c), KWin the output's ``pixelSize()``.  The
+    region was cropped straight out of the buffer, so at 200% scale it took
+    a quarter-size patch from the wrong place, silently.
+
+    ``granted`` is the stream's logical ``(position, size)``; without one the
+    region is used as it is, which is what happened before.
+    """
+    if granted is None:
+        frame_log.debug("map_region_to_buffer: no granted geometry — 1:1")
+        return x, y, width, height
+    (px, py), (lw, lh) = granted
+    bw, bh = buffer_size
+    sx, sy = bw / lw if lw else 1.0, bh / lh if lh else 1.0
+    mapped = (round((x - px) * sx), round((y - py) * sy),
+              round(width * sx), round(height * sy))
+    frame_log.debug("map_region_to_buffer: (%d,%d) %dx%d in %dx%d at (%d,%d) "
+                    "-> %s in a %dx%d buffer", x, y, width, height, lw, lh,
+                    px, py, mapped, bw, bh)
+    return mapped
 
 
 def crop_rgb24(
@@ -728,7 +801,7 @@ class PipeWireScreenCapture(ScreenCapture):
         """The portal's frame when the session is up; ``CaptureNotReady``
         while it is starting; the fallback only when there is no portal to
         wait for."""
-        log.debug("grab_region: x=%s y=%s", x, y)
+        frame_log.debug("grab_region: x=%s y=%s", x, y)
         session = self._ensure_session()
         if session is None:
             # No bindings, or a start that was refused or timed out --
@@ -745,6 +818,9 @@ class PipeWireScreenCapture(ScreenCapture):
             raise CaptureNotReady(
                 "the portal session is up but has delivered no frame yet")
         src_w, src_h, data = latest
+        x, y, width, height = map_region_to_buffer(
+            x, y, width, height, getattr(session, "granted", None),
+            (src_w, src_h))
         self._warn_if_outside(src_w, src_h, x, y, width, height)
         return crop_rgb24(data, src_w, src_h, x, y, width, height)
 

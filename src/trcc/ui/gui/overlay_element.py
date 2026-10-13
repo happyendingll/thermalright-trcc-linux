@@ -6,26 +6,27 @@ live hardware metrics, and selection overlay.
 from __future__ import annotations
 
 import logging
-import re
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter
 from PySide6.QtWidgets import QMenu, QWidget
 
+from ...core.logs import per_frame
 from ...core.models import (
     CATEGORY_NAMES,
-    METRICS,
     OVERLAY_MODE_IMAGES,
     OVERLAY_SELECT_IMAGE,
     SUB_METRICS,
     OverlayElementConfig,
     OverlayMode,
-    format_metric,
 )
+from ..presentation.sensor_display import source_label
 from .assets import Assets
 from .constants import Colors, Sizes
 
 log = logging.getLogger(__name__)
+#: Per metrics tick, once a second per card.
+frame_log = per_frame(__name__)
 
 # ============================================================================
 # Overlay element constants (matching Tkinter UCXiTongXianShiSub)
@@ -63,8 +64,6 @@ class OverlayElementWidget(QWidget):
     clicked = Signal(int)           # index
     double_clicked = Signal(int)    # index (delete)
 
-    # Single source of truth: METRICS in core/models.py
-
     def __init__(self, index, parent=None):
         super().__init__(parent)
         self.index = index
@@ -97,38 +96,29 @@ class OverlayElementWidget(QWidget):
         self.update()
 
     def set_selected(self, selected):
-        log.debug("OverlayElementWidget.set_selected: index=%d %s",
-                  self.index, selected)
+        # Logged on a CHANGE only: the grid re-applies every cell's state on
+        # each refill, which follows every change any UI makes, so an
+        # unconditional line wrote 42 of them per drag move, nearly all
+        # "index=N False" for empty cells.
+        if selected != self._selected:
+            log.debug("OverlayElementWidget.set_selected: index=%d %s → %s",
+                      self.index, self._selected, selected)
         self._selected = selected
         self.update()
 
-    def update_metrics(self, metrics):
-        """Update card with live system metrics (Windows UCXiTongXianShiSubTimer).
+    def show_reading(self, reading: tuple[str, str] | None) -> None:
+        """Show a live ``(number, unit)`` -- label2 and label3 of the C# tile.
 
-        ``label2`` is the number, ``label3`` the unit.  The C# unit-switch
-        (``mode_sub``) decides whether the unit shows: 1 → number + unit, 0 →
-        bare.  C/F is a separate global choice, not ``mode_sub`` (that was the
-        bug — the toggle flipped Celsius↔Fahrenheit instead of show/hide).
+        The text comes from ``tile_reading``, the panel's own rule, so the
+        card cannot disagree with the panel (#301).  None leaves the card
+        showing its sub-metric name, as before any reading arrives.
         """
-        log.debug("update_metrics")
-        if not self.config or self.config.mode != OverlayMode.HARDWARE:
-            return
-        pair = (self.config.main_count, self.config.sub_count)
-        if pair not in METRICS:
-            log.debug("update_metrics: %s is not a known metric — skip", pair)
-            return
-        metric = METRICS[pair]
-        # Separate number from unit: "52°C" → "52" + "°C".
-        formatted = format_metric(metric.field, metrics[pair])
-        m = re.match(r'([\d.]+)(.*)', formatted)
-        if m:
-            self._live_value = m.group(1)
-            unit = m.group(2).strip()
-        else:
-            self._live_value = formatted
-            unit = ''
-        self._live_unit = unit if self.config.mode_sub == 1 else ''
-        self.update()
+        value, unit = reading or ("", "")
+        if (value, unit) != (self._live_value, self._live_unit):
+            frame_log.debug("show_reading: index=%d %s%s",
+                            self.index, value, unit)
+            self._live_value, self._live_unit = value, unit
+            self.update()
 
     # Card UI font matching Windows 微软雅黑 10.5pt
     _CARD_FONT = QFont('Microsoft YaHei', 10)
@@ -152,7 +142,8 @@ class OverlayElementWidget(QWidget):
             if mode == OverlayMode.HARDWARE:
                 mc = self.config.main_count
                 cat_color = CATEGORY_COLORS.get(mc, '#9375FF')
-                cat_name = CATEGORY_NAMES.get(mc, '???')
+                cat_name = (source_label(self.config.metric) if self.config.metric
+                            else CATEGORY_NAMES.get(mc, '???'))
 
                 # label1: category name in category color (Windows: label1.ForeColor)
                 painter.setPen(QColor(cat_color))
@@ -163,7 +154,8 @@ class OverlayElementWidget(QWidget):
                     painter.drawText(2, 21, 56, 18, Qt.AlignmentFlag.AlignCenter,
                                      self._live_value)
                 else:
-                    sub_name = SUB_METRICS.get(mc, {}).get(self.config.sub_count, '--')
+                    sub_name = ('--' if self.config.metric else
+                                SUB_METRICS.get(mc, {}).get(self.config.sub_count, '--'))
                     painter.drawText(2, 21, 56, 18, Qt.AlignmentFlag.AlignCenter, sub_name)
                 # label3: unit suffix (Windows: label3.ForeColor = myColor)
                 painter.drawText(2, 41, 56, 18, Qt.AlignmentFlag.AlignCenter,

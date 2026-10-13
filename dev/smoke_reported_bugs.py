@@ -287,11 +287,22 @@ def repro_162_daemon_flag_strip() -> ReproResult:
             seen["flag"] = os.environ.get("TRCC_DAEMON")
             raise RuntimeError("stop before serve")
 
-        with patch("trcc._boot._build_local_app", _build_spy):
+        # A private runtime dir, as #148's probe has: the real one holds the
+        # user's running App, so ``DaemonUI.preflight`` refused (exit 1)
+        # before the spy could fire -- and an empty ``seen`` read as "fixed"
+        # without testing anything.
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="trcc-repro-") as runtime, \
+             patch.dict(os.environ, {"XDG_RUNTIME_DIR": runtime}), \
+             patch("trcc._boot._build_local_app", _build_spy):
             try:
                 dm.run_daemon(platform=None, renderer=None)
             except RuntimeError:
                 pass
+        if "flag" not in seen:
+            return _diff("run_daemon never reached _build_local_app -- the "
+                         "probe proved nothing")
         if seen.get("flag") is not None:
             return _bug(f"run_daemon builds App with TRCC_DAEMON={seen['flag']!r} still set")
     finally:
@@ -362,11 +373,20 @@ def repro_148_daemon_metrics_loop() -> ReproResult:
         def serve_forever(self) -> None: ...
         def shutdown(self) -> None: ...
 
+    import tempfile
+
     fake = _App()
-    with patch("trcc._boot._build_local_app", return_value=fake), \
-         patch.object(dm.ipc, "IPCServer", _Srv), \
-         patch.object(dm, "_install_signal_handlers", lambda s: None):
-        dm.run_daemon(platform=None, renderer=None)
+    # Its own runtime dir: a daemon already running on this machine made
+    # ``DaemonUI.preflight`` refuse (exit 1), the stub never started, and this
+    # probe reported #148 live on the maintainer's box (measured 2026-10-01).
+    with tempfile.TemporaryDirectory(prefix="trcc-repro-") as runtime, \
+         patch.dict(os.environ, {"XDG_RUNTIME_DIR": runtime}), \
+         patch("trcc._boot._build_local_app", return_value=fake), \
+         patch.object(dm.ipc, "IPCServer", _Srv):
+        rc = dm.run_daemon(platform=None, renderer=None)
+    if rc != 0:
+        return _bug(f"run_daemon refused to start (rc={rc}) — the probe "
+                    "never reached bring-up")
     if not fake.metrics_loop.started:
         return _bug("run_daemon never called app.metrics_loop.start() — display stays blank")
     return _ok("run_daemon starts metrics_loop (+ led_animation_loop) during bring-up")
@@ -504,7 +524,34 @@ _COLOR = {
 }
 
 
+def _log_into(root: Path) -> None:
+    """Send every log line this smoke produces under *root*.
+
+    Two repros reach logging setup: ``gui()`` (#187) configures it when nothing
+    has, and the CLI root callback (#201) re-configures it with ``force``.
+    Both used to land in the user's real ``~/.trcc`` log -- appending to a
+    running session's ``latest`` or truncating it when no TRCC ran, which is
+    the file ``trcc report`` sends.  A mock platform as the CLI's override, and
+    logging configured from it first, keeps both here.
+    """
+    from tests.mock_platform import MockPlatform
+    from trcc.adapters.infra.logging import ensure_configured
+    from trcc.ui.cli import _ctx
+
+    platform = MockPlatform([], root)
+    _ctx.set_platform(platform)
+    ensure_configured(platform=platform)
+
+
 def main() -> int:
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="trcc-smoke-bugs-") as logs:
+        _log_into(Path(logs))
+        return _run_all()
+
+
+def _run_all() -> int:
     print(f"{_BOLD}TRCC reported-bugs repro smoke{_RESET}")
     print(f"  {len(REPROS)} reporter scenarios across "
           f"{len({r.issue for r in REPROS})} GitHub issues\n")

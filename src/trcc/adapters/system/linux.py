@@ -16,6 +16,7 @@ import ctypes
 import errno
 import logging
 import os
+import re
 import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -25,7 +26,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ._imc_timings import ImcTimings
 
-from ...core.errors import TransportError
+from ...core.errors import PermissionError_, TransportError
 from ...core.logs import per_frame
 from ...core.models import UsbPowerState
 from ...core.ports import (
@@ -33,16 +34,22 @@ from ...core.ports import (
     HotplugMonitor,
     PackageManager,
     Paths,
+    RamAccess,
     ScsiTransport,
     SensorEnumerator,
+    SmBus,
 )
+from ..rgb.smbus import LinuxSmBus, find_smbus, silent_memory_sensors
 from ..sensors.aggregator import build_linux_sensors
 from ..sensors.gpu_detect import (
     detect_gpu_vendors,
     install_matching_gpu_extras,
 )
-from ._base import BaseOS, BasePaths
+from ._base import RELEASES_URL, BaseOS, BasePaths, download_and_install
 from ._desktop_entry import XdgDesktopEntry
+from ._polkit_install import POLKIT_POLICY
+from ._polkit_install import install as install_polkit_files
+from ._ram_access import LinuxRamAccess
 from ._selinux import install as install_selinux_policy
 from ._udev import install as install_udev_rules
 
@@ -123,9 +130,45 @@ class _SgIoHdr(ctypes.Structure):
 
 _SG_HDR_SIZE = ctypes.sizeof(_SgIoHdr)
 
+#: Host byte the kernel completes SG_IO with once the device is being removed
+#: or has been offlined (scsi_lib.c, usb-storage scsiglue.c, uas.c).  The
+#: ioctl itself returns 0 and ``status`` stays 0.
+_DID_NO_CONNECT = 0x01
+#: ``info`` bit the kernel sets when status, host or driver byte reports any
+#: error (sg.h SG_INFO_OK_MASK).
+_SG_INFO_OK_MASK = 0x1
 
-def _resolve_scsi_path(vid: int, pid: int) -> str | None:
+
+def _sg_failed(hdr: _SgIoHdr, op: str, path: str) -> bool:
+    """Whether a completed SG_IO failed; raise when the device is gone.
+
+    ``status`` alone was tested, and a removed or offlined panel completes
+    with ``status`` 0 and ``host_status`` DID_NO_CONNECT -- so every frame to
+    a dead panel counted as SENT, nothing escalated, and the panel stayed
+    "connected" (#254).  That one is raised as disconnect-class (ENODEV), so
+    the recovery threshold marks it lost; any other error is a soft failure,
+    as USBLCD.exe treats every write.
+    """
+    if hdr.host_status == _DID_NO_CONNECT:
+        log.warning("SG_IO %s on %s: DID_NO_CONNECT -- the device is gone",
+                    op, path)
+        raise TransportError(
+            f"SG_IO {op} on {path}: device gone (DID_NO_CONNECT)",
+        ) from OSError(errno.ENODEV, "DID_NO_CONNECT")
+    if hdr.info & _SG_INFO_OK_MASK:
+        log.warning("SG_IO %s on %s failed: status=%d host=%d driver=%d "
+                    "info=%#x", op, path, hdr.status, hdr.host_status,
+                    hdr.driver_status, hdr.info)
+        return True
+    return False
+
+
+def _resolve_scsi_path(vid: int, pid: int,
+                       unit: str = "") -> str | None:
     """Walk sysfs to find /dev/sgN for a given VID:PID.
+
+    *unit* restricts the search to the device in one USB port, so two
+    identical coolers do not both resolve to the first one's node (#287).
 
     Pass 1: /sys/class/scsi_generic/sgN  (kernel `sg` module loaded)
     Pass 2: /sys/block/sdN               (sg not loaded — block fallback)
@@ -144,8 +187,8 @@ def _resolve_scsi_path(vid: int, pid: int) -> str | None:
             sysfs_device = entry / "device"
             if not sysfs_device.exists():
                 continue
-            found = _walk_sysfs_for_vid_pid(sysfs_device)
-            if found == (vid, pid):
+            found, usb_dir = _walk_sysfs_for_vid_pid(sysfs_device)
+            if found == (vid, pid) and (not unit or usb_dir == unit):
                 if name_prefix == "sd":
                     log.info("sg module not loaded — using block device /dev/%s",
                              entry.name)
@@ -153,8 +196,24 @@ def _resolve_scsi_path(vid: int, pid: int) -> str | None:
     return None
 
 
-def _walk_sysfs_for_vid_pid(start: Path) -> tuple[int, int] | None:
-    """Walk up sysfs parents until we find idVendor + idProduct files."""
+def _walk_sysfs_for_vid_pid(
+    start: Path,
+) -> tuple[tuple[int, int] | None, str]:
+    """``((vid, pid), usb_dir)`` for the USB device this node hangs off.
+
+    The second value is the ancestor directory's NAME, and it is free: the
+    kernel names a USB device directory by its topology — ``1-13.4`` — which
+    is character-for-character what :func:`usb_path` builds from PyUSB's
+    ``bus`` and ``port_numbers``.  That is why the format was chosen there
+    rather than invented, and it is what lets SCSI pick a specific unit
+    (#287) without a second lookup or a second identity scheme.
+
+    VERIFIED on the dev box: ``/sys/bus/usb/devices/1-13.4`` holds
+    ``idVendor=0402``, and ``sg0``'s device link resolves through
+    ``…/usb1/1-13/1-13.4/…``.
+
+    ``(None, "")`` when no USB ancestor is found within ten levels.
+    """
     log.debug("_walk_sysfs_for_vid_pid: start=%s", start)
     path = Path(start).resolve()
     for _ in range(10):
@@ -163,11 +222,11 @@ def _walk_sysfs_for_vid_pid(start: Path) -> tuple[int, int] | None:
         pid_file = path / "idProduct"
         if vid_file.exists() and pid_file.exists():
             try:
-                return (int(vid_file.read_text().strip(), 16),
-                        int(pid_file.read_text().strip(), 16))
+                return ((int(vid_file.read_text().strip(), 16),
+                         int(pid_file.read_text().strip(), 16)), path.name)
             except (OSError, ValueError):
-                return None
-    return None
+                return (None, "")
+    return (None, "")
 
 
 class LinuxScsiTransport(ScsiTransport):
@@ -211,11 +270,14 @@ class LinuxScsiTransport(ScsiTransport):
                 # instead of a bare EACCES.  (#217)
                 detail = ("this is a root-only block node (the sg kernel module "
                           "isn't loaded) — " if self._is_block else "")
-                log.warning(
-                    "LinuxScsiTransport: permission denied on %s — %srun "
-                    "`trcc system setup` then reboot to load sg and grant "
-                    "0666 access without sudo (#217)", self._path, detail,
-                )
+                hint = (f"permission denied on {self._path} — {detail}run "
+                        "`trcc system setup` then reboot to load sg and grant "
+                        "0666 access without sudo (#217)")
+                log.warning("LinuxScsiTransport: %s", hint)
+                # Raised, like the bulk and HID transports: a plain False read
+                # as "not answering yet", so a panel nobody may open was retried
+                # for as long as TRCC ran, and the connect lost the hint.
+                raise PermissionError_(hint) from e
             return False
         if not self._claim(fd):
             os.close(fd)
@@ -280,7 +342,8 @@ class LinuxScsiTransport(ScsiTransport):
 
     def send_cdb(self, cdb: bytes, data: bytes,
                  timeout_ms: int = 5000) -> bool:
-        """SCSI CDB + data-out via single SG_IO ioctl.  True on status 0."""
+        """SCSI CDB + data-out via single SG_IO ioctl.  True when it
+        completed clean; raises once the device is gone (:func:`_sg_failed`)."""
         frame_log.debug("LinuxScsiTransport.send_cdb: cdb_len=%d data_len=%d timeout=%dms",
                   len(cdb), len(data), timeout_ms)
         if self._fd is None:
@@ -302,11 +365,7 @@ class LinuxScsiTransport(ScsiTransport):
         fcntl.ioctl(self._fd, _SG_IO, ioctl_buf)
         ctypes.memmove(ctypes.addressof(hdr), ioctl_buf, _SG_HDR_SIZE)
 
-        if hdr.status != 0:
-            log.warning("SG_IO send_cdb status=%d host=%d driver=%d",
-                        hdr.status, hdr.host_status, hdr.driver_status)
-            return False
-        return True
+        return not _sg_failed(hdr, "send_cdb", self._path)
 
     def read_cdb(self, cdb: bytes, length: int,
                  timeout_ms: int = 5000) -> bytes:
@@ -341,11 +400,22 @@ class LinuxScsiTransport(ScsiTransport):
         fcntl.ioctl(self._fd, _SG_IO, ioctl_buf)
         ctypes.memmove(ctypes.addressof(hdr), ioctl_buf, _SG_HDR_SIZE)
 
-        if hdr.status != 0:
-            log.warning("SG_IO read_cdb status=%d host=%d driver=%d",
-                        hdr.status, hdr.host_status, hdr.driver_status)
-            return b""
         actual = length - hdr.resid
+        # SCSI status GOOD with a host error is how the panel answers its
+        # handshake poll: host=7 (DID_ERROR) every time, with the reply
+        # delivered.  Dropping it read every 0402:3922 panel as FBL 100,
+        # "Frozen Warframe Pro" (#301, since #254's 3e3909e2).  It is the
+        # panel's NORMAL answer, so INFO: as a warning it printed two lines on
+        # every connect.  DID_NO_CONNECT still goes to ``_sg_failed`` (gone).
+        if (hdr.info & _SG_INFO_OK_MASK and hdr.status == 0
+                and hdr.host_status != _DID_NO_CONNECT
+                and 0 < actual <= length):
+            log.info("read_cdb on %s: %d byte(s) with SCSI status GOOD and "
+                     "host=%d — the panel's usual poll answer, kept",
+                     self._path, actual, hdr.host_status)
+            return bytes(data_buf[:actual])
+        if _sg_failed(hdr, "read_cdb", self._path):
+            return b""
         return bytes(data_buf[:actual])
 
     def _alloc_write_bufs(self, cdb_len: int, data_len: int) -> tuple:
@@ -404,8 +474,9 @@ class LinuxFamily:
     manager: str
     #: Install one-liner with a ``{pkg}`` slot.
     install_cmd: str
-    #: Argv that upgrades trcc-linux, or empty where there is no single line.
-    upgrade_cmd: tuple[str, ...] = ()
+    #: The command that installs the release's own package for this family,
+    #: or "" where we ship none (the hint then points at the release page).
+    package_upgrade: str = ""
     #: tool -> this family's package name, where it differs from
     #: :data:`_LINUX_INSTALL_PKGS`.  A missing row means "unconfirmed", not
     #: "same as Debian" — guessing is what #207 was.
@@ -419,7 +490,7 @@ _FAMILIES: tuple[LinuxFamily, ...] = (
     LinuxFamily(
         name="Fedora-family", manager="dnf",
         install_cmd="sudo dnf install {pkg}",
-        upgrade_cmd=("sudo", "dnf", "upgrade", "-y", "trcc-linux"),
+        package_upgrade=f"sudo dnf install {RELEASES_URL}/download/trcc-linux-latest.noarch.rpm",
         # Advised by BINARY PATH, not package name.  Both shared names are
         # wrong here and both fail in a way that looks like success:
         #   p7zip  -> 7zip-standalone, ships ['7za'] and NO 7z
@@ -435,36 +506,34 @@ _FAMILIES: tuple[LinuxFamily, ...] = (
     LinuxFamily(
         name="Debian-family", manager="apt",
         install_cmd="sudo apt install {pkg}",
-        upgrade_cmd=("sudo", "apt", "upgrade", "-y", "trcc-linux"),
+        package_upgrade=download_and_install("trcc-linux-latest_all.deb",
+                                             "sudo apt install"),
         packages={"pynvml": "python3-pynvml"},
     ),
     LinuxFamily(
         name="Arch-family", manager="pacman",
         install_cmd="sudo pacman -S {pkg}",
-        upgrade_cmd=("sudo", "pacman", "-Syu", "--noconfirm", "trcc-linux"),
+        package_upgrade=download_and_install("trcc-linux-latest-any.pkg.tar.zst",
+                                             "sudo pacman -U"),
         # Arch names it differently, and advising Debian's name here is #207.
         packages={"pynvml": "python-nvidia-ml-py"},
     ),
     LinuxFamily(
         name="SUSE-family", manager="zypper",
         install_cmd="sudo zypper install {pkg}",
-        upgrade_cmd=("sudo", "zypper", "update", "-y", "trcc-linux"),
         packages={"pynvml": "python3-pynvml"},
     ),
     LinuxFamily(
         name="Void", manager="xbps-install",
         install_cmd="sudo xbps-install {pkg}",
-        upgrade_cmd=("sudo", "xbps-install", "-u", "trcc-linux"),
     ),
     LinuxFamily(
         name="Alpine", manager="apk",
         install_cmd="sudo apk add {pkg}",
-        upgrade_cmd=("sudo", "apk", "upgrade", "trcc-linux"),
     ),
     LinuxFamily(
         name="NixOS", manager="nix-env",
         install_cmd="nix-env -iA nixpkgs.{pkg}",
-        upgrade_cmd=(),            # flake-managed; there is no one upgrade line
     ),
 )
 
@@ -478,7 +547,6 @@ _FAMILIES: tuple[LinuxFamily, ...] = (
 _EL_FAMILY = LinuxFamily(
     name="EL-family", manager="dnf",
     install_cmd="sudo dnf install {pkg}",
-    upgrade_cmd=("sudo", "dnf", "upgrade", "-y", "trcc-linux"),
     packages={"pynvml": "python3-pynvml",
               "7z": "/usr/bin/7z",
               "ffmpeg": "/usr/bin/ffmpeg"},
@@ -577,16 +645,17 @@ class LinuxOS(BaseOS, key="linux"):
 
     # ── Transport factories ──────────────────────────────────────────
 
-    def _open_scsi(self, vid: int, pid: int,
-                  serial: str | None = None) -> ScsiTransport:
+    def _open_scsi(self, vid: int, pid: int, serial: str | None = None,
+                  unit: str = "") -> ScsiTransport:
         """Return an unopened SG_IO-backed SCSI transport.
 
         Resolves vid:pid → /dev/sgN via sysfs before building the
         transport.  Raises TransportError if the device isn't present
         as a SCSI generic or sd block device.
         """
-        log.info("LinuxOS.open_scsi: %04x:%04x serial=%r", vid, pid, serial)
-        path = _resolve_scsi_path(vid, pid)
+        log.info("LinuxOS.open_scsi: %04x:%04x serial=%r unit=%s",
+                 vid, pid, serial, unit or "(only)")
+        path = _resolve_scsi_path(vid, pid, unit)
         if path is None:
             log.error("LinuxOS.open_scsi: no /dev/sg* node for %04x:%04x",
                       vid, pid)
@@ -603,7 +672,7 @@ class LinuxOS(BaseOS, key="linux"):
     def setup(self, dry_run: bool = False) -> int:
         """Run one-time Linux setup.
 
-        Four things happen here and none can silently no-op:
+        Six things happen here and none can silently no-op:
           1. udev rules — write /etc/udev/rules.d/99-trcc-lcd.rules for
              every device in the registry + modprobe quirks + sg autoload.
              Requires root; re-execs via sudo when not already root.
@@ -617,6 +686,12 @@ class LinuxOS(BaseOS, key="linux"):
              it the app installs, autostarts, and cannot be launched from
              the menu (#231).  Per-user, no root, skipped when a package
              already provides it.
+          5. Old polkit grants — remove the rule and policy older releases
+             wrote, which let any program run dmidecode/smartctl as root.
+             Root (re-execs via sudo); only files that name our actions.
+          6. TRCC's polkit policy + RAM-lighting helpers — what the packages
+             install, so a pip/source install gets TRCC's own short password
+             prompt and a password-free turn-off.  Never over a package's.
 
         ``dry_run=True`` prints what would be done and returns 0
         without touching the system.
@@ -631,6 +706,8 @@ class LinuxOS(BaseOS, key="linux"):
             install_selinux_policy(dry_run=True)
             log.info("would install the desktop entry: %s",
                      XdgDesktopEntry().path)
+            retire_legacy_polkit(dry_run=True)
+            install_polkit_files(dry_run=True, owns=self.packages().owns)
             return 0
 
         rc_udev = install_udev_rules(dry_run=False)
@@ -648,16 +725,28 @@ class LinuxOS(BaseOS, key="linux"):
         # Desktop integration is a convenience, never a reason to report
         # failure — the device still works from the CLI without a menu icon.
         XdgDesktopEntry().install()
-        return rc_udev or rc_selinux
+        rc_polkit = retire_legacy_polkit(dry_run=False)
+        # After the retirement above, which keeps a policy naming only our
+        # /usr/bin/trcc-* helpers -- exactly the one this installs.
+        rc_helpers = install_polkit_files(dry_run=False,
+                                          owns=self.packages().owns)
+        return rc_udev or rc_selinux or rc_polkit or rc_helpers
 
     def check_permissions(self) -> list[str]:
         """Return user-facing warnings if udev rules are missing, etc."""
         log.info("LinuxOS.check_permissions: probing")
+        from ._udev import rules_state
         warnings: list[str] = []
-        if not Path("/etc/udev/rules.d/99-trcc-lcd.rules").exists():
+        state = rules_state()
+        if state.path is None:
             warnings.append(
                 "udev rules not installed — device access may require root. "
-                "Run 'python -m trcc system setup' to install them."
+                "Run `trcc system setup` to install them."
+            )
+        elif state.current is False:
+            warnings.append(
+                f"the udev rules in {state.path} are from an older TRCC — run "
+                "`trcc doctor` for how to bring them up to date"
             )
         log.info("LinuxOS.check_permissions: %d warning(s)", len(warnings))
         return warnings
@@ -682,8 +771,20 @@ class LinuxOS(BaseOS, key="linux"):
                         "defaulting to 'Linux'", e)
         return "Linux"
 
-    def usb_power_state(self, vid: int, pid: int) -> UsbPowerState | None:
+    #: A sysfs USB device directory is named by its PORT CHAIN (``1-13``,
+    #: ``1-2.3``) — the exact form ``usb_path`` gives a unit, measured 7/7 on
+    #: the dev box incl. two identical hubs.  A unit becomes part of a PATH
+    #: here and can arrive from a user-typed key, so anything else — ``../``,
+    #: or the ``bus@address`` fallback sysfs does not name — is refused.
+    _SYSFS_PORT = re.compile(r"\d+-\d+(?:\.\d+)*")
+
+    def usb_power_state(self, vid: int, pid: int,
+                        unit: str = "") -> UsbPowerState | None:
         """Read the kernel's runtime-PM view of this device from sysfs.
+
+        ``unit`` reads THAT cooler's own directory; unit-less, the first of
+        the model — which, with two identical coolers, was the wrong one half
+        the time (#287).
 
         Read-only.  Setting the policy is the udev rules' job (``_udev.py``);
         this reports what the kernel currently thinks so a timed-out handshake
@@ -696,11 +797,15 @@ class LinuxOS(BaseOS, key="linux"):
         panel (0402:3922, bmAttributes 0x80 → bit 5 clear → never suspends
         even at control=auto).
         """
-        log.debug("usb_power_state: %04x:%04x", vid, pid)
+        log.debug("usb_power_state: %04x:%04x unit=%r", vid, pid, unit)
         base = Path("/sys/bus/usb/devices")
         if not base.is_dir():
             return None
-        for dev in base.iterdir():
+        if unit and not self._SYSFS_PORT.fullmatch(unit):
+            log.debug("usb_power_state: unit %r is not a sysfs port — "
+                      "unknowable", unit)
+            return None
+        for dev in [base / unit] if unit else base.iterdir():
             try:
                 if (int((dev / "idVendor").read_text().strip(), 16) != vid
                         or int((dev / "idProduct").read_text().strip(), 16) != pid):
@@ -813,10 +918,13 @@ class LinuxOS(BaseOS, key="linux"):
         log.debug("package_manager: %s", self._family.manager or "(none)")
         return self._family.manager
 
-    def upgrade_command(self) -> tuple[str, ...]:
-        """Argv that upgrades trcc-linux on this family, or empty if unknown."""
-        log.debug("upgrade_command: %s", self._family.upgrade_cmd)
-        return self._family.upgrade_cmd
+    def upgrade_hint(self) -> str:
+        """A package install upgrades by installing the release's package."""
+        if self.install_method() == "package" and self._family.package_upgrade:
+            log.info("upgrade_hint: %s package -> %s", self._family.name,
+                     self._family.package_upgrade)
+            return self._family.package_upgrade
+        return super().upgrade_hint()
 
     def software_install_hint(self, tool: str) -> str:
         """Install line for a logical tool, in this family's package manager.
@@ -861,8 +969,22 @@ class LinuxOS(BaseOS, key="linux"):
         return f"sudo dnf install {_EPEL} && {command}"
 
     def permission_denied_hint(self) -> str:
-        log.debug("LinuxOS.permission_denied_hint: called")
-        return "run 'trcc system setup' to install udev rules"
+        """Why an open was refused — told by whether OUR udev rules exist.
+
+        Only blames udev when the rules are actually missing: #267's report
+        read ``[OK] udev-rules installed`` while being told to install them,
+        which sends a user to fix something that is not broken.  (This lived
+        in the transport, on every OS, until #173.)
+        """
+        from ._udev import rules_state
+        installed = rules_state().path is not None
+        log.debug("LinuxOS.permission_denied_hint: rules installed=%s",
+                  installed)
+        if not installed:
+            return "run 'trcc system setup' to install udev rules"
+        return ("udev rules are installed, so this is not permissions — the "
+                "panel may be re-enumerating or held by another TRCC process "
+                "(a running trccd, or another TRCC window)")
 
     def no_devices_hint(self) -> str:
         log.debug("LinuxOS.no_devices_hint: called")
@@ -887,6 +1009,37 @@ class LinuxOS(BaseOS, key="linux"):
         disks = _linux_disk_info()
         log.info("LinuxOS.disk_info: %d disk(s)", len(disks))
         return disks
+
+    def ram_access(self) -> RamAccess:
+        """The opt-in grant to reach RGB memory's bus (``trcc-ram-access``)."""
+        log.debug("LinuxOS.ram_access")
+        return LinuxRamAccess(_pkexec_helper)
+
+    def smbuses(self) -> tuple[SmBus, ...]:
+        """Every chipset SMBus, through i2c-dev; all or none."""
+        numbers = find_smbus()
+        log.info("LinuxOS.smbuses: %s", numbers or "none")
+        if not numbers:
+            raise OSError("no SMBus controller found -- is the i2c-dev "
+                          "module loaded?")
+        # A stuck SPD hub on a bus is no place to add traffic.
+        stuck = [s for s in silent_memory_sensors()
+                 if s.partition("-")[0].isdigit()
+                 and int(s.partition("-")[0]) in numbers]
+        if stuck:
+            raise OSError(f"the memory's SPD hub(s) {', '.join(stuck)} are not "
+                          "answering -- TRCC will not use that bus until a "
+                          "full power-off (shut down, switch the power supply "
+                          "off for 30 s) clears them")
+        opened: list[SmBus] = []
+        try:
+            for number in numbers:
+                opened.append(LinuxSmBus(number))
+        except OSError:
+            for bus in opened:
+                bus.close()
+            raise
+        return tuple(opened)
 
 
 # =========================================================================
@@ -918,24 +1071,112 @@ _DMI_MEMORY_FIELDS: frozenset[str] = frozenset({
     'minimum_voltage', 'maximum_voltage', 'memory_technology',
 })
 
-_POLKIT_POLICY = '/usr/share/polkit-1/actions/com.github.lexonight1.trcc.policy'
+_POLKIT_POLICY = str(POLKIT_POLICY)
+# Written by ``setup-polkit`` from v5.3.3 to v9.6.5: polkit.Result.YES for
+# dmidecode/smartctl in ANY session, SSH included.  Nothing owns it.
+_LEGACY_POLKIT_RULE = '/etc/polkit-1/rules.d/50-trcc.rules'
+_POLKIT_ACTION_PREFIX = 'com.github.lexonight1.trcc.'
 
-# Privileged MCHBAR reader (installed by the distro packages).  Intel family-6
-# Alder Lake (0x97/0x9A) + Raptor Lake (0xB7/0xBA/0xBF) share the register map.
+# The privileged helpers the distro packages install, each argv-locked: the
+# policy names these and nothing else.  Intel family-6 Alder Lake (0x97/0x9A)
+# + Raptor Lake (0xB7/0xBA/0xBF) share the MCHBAR register map.
 _IMC_HELPER = '/usr/bin/trcc-imc'
+_DMI_HELPER = '/usr/bin/trcc-dmi'
 _ADL_RPL_MODELS = frozenset({0x97, 0x9A, 0xB7, 0xBA, 0xBF})
 
 
-def _privileged_cmd(binary: str, args: list[str]) -> list[str]:
-    """Build a command, wrapping in pkexec when polkit policy is installed."""
-    log.debug("_privileged_cmd: binary=%s args=%s", binary, args)
+def _pkexec_helper(helper: str) -> list[str] | None:
+    """``pkexec <helper>`` when a packaged helper + policy can run it, else None.
+
+    Only ever one of our argv-locked helpers, never a general-purpose program:
+    pkexec passes arguments through unchecked, so the policy grants a program,
+    not a command line.  None means no silent privilege path exists here (a
+    pip install has no helper), so nothing is spawned and nothing prompts.
+    """
     import shutil
-    if hasattr(os, 'geteuid') and os.geteuid() == 0:
-        return [binary, *args]
-    full_path = shutil.which(binary)
-    if full_path and Path(_POLKIT_POLICY).is_file() and shutil.which('pkexec'):
-        return ['pkexec', full_path, *args]
-    return [binary, *args]
+    if not Path(helper).is_file():
+        log.debug("_pkexec_helper: %s not installed", helper)
+        return None
+    if not (Path(_POLKIT_POLICY).is_file() and shutil.which('pkexec')):
+        log.info("_pkexec_helper: %s present but no polkit policy/pkexec", helper)
+        return None
+    log.debug("_pkexec_helper: pkexec %s", helper)
+    return ['pkexec', helper]
+
+
+def _legacy_polkit_grants() -> list[Path]:
+    """The grants an older TRCC left on this host, by content, never by name.
+
+    The old rule only if it names our actions (the file name alone could be an
+    admin's own); the policy only if it hands pkexec a program that is not one
+    of our ``/usr/bin/trcc-*`` helpers.  Raises ``PermissionError`` when the
+    rules directory is unreadable (root-only on Fedora), so the caller can ask.
+    """
+    import xml.etree.ElementTree as ET
+    stale: list[Path] = []
+    rule = Path(_LEGACY_POLKIT_RULE)
+    try:
+        if _POLKIT_ACTION_PREFIX in rule.read_text(encoding='utf-8'):
+            stale.append(rule)
+    except FileNotFoundError:
+        pass
+    policy = Path(_POLKIT_POLICY)
+    try:
+        programs = {a.text or '' for a in ET.parse(policy).getroot().iter('annotate')
+                    if a.get('key') == 'org.freedesktop.policykit.exec.path'}
+    except FileNotFoundError:
+        programs = set()
+    except ET.ParseError as e:
+        log.warning("_legacy_polkit_grants: %s is not valid XML (%s) — left "
+                    "alone", policy, e)
+        programs = set()
+    if any(not p.startswith('/usr/bin/trcc-') for p in programs):
+        stale.append(policy)
+    log.info("_legacy_polkit_grants: %s", [str(p) for p in stale] or "none")
+    return stale
+
+
+def retire_legacy_polkit(dry_run: bool = False) -> int:
+    """Remove the polkit grants older releases left, which outlive an upgrade.
+
+    v5.3.3-v9.6.5 ``setup-polkit`` wrote a rule that answered YES for
+    dmidecode/smartctl in any session, SSH included, and a policy naming those
+    programs; on a pip install nothing ever replaced either.  Packages replace
+    the policy themselves and remove the rule in their install scripts.
+    Returns 0 on success or nothing to do; re-execs via sudo when it needs root.
+    """
+    log.info("retire_legacy_polkit: dry_run=%s", dry_run)
+    root = hasattr(os, 'geteuid') and os.geteuid() == 0
+    try:
+        stale = _legacy_polkit_grants()
+    except PermissionError:
+        if dry_run or root:
+            log.info("retire_legacy_polkit: %s unreadable — would check it as "
+                     "root", _LEGACY_POLKIT_RULE)
+            return 0 if dry_run else 1
+        return _retire_as_root()
+    if not stale:
+        log.info("retire_legacy_polkit: no old grant on this host")
+        return 0
+    if dry_run:
+        log.info("retire_legacy_polkit: would remove %s",
+                 ", ".join(map(str, stale)))
+        return 0
+    if not root:
+        return _retire_as_root()
+    for path in stale:
+        path.unlink()
+        log.warning("retire_legacy_polkit: removed %s — it let any program in "
+                    "the session run dmidecode/smartctl as root", path)
+    return 0
+
+
+def _retire_as_root() -> int:
+    """Run :func:`retire_legacy_polkit` again under sudo."""
+    log.info("_retire_as_root: the polkit files need root")
+    from ._elevate import reexec_as_root
+    return reexec_as_root("from trcc.adapters.system.linux import "
+                          "retire_legacy_polkit; sys.exit(retire_legacy_polkit())")
 
 
 def _enrich_with_spd_timings(slots: list[dict[str, str]]) -> None:
@@ -1005,12 +1246,11 @@ def _read_live_imc_timings() -> ImcTimings | None:
     if not _cpu_is_adl_rpl() or not Path(_IMC_HELPER).is_file():
         return None
 
-    import shutil
     import subprocess
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         cmd = [_IMC_HELPER]
-    elif Path(_POLKIT_POLICY).is_file() and shutil.which("pkexec"):
-        cmd = ["pkexec", _IMC_HELPER]
+    elif (pkexec := _pkexec_helper(_IMC_HELPER)) is not None:
+        cmd = pkexec
     else:
         return None             # no silent privilege path available
 
@@ -1144,25 +1384,64 @@ def _prefer_configured_speed(slots: list[dict[str, str]]) -> None:
         slot["speed"] = configured
 
 
-def _linux_memory_info() -> list[dict[str, str]]:
-    """Get DRAM slot info via dmidecode; falls back to psutil for totals."""
-    log.debug("_linux_memory_info: called")
+def _dmi_memory_slots() -> list[dict[str, str]]:
+    """DRAM slots from ``dmidecode -t memory``, speed = what the IMC RUNS.
+
+    Only the dmidecode half of :func:`_linux_memory_info` — no SPD or
+    ``trcc-imc`` enrichment — so the memory clock sensor can read the
+    configured speed without a second privileged helper (#279).  Empty when
+    dmidecode is missing, refused or fails.
+
+    Root reads ``dmidecode`` itself.  Anyone else goes through the argv-locked
+    ``trcc-dmi`` helper, or reads nothing: handing pkexec ``dmidecode`` made
+    every program in the session able to run it as root with any arguments.
+    """
+    log.debug("_dmi_memory_slots: called")
     import subprocess
+    if hasattr(os, 'geteuid') and os.geteuid() == 0:
+        cmd = ['dmidecode', '-t', '17']
+    elif (pkexec := _pkexec_helper(_DMI_HELPER)) is not None:
+        cmd = pkexec
+    else:
+        log.info("_dmi_memory_slots: no root and no %s — the configured "
+                 "memory speed is unavailable, the SPD nameplate is used",
+                 _DMI_HELPER)
+        return []
     slots: list[dict[str, str]] = []
     try:
-        result = subprocess.run(
-            _privileged_cmd('dmidecode', ['-t', 'memory']),
-            capture_output=True, text=True, timeout=5, check=False,
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=10, check=False)
         if result.returncode == 0:
             slots = _parse_dmi_memory(result.stdout)
         else:
-            log.debug("dmidecode -t memory exited %d — falling back",
-                      result.returncode)
+            # trcc-dmi: 3 = no dmidecode installed; pkexec: 126/127 = refused
+            # (e.g. not the active local session).
+            log.info("_dmi_memory_slots: %s exited %d — falling back to the "
+                     "SPD nameplate", cmd[-1], result.returncode)
     except (OSError, subprocess.SubprocessError) as e:
-        log.debug("dmidecode -t memory failed: %s", type(e).__name__)
-
+        log.info("_dmi_memory_slots: %s failed: %s", cmd[0], type(e).__name__)
     _prefer_configured_speed(slots)
+    return slots
+
+
+def configured_memory_mts() -> int | None:
+    """The memory speed the controller RUNS, in MT/s — or ``None`` if unknown.
+
+    The highest configured speed across populated slots (they run together).
+    ``None`` when dmidecode cannot be read, which is every host without our
+    polkit rule or root: the caller falls back to the SPD nameplate.
+    """
+    speeds = [int(n) for slot in _dmi_memory_slots()
+              if (n := slot.get("speed", "").split(" ")[0]).isdigit()]
+    mts = max(speeds, default=None)
+    log.info("configured_memory_mts: %s MT/s (from %d slot(s))", mts, len(speeds))
+    return mts
+
+
+def _linux_memory_info() -> list[dict[str, str]]:
+    """Get DRAM slot info via dmidecode; falls back to psutil for totals."""
+    log.debug("_linux_memory_info: called")
+    slots = _dmi_memory_slots()
     _enrich_with_spd_timings(slots)
     _enrich_with_live_imc_timings(slots)
 
@@ -1210,12 +1489,18 @@ def _linux_disk_info() -> list[dict[str, str]]:
 
 
 def _smart_health(dev_name: str) -> str | None:
-    """SMART overall-health status via smartctl -H."""
+    """SMART overall-health status via smartctl -H.
+
+    Never elevated: no feature reads disk health today (``disk_info`` has no
+    caller), and a pkexec grant for smartctl was a grant of every smartctl
+    option, including the ones that change drive state.  As root it works;
+    otherwise smartctl refuses and the health is simply unknown.
+    """
     log.debug("_smart_health: dev=%s", dev_name)
     import subprocess
     try:
         result = subprocess.run(
-            _privileged_cmd('smartctl', ['-H', f'/dev/{dev_name}']),
+            ['smartctl', '-H', f'/dev/{dev_name}'],
             capture_output=True, text=True, timeout=5, check=False,
         )
         for line in result.stdout.splitlines():

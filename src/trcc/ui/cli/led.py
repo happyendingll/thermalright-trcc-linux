@@ -31,15 +31,16 @@ from ...core.commands import (
     SetMemoryRatio,
     SetWeekStart,
     ToggleLed,
-    ToggleSegment,
 )
+from ...core.errors import TrccError
 from ...core.led_models import LEDMode
 from ._ctx import (
+    daemon_owns_the_panels,
     dispatch_echo,
     emit_json,
-    ensure_connected,
     get_app,
     parse_on_off,
+    recover_or_exit,
 )
 
 log = logging.getLogger(__name__)
@@ -85,7 +86,6 @@ def set_colors(
         key, colors, brightness, off,
     )
     parsed = [_parse_hex_color(c) for c in colors]
-    ensure_connected(get_app(), key)
     dispatch_echo(SetLedColors(
         key=key, colors=parsed, global_on=not off, brightness=brightness,
     ))
@@ -108,8 +108,7 @@ def render(
     """
     log.info("cli led render: key=%s color=%s phase=%s", key, color, phase)
     override = _parse_hex_color(color) if color else None
-    ensure_connected(get_app(), key)
-    dispatch_echo(RenderLed(key=key, color=override, phase=phase))
+    dispatch_echo(InitializeLed(key=key, color=override, phase=phase))
 
 
 @app.command("mode")
@@ -273,23 +272,10 @@ def select_zone(
     key: str = typer.Argument(..., help="LED device key"),
     zone: int = typer.Argument(..., help="Zone index to select"),
 ) -> None:
-    """Set the currently-selected zone (UI state)."""
+    """Select exactly this zone: the page a page-style cooler shows, or the
+    one zone a PA120/LF10 edit reaches."""
     log.info("cli led select-zone: key=%s zone=%s", key, zone)
     dispatch_echo(SelectZone(key=key, zone=zone))
-
-
-@app.command("toggle-segment")
-def toggle_segment(
-    key: str = typer.Argument(..., help="LED device key"),
-    index: int = typer.Argument(..., help="Segment index"),
-    state: str = typer.Argument(..., help="'on' or 'off'"),
-) -> None:
-    """Flip one segment on/off (segment-display devices)."""
-    log.info(
-        "cli led toggle-segment: key=%s index=%s state=%s",
-        key, index, state,
-    )
-    dispatch_echo(ToggleSegment(key=key, index=index, on=parse_on_off(state)))
 
 
 @app.command("list-styles")
@@ -449,7 +435,19 @@ def play(
     import time
 
     app_obj = get_app()
-    ensure_connected(app_obj, key)   # once, before the loop (not per tick)
+    # The first frame is the one-shot render: dispatch connects its device
+    # (USES_DEVICE) and the result says why when it cannot.  The per-tick
+    # RenderLed below never connects.
+    first = app_obj.dispatch(InitializeLed(key=key))
+    if not first.ok:
+        typer.echo(first.message, err=True)
+        raise typer.Exit(code=1)
+    if daemon_owns_the_panels(app_obj):
+        # The daemon's LedAnimationLoop animates it; ticking here as well would
+        # run every effect at double speed (the #249 shape, for LEDs).
+        log.info("cli led play: %s is animated by the daemon — not ticking", key)
+        typer.echo(f"The daemon is animating {key} — it keeps the LEDs updated.")
+        return
     if interval is not None:
         tick_s = interval
     else:
@@ -462,10 +460,16 @@ def play(
     typer.echo(f"Animating LED on {key} at {tick_s:.2f}s intervals (Ctrl-C to stop)…")
     try:
         while True:
-            result = app_obj.dispatch(RenderLed(key=key))
+            # A panel that goes away (suspend/resume, a replug) is reconnected,
+            # not the end of the command (#270).
+            try:
+                result = app_obj.dispatch(RenderLed(key=key))
+            except TrccError as e:
+                recover_or_exit(app_obj, key, str(e))
+                continue
             if not result.ok:
-                typer.echo(f"  tick failed: {result.message}", err=True)
-                raise typer.Exit(code=1)
+                recover_or_exit(app_obj, key, result.message)
+                continue
             time.sleep(tick_s)
     except KeyboardInterrupt:
         typer.echo("\nStopped.")

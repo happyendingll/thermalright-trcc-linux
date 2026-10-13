@@ -459,9 +459,9 @@ def test_an_offscreen_qt_never_supplies_a_capture(monkeypatch) -> None:
     MEASURED against ImageMagick ground truth on the same rectangle: offscreen
     scored a mean absolute error of 68.9, native xcb scored 0.0.
 
-    Reachable from every non-GUI face — ``_ensure_qt_app`` forces
-    ``QT_QPA_PLATFORM=offscreen`` for headless rendering without asking
-    whether a display exists.
+    Reachable from every non-GUI face — ``_ensure_qt_app`` builds the
+    headless app on the offscreen platform (``-platform offscreen``) without
+    asking whether a display exists.
     """
     cap = QtNativeCapture()
 
@@ -559,20 +559,6 @@ def _assert_tightly_packed(data: bytes, w: int, h: int, who: str) -> None:
     )
 
 
-def test_qimage_producer_strips_row_padding() -> None:
-    """``qimage_to_raw_rgb24`` — the gui screencast tick and the Renderer."""
-    from trcc.adapters.render.qt import qimage_to_raw_rgb24
-
-    img = _row_ramp(PADDED_W, PADDED_H)
-    assert img.bytesPerLine() != PADDED_W * 3, (
-        "pick a width Qt actually pads, or this test proves nothing"
-    )
-
-    frame = qimage_to_raw_rgb24(img)
-
-    _assert_tightly_packed(frame.data, PADDED_W, PADDED_H, "qimage_to_raw_rgb24")
-
-
 def test_pixmap_producer_strips_row_padding() -> None:
     """``_pixmap_to_raw_frame`` — every external region-capture rung."""
     from PySide6.QtGui import QPixmap
@@ -587,16 +573,16 @@ def test_pixmap_producer_strips_row_padding() -> None:
                            "_pixmap_to_raw_frame")
 
 
-def test_both_qt_producers_agree_with_the_shared_primitive() -> None:
+def test_the_qt_producer_agrees_with_the_shared_primitive() -> None:
     """The three copies were verified identical before being collapsed.
 
-    This is the guard that keeps them that way: both Qt producers must agree
+    This is the guard that keeps them that way: the Qt producer must agree
     byte-for-byte with ``core._frames.unpad_rows`` applied by hand to the same
-    buffer.  A future "optimisation" inside either one fails here.
+    buffer.  A future "optimisation" inside it fails here.  (The second Qt
+    producer, ``qimage_to_raw_rgb24``, went on 2026-10-07 with no caller left.)
     """
     from PySide6.QtGui import QImage, QPixmap
 
-    from trcc.adapters.render.qt import qimage_to_raw_rgb24
     from trcc.adapters.screencast.qt import _pixmap_to_raw_frame
     from trcc.core._frames import unpad_rows
 
@@ -605,6 +591,126 @@ def test_both_qt_producers_agree_with_the_shared_primitive() -> None:
     by_hand = unpad_rows(bytes(img.constBits()), PADDED_W, PADDED_H,
                          img.bytesPerLine())
 
-    assert qimage_to_raw_rgb24(img).data == by_hand
     assert _pixmap_to_raw_frame(
         QPixmap.fromImage(img), PADDED_W, PADDED_H).data == by_hand
+
+
+# ── nothing left behind (class A audit, 2026-09-26) ────────────────────────
+
+def _scrot_like(monkeypatch: pytest.MonkeyPatch, module: str) -> None:
+    """Only ``scrot`` on PATH, behaving as scrot does: it will not overwrite an
+    existing file and writes ``<name>_000.png`` beside it instead (confirmed
+    against the installed scrot)."""
+    def fake_which(name: str) -> str | None:
+        return "/usr/bin/scrot" if name == "scrot" else None
+
+    def fake_run(cmd: list[str], **kw: Any) -> Any:
+        out = Path(cmd[-1])
+        if out.exists():
+            out = out.with_name(f"{out.stem}_000{out.suffix}")
+        _png(out, REGION[2], REGION[3], INK)
+        return subprocess.CompletedProcess(cmd, 0, b"", b"")
+
+    monkeypatch.setattr(f"{module}.shutil.which", fake_which)
+    monkeypatch.setattr(f"{module}.subprocess.run", fake_run)
+
+
+@pytest.fixture
+def private_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    import tempfile
+    private = tmp_path / "systmp"
+    private.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(private))
+    return private
+
+
+def test_a_screencast_grab_leaves_nothing_in_tmp(
+    cap: ToolCapture, monkeypatch: pytest.MonkeyPatch, private_tmp: Path,
+) -> None:
+    """A pre-created mkstemp file made scrot write ``_000.png`` beside it: one
+    PNG left in /tmp — tmpfs, RAM — on every screencast tick."""
+    _scrot_like(monkeypatch, "trcc.adapters.screencast.qt")
+
+    frames = [cap.grab_region(*REGION) for _ in range(3)]
+
+    assert all(_uniform(f, INK) for f in frames)
+    assert list(private_tmp.iterdir()) == []
+
+
+def test_the_picker_grab_leaves_nothing_in_tmp(
+    monkeypatch: pytest.MonkeyPatch, private_tmp: Path,
+) -> None:
+    """The region picker's own full-screen fallback had the same mkstemp."""
+    from trcc.ui import screen_overlay
+
+    _scrot_like(monkeypatch, "trcc.ui.screen_overlay")
+    monkeypatch.setattr(screen_overlay.QApplication, "primaryScreen",
+                        staticmethod(lambda: None))
+
+    pix = screen_overlay.grab_full_screen()
+
+    assert not pix.isNull()
+    assert list(private_tmp.iterdir()) == []
+
+
+# ── a cast writes nothing to the log per frame ─────────────────────────────
+#
+# A grab runs ~16 times a second.  Every line it wrote on the plain logger
+# reached the file each frame -- up to six per frame on the tool rung,
+# INFOs among them -- the noise that rotates away the lines a report is
+# read for.  Per-frame detail goes to the ``trcc.frame`` family; a change of
+# state (handing over, a new crop) is said once.
+
+
+def _file_records(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """What would reach the log file: everything but the per-frame family."""
+    return [f"{r.levelname} {r.getMessage()}" for r in caplog.records
+            if not r.name.startswith("trcc.frame")]
+
+
+@pytest.mark.parametrize("tool, size", [
+    ("grim", (REGION[2], REGION[3])),       # a region tool
+    ("gnome-screenshot", FULL),             # a full grab, cropped
+])
+def test_a_cast_through_a_tool_writes_nothing_per_frame(
+    cap: ToolCapture, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, tool: str, size: tuple[int, int],
+) -> None:
+    """Qt cannot grab offscreen, so every frame is handed to the tool rung.
+
+    MUTATION CHECK: log the handover, the crop or the capture on the plain
+    logger again and the 20 frames below write 20+ records.
+    """
+    import logging
+
+    _only(tool, monkeypatch, size)
+    chain = QtNativeCapture(then=cap)
+    with caplog.at_level(logging.DEBUG):
+        chain.grab_region(*REGION)          # the first frame may announce
+        caplog.clear()
+        for _ in range(20):
+            chain.grab_region(*REGION)
+
+    assert _file_records(caplog) == []
+
+
+def test_a_cast_through_qt_writes_nothing_per_frame(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Qt's own grab works (an X11 session): three lines a frame, until now."""
+    import logging
+
+    from PySide6.QtGui import QColor, QPixmap
+
+    pix = QPixmap(REGION[2], REGION[3])
+    pix.fill(QColor(*INK))
+    monkeypatch.setattr(QtNativeCapture, "_qt_grab",
+                        lambda self, *region: pix)
+    chain = QtNativeCapture()
+    with caplog.at_level(logging.DEBUG):
+        chain.grab_region(*REGION)
+        caplog.clear()
+        for _ in range(20):
+            chain.grab_region(*REGION)
+
+    assert _file_records(caplog) == []

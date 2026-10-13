@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "trcc-linux"
-version = "9.10.2"
+version = "9.10.8"
 description = "Linux implementation of Thermalright LCD Control Center"
 readme = "README.md"
 license = "GPL-3.0-or-later"
@@ -28,7 +28,14 @@ classifiers = [
 ]
 
 dependencies = [
-    "PySide6>=6.5.0",
+    # PySide6 6.12.0 releases Py_None one time too many on every call that
+    # returns nothing (measured: -1 refcount per QImage.fill / setPixel /
+    # QPainter.setPen).  None is immortal from Python 3.12, so only 3.10 and
+    # 3.11 suffer -- and there the process aborts ("none_dealloc: deallocating
+    # None") after ~5000 such calls, i.e. seconds into rendering.  6.11.2 is
+    # clean on both.  Lift the cap once a 6.12.x is measured clean on 3.10.
+    "PySide6>=6.5.0,<6.12; python_version < '3.12'",
+    "PySide6>=6.5.0; python_version >= '3.12'",
     "numpy>=1.24.0",
     "psutil>=5.9.0",
     "pyusb>=1.2.0",
@@ -43,6 +50,11 @@ dependencies = [
     "click>=7.0",
     "typer>=0.9.0",
     "fastapi>=0.100",
+    # The LAN API's opt-in TLS (`trcc api --tls`): a self-signed certificate
+    # made once and pinned by fingerprint.  Imported only under --tls.  Floor
+    # MEASURED, not guessed: the TLS tests pass on 3.4.8 (Ubuntu 22.04), 38.0.4
+    # (Debian 12), 41.0.7 (Ubuntu 24.04) and 50.
+    "cryptography>=3.4.8",
     "tzdata>=2024.1; sys_platform == 'win32'",
     "uvicorn[standard]>=0.20",
     # >=0.0.18, not >=0.0.6, for two reasons measured together: 0.0.13
@@ -103,7 +115,7 @@ dev = [
     # was declared nowhere and worked only because every machine that had run
     # the suite happened to have it installed already.  The first environment
     # that did not was the Windows CI job, on its first ever run.
-    "pytest-xdist>=3.0",
+    "pytest-xdist>=3.2",          # --dist worksteal arrived in 3.2
     "ruff>=0.4.0",
     # httpx2, not httpx: starlette.testclient does `try: import httpx2 / except:
     # import httpx` + a DeprecationWarning. Pinning the old one made the suite
@@ -163,9 +175,14 @@ artifacts = [
     "**/assets/**/*.service",
     "**/assets/**/*.policy",
     "**/assets/**/*.svg",
-    # Privileged MCHBAR timing reader (no extension) — distro packages install
-    # it to /usr/bin/trcc-imc; shipped here so it's in the sdist/wheel too.
+    # Privileged helpers (no extension), the polkit policy's only targets —
+    # distro packages install them to /usr/bin; shipped here so they are in
+    # the sdist/wheel too.  trcc-imc: MCHBAR timings.  trcc-dmi: DRAM slots.
+    # trcc-ram-access: the opt-in RAM-lighting grant; -off: removing it.
     "**/assets/trcc-imc",
+    "**/assets/trcc-dmi",
+    "**/assets/trcc-ram-access",
+    "**/assets/trcc-ram-access-off",
     # SELinux policy source — `trcc system setup` builds + loads it on Fedora
     # so source/pip installs can pass the USB/SCSI ioctls (packages ship the
     # compiled .pp via the rpm).
@@ -178,7 +195,16 @@ pythonpath = ["src", "tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-addopts = "-v --tb=short -n auto"
+# --dist worksteal: an idle worker takes queued tests from a busy one.  The
+# default hands every worker its share up front, and the slow GUI tests left
+# one worker grinding while 15 sat idle.  Measured 2026-10-10 on the 3.12
+# venv, same 29,574 results either way: 211 s by default, 101 s stealing.
+addopts = "-v --tb=short -n auto --dist worksteal"
+# A test still running after this many seconds gets every thread's stack
+# printed, so a hang names itself.  Three CI runs (2026-10-09/10) sat silent
+# 21-25 minutes at 88-90% until the 45-minute job limit, with nothing in the
+# log to say which test; one hung the same way locally and took gdb to read.
+faulthandler_timeout = 300
 # pyusb 1.3.1 uses _pack_ in ctypes — deprecated in Python 3.14 (pyusb#535)
 # Remove once pyusb releases a fix with _layout_ = 'ms'
 # An unexplained warning is a defect nobody has read yet.  This was a COUNT in
@@ -188,6 +214,9 @@ addopts = "-v --tb=short -n auto"
 # finalise them.  A number you can scroll past is not a gate; an error is.
 # Filters apply in order and the LAST match wins, so the usb ignore below must
 # stay after "error".
+markers = [
+    "expects_logging_error: the test drives a handler into handleError on purpose; tests/conftest.py then REQUIRES one",
+]
 filterwarnings = [
     "error",
     "ignore::DeprecationWarning:usb.*",

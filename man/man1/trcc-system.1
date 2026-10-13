@@ -1,4 +1,4 @@
-.TH "TRCC\-SYSTEM" "1" "" "trcc\-linux 9.10.2" "TRCC Manual"
+.TH "TRCC\-SYSTEM" "1" "" "trcc\-linux 9.10.8" "TRCC Manual"
 .SH NAME
 trcc\-system \- System\-level operations (setup, sensors, info)
 .SH SYNOPSIS
@@ -87,6 +87,87 @@ Persist the auto\-mapped bindings instead of only showing them.
 \fB\-\-help\fR
 Show this command's help and exit.
 .RE
+.SS dashboard\-add
+.PP
+\fBtrcc system dashboard\-add\fR [\fIOPTIONS\fR]
+.PP
+Add an empty custom panel to the sensor dashboard. Four unbound rows, ready for dashboard\-bind. What a new panel IS lives on the model, so this, the GUI and qtgui all add the same thing.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-name \fINAME\fR\fR
+Panel name.
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS dashboard\-bind
+.PP
+\fBtrcc system dashboard\-bind\fR \fIINDEX\fR \fIROW\fR \fISENSOR_ID\fR
+.PP
+Bind one dashboard row to a sensor. The sensor must exist on this machine  \-  the GUIs bind by picking from a list and cannot name one that does not, so neither can this. The unit comes from the sensor rather than the caller, for the same reason.
+.PP
+Arguments:
+.RS 4
+.TP
+\fBINDEX\fR
+Panel index from dashboard.
+.TP
+\fBROW\fR
+Row within the panel (0\-based).
+.TP
+\fBSENSOR_ID\fR
+Sensor id from list\-sensors.
+.RE
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS dashboard\-delete
+.PP
+\fBtrcc system dashboard\-delete\fR \fIINDEX\fR
+.PP
+Delete a panel from the sensor dashboard. Deleting the only panel is refused  \-  an empty layout would make the next read fall back to defaults, a wipe dressed up as a write.
+.PP
+Arguments:
+.RS 4
+.TP
+\fBINDEX\fR
+Panel index from dashboard.
+.RE
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS dashboard\-rename
+.PP
+\fBtrcc system dashboard\-rename\fR \fIINDEX\fR \fINAME\fR
+.PP
+Rename a sensor\-dashboard panel.
+.PP
+Arguments:
+.RS 4
+.TP
+\fBINDEX\fR
+Panel index from dashboard.
+.TP
+\fBNAME\fR
+The new panel name.
+.RE
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
 .SS debug\-report
 .PP
 \fBtrcc system debug\-report\fR [\fIOPTIONS\fR]
@@ -147,6 +228,43 @@ Show whether trcc has been set up on this machine yet.
 .PP
 Options:
 .RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS follow
+.PP
+\fBtrcc system follow\fR [\fIMODE\fR] [\fIOPTIONS\fR]
+.PP
+Make other RGB follow the LED cooler's colours \-\- or an LCD's picture (#160). 'openrgb': TRCC connects to OpenRGB's SDK server \-\- start it in OpenRGB's SDK Server tab \-\- and sends the cooler's colours to every OpenRGB device, in OpenRGB's direct mode. 'ram': TRCC sends them to Corsair RGB memory itself, with no OpenRGB \-\- close OpenRGB first, so the two never drive the same sticks. 'off' stops.
+.PP
+Arguments:
+.RS 4
+.TP
+\fBMODE\fR
+\&'off', 'openrgb', 'ram' or 'status'
+.RE
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-host \fIHOST\fR\fR
+OpenRGB's SDK server (default: the saved one, 127.0.0.1 at first).
+.TP
+\fB\-\-port \fIPORT\fR\fR
+Its port (default: the saved one, 6742 at first).
+.TP
+\fB\-\-source \fISOURCE\fR\fR
+The device that leads: an LCD's key (e.g. 0402:3922) to follow its picture, or '' for the first LED cooler. Default: the saved one.
+.TP
+\fB\-\-mapping \fIMAPPING\fR\fR
+An LCD's picture on the followers: 'halves' (left to the first, right to the second) or 'single' (one colour each). Default: the saved one.
+.TP
+\fB\-\-colors \fICOLORS\fR\fR
+How a region of an LCD's picture becomes a light's colour: 'vivid' (its brightest pixels \-\- small bright details show) or 'smooth' (its average \-\- steadier). Default: the saved one, vivid at first.
+.TP
+\fB\-\-target \fITARGET\fR\fR
+A light that follows (a stick's 'i2c\-3/0x19', an OpenRGB device's name); repeat for more. '\-\-target all' for every one. Default: the saved ones.
 .TP
 \fB\-\-help\fR
 Show this command's help and exit.
@@ -278,7 +396,7 @@ Show this command's help and exit.
 .PP
 \fBtrcc system list\-endpoints\fR
 .PP
-Enumerate every HTTP route the REST API exposes. Builds the FastAPI app (no uvicorn) and walks its router so the output reflects what trcc api / trcc serve would serve.
+Enumerate every HTTP route the REST API exposes. Builds the FastAPI app (no uvicorn) and walks its router so the output reflects what trcc api / trcc serve would serve. Routes only, no App: build_app() bare found or STARTED the shared App \-\- USB and all \-\- to print a list.
 .PP
 Options:
 .RS 4
@@ -400,6 +518,83 @@ Options:
 \fB\-\-help\fR
 Show this command's help and exit.
 .RE
+.SS ram\-effect
+.PP
+\fBtrcc system ram\-effect\fR \fIEFFECT\fR [\fIOPTIONS\fR]
+.PP
+Save one of the memory's own effects on the sticks. The stick keeps it after TRCC closes and through a reboot. If the RAM was following a device, following turns off first.
+.PP
+Arguments:
+.RS 4
+.TP
+\fBEFFECT\fR
+The effect to save on the RAM.
+.RE
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-stick \fISTICK\fR\fR
+A stick by ref (see trcc system rgb); repeat for more. Default: every stick.
+.TP
+\fB\-\-speed \fISPEED\fR\fR
+(no description)
+.TP
+\fB\-\-direction \fIDIRECTION\fR\fR
+(no description)
+.TP
+\fB\-\-color \fICOLOR\fR\fR
+R,G,B; repeat for a second colour.
+.TP
+\fB\-\-random\fR
+Let the stick pick the colours.
+.TP
+\fB\-\-brightness \fIBRIGHTNESS\fR\fR
+(no description)
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS ram\-lighting
+.PP
+\fBtrcc system ram\-lighting\fR [\fIACTION\fR]
+.PP
+Let TRCC reach RGB memory's lighting \-\- opt\-in, asks for a password. RGB memory's lighting chips sit on the motherboard's SMBus, beside the chips that hold the memory's own settings. Linux can only open the whole bus, so enabling lets programs you run reach all of it, not just TRCC. Only the person logged in at this computer gets access, and only that bus. 'disable' removes it completely. It lasts across reboots. Your desktop asks for the password; the answer comes when you type it or close the prompt.
+.PP
+Arguments:
+.RS 4
+.TP
+\fBACTION\fR
+\&'enable', 'disable' or 'status'
+.RE
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS rgb
+.PP
+\fBtrcc system rgb\fR [\fIOPTIONS\fR]
+.PP
+The RGB lights TRCC can drive or hand colours to.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-scan\fR
+Look for the lights first: RGB memory on the SMBus, and OpenRGB's devices.
+.TP
+\fB\-\-host \fIHOST\fR\fR
+With \-\-scan: look for OpenRGB here, and save it (default: the saved one, 127.0.0.1 at first).
+.TP
+\fB\-\-port \fIPORT\fR\fR
+With \-\-scan: OpenRGB's port (default: the saved one, 6742 at first).
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
 .SS sensors
 .PP
 \fBtrcc system sensors\fR
@@ -449,16 +644,16 @@ Show this command's help and exit.
 .PP
 \fBtrcc system upgrade\fR [\fIOPTIONS\fR]
 .PP
-Upgrade trcc\-linux via the detected package manager.
+Print the command that upgrades this TRCC install.
 .PP
 Options:
 .RS 4
 .TP
 \fB\-\-yes, \-y\fR
-Skip confirmation and run the upgrade subprocess.
+Accepted for older scripts; nothing is run.
 .TP
 \fB\-\-dry\-run\fR
-Print the command that would run, don't execute it.
+Accepted for older scripts; nothing is run.
 .TP
 \fB\-\-help\fR
 Show this command's help and exit.

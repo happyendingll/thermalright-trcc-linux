@@ -20,10 +20,9 @@ import logging
 import weakref
 import webbrowser
 from pathlib import Path
-from threading import Thread
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, Qt, Signal
 from PySide6.QtGui import QIcon, QIntValidator
 from PySide6.QtWidgets import (
     QComboBox,
@@ -31,6 +30,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMenu,
+    QMessageBox,
     QPushButton,
     QToolTip,
 )
@@ -45,6 +45,7 @@ from ...core.commands import (
     RefreshAutostart,
 )
 from ...core.models import DEFAULT_REFRESH_INTERVAL_S
+from ...core.results import ControlCenterSnapshotResult
 from .assets import Assets
 from .base import BasePanel, create_image_button, set_background_pixmap
 from .constants import Layout, Sizes, Styles
@@ -52,36 +53,36 @@ from .constants import Layout, Sizes, Styles
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from ...app import App
+    from ...core.ports import CommandBus
     from ._ui_state import UiStateStore
 
 log = logging.getLogger(__name__)
 
 
-def ensure_autostart(app: App) -> bool:
-    """Auto-enable autostart on first launch; re-render it otherwise.
+def ensure_autostart(app: CommandBus) -> bool:
+    """Auto-enable autostart ONCE, on first launch; re-render it otherwise.
 
     GUI-launch policy, kept here deliberately rather than pushed into a
     Command: qtgui's system panel reads and toggles autostart but has never
     auto-enabled it, and moving this would hand it a behaviour it does not
     have.  That is a product decision, not a refactor.
 
-    Three dispatches rather than a held ``AutostartManager`` — the port reach
-    it replaced (``app.platform.autostart()``) raised under ``TRCC_DAEMON=1``.
-    ``RefreshAutostart`` is the already-enabled branch: it re-renders an
-    existing entry so a moved install picks up a new ``Exec=`` (#201) without
-    the user toggling autostart off and on again.
+    "First launch" is ``configured``, not ``enabled``: Enable and Disable both
+    record the choice, from any UI.  Keyed on ``enabled`` it turned a user's
+    "off" back on at every gui launch — a cutover regression; legacy and the
+    C# (a ``boot`` marker file, ``Form1.cs:290``) both enable once.
+    ``RefreshAutostart`` re-renders an existing entry so a moved install picks
+    up a new launch line (#201), and never creates one — so "off" stays off.
     """
-    if not app.dispatch(GetAutostartStatus()).enabled:
-        # First launch: install the entry.  Idempotent across re-runs.
-        log.info("ensure_autostart: no entry — enabling on first launch")
+    if not app.dispatch(GetAutostartStatus()).configured:
+        log.info("ensure_autostart: never configured — enabling on first launch")
         return app.dispatch(EnableAutostart()).enabled
-    log.info("ensure_autostart: entry present — refreshing Exec path")
+    log.info("ensure_autostart: configured — refreshing any existing entry")
     return app.dispatch(RefreshAutostart()).enabled
 
 
 def _get_install_info(
-    app: App | None, ui_state: UiStateStore | None = None,
+    app: CommandBus | None, ui_state: UiStateStore | None = None,
 ) -> tuple[str, str]:
     """Install method + distro from UiState; ask the bus on first call.
 
@@ -171,12 +172,10 @@ class UCAbout(BasePanel):
     hdd_toggle_changed = Signal(bool)    # HDD info enabled
     refresh_changed = Signal(int)        # refresh interval (seconds)
     gpu_changed = Signal(str)            # gpu_key for metrics
-    _update_available = Signal(str)       # latest version
-    _upgrade_finished = Signal(bool)     # True=success, False=failure
 
     def __init__(self, parent=None,
                  gpu_list: list[tuple[str, str]] | None = None,
-                 app: App | None = None,
+                 app: CommandBus | None = None,
                  ui_state: UiStateStore | None = None):
         super().__init__(parent, width=Sizes.FORM_W, height=Sizes.FORM_H)
 
@@ -321,16 +320,15 @@ class UCAbout(BasePanel):
             self._on_update_btn_tooltip, self.update_btn)
         self.update_btn.installEventFilter(self._tooltip_filter)
         self.update_btn.clicked.connect(self._on_update_clicked)
-        self._update_available.connect(self._on_update_result)
-        self._upgrade_finished.connect(self._on_upgrade_done)
         self._latest_version: str | None = None
         self._install_method, self._distro = _get_install_info(self._app, self._ui_state)
 
-        # Check GitHub for updates in background, then every hour
-        self._update_timer = QTimer(self)
-        self._update_timer.timeout.connect(self._start_update_check)
-        self._update_timer.start(60 * 60 * 1000)  # 1 hour
-        Thread(target=self._check_for_update, daemon=True).start()
+        # The App checks for updates (UpdateWatch) -- at session start, then
+        # hourly -- and this panel shows its answer: the last one now, each
+        # new one through ``on_update_checked``.  It starts no thread: the
+        # one it used to start held this widget and deadlocked Qt when a
+        # window was dropped mid-check.
+        self._show_last_update()
 
         # === GPU selection (below language row) ===
         self._setup_gpu_widget()
@@ -398,16 +396,46 @@ class UCAbout(BasePanel):
         log.info("_on_website_clicked")
         webbrowser.open('https://www.thermalright.com')
 
-    def _start_update_check(self) -> None:
-        """Kick a background update check — slot fired by the 1-hour QTimer."""
-        Thread(target=self._check_for_update, daemon=True).start()
-
     def _set_temp(self, mode: str):
         """Toggle temperature unit (radio behavior)."""
+        log.info("_set_temp: %s", mode)
+        self.show_temp_unit(mode)
+        self.temp_unit_changed.emit(mode)
+
+    def show_app_settings(self, cc: ControlCenterSnapshotResult) -> None:
+        """Show the App's control-centre settings — sends nothing.
+
+        The HDD box and the refresh field emit only on a click and on
+        editing, so setting them is silent; the GPU picker emits on any
+        index change, so it is blocked while it is set.
+        """
+        log.info("show_app_settings: hdd=%s refresh=%ss gpu=%s unit=%s",
+                 cc.hdd_enabled, cc.refresh_interval_s, cc.active_gpu,
+                 cc.temp_unit)
+        self.show_temp_unit(cc.temp_unit)
+        self._read_hdd = cc.hdd_enabled
+        self.hdd_btn.setChecked(cc.hdd_enabled)
+        self._refresh_interval = int(cc.refresh_interval_s)
+        self.refresh_input.setText(str(self._refresh_interval))
+        self._gpu_device = cc.active_gpu or ''
+        if self._gpu_combo is not None:   # a picker only with two GPUs or more
+            self._gpu_combo.blockSignals(True)
+            self._gpu_combo.setCurrentIndex(self._gpu_combo.findData(self._gpu_device))
+            self._gpu_combo.blockSignals(False)
+
+    def show_autostart(self, enabled: bool) -> None:
+        """Show whether TRCC starts at login -- sends nothing (the button
+        emits on a click, not on ``setChecked``)."""
+        log.info("show_autostart: %s", enabled)
+        self._autostart = enabled
+        self.startup_btn.setChecked(enabled)
+
+    def show_temp_unit(self, mode: str) -> None:
+        """Show the App's temperature unit — sends nothing back."""
+        log.info("show_temp_unit: %s → %s", self._temp_mode, mode)
         self._temp_mode = mode
         self.celsius_btn.setChecked(mode == 'C')
         self.fahrenheit_btn.setChecked(mode == 'F')
-        self.temp_unit_changed.emit(mode)
 
     @property
     def temp_mode(self):
@@ -455,6 +483,7 @@ class UCAbout(BasePanel):
             # Single GPU or none — plain text label
             name = self._gpu_list[0][1] if self._gpu_list else 'No GPU detected'
             self._gpu_label = QLabel(name, self)
+            self._gpu_combo: QComboBox | None = None
             self._gpu_label.setGeometry(x, y, w, h)
             self._gpu_label.setStyleSheet(
                 "color: white; font-size: 10pt; background: transparent;"
@@ -480,6 +509,7 @@ class UCAbout(BasePanel):
 
     def _on_gpu_selected(self, index: int):
         """Handle GPU dropdown selection."""
+        assert self._gpu_combo is not None   # connected only to the picker
         gpu_key = self._gpu_combo.itemData(index)
         if gpu_key:
             log.info("GPU selected: %s", gpu_key)
@@ -509,62 +539,57 @@ class UCAbout(BasePanel):
 
     # --- Software update ---
 
-    def _check_for_update(self):
-        """Background thread: ask the bus whether a newer release exists.
-
-        One path, the same one cli / api / qtgui take.  A direct
-        ``urlopen`` of the GitHub API used to sit behind an ``app is None``
-        fallback here, with its own asset-URL parsing and a ``pkexec``
-        install table — the whole download-it-yourself mechanism that
-        ``RunUpgrade`` replaced.  Production never reached it (``TRCCApp``
-        takes a non-optional ``App`` and passes it), so the only callers
-        were two tests that construct this panel bare, which is why the
-        suite talked to GitHub.
-        """
+    def _show_last_update(self) -> None:
+        """The App's last answer about updates -- read once, no network."""
         if self._app is None:
-            log.warning("_check_for_update: no App injected — skipping the "
-                        "update check")
+            log.debug("_show_last_update: no App -- nothing to show")
             return
-        from ...core.commands import CheckForUpdate
-        r = self._app.dispatch(CheckForUpdate())
-        log.info("_check_for_update: ok=%s available=%s latest=%s",
-                 r.ok, r.update_available, r.latest_version)
-        if r.ok and r.update_available and r.latest_version:
-            self._update_available.emit(r.latest_version)
+        from ...core.commands import UpdateStatus
+        r = self._app.dispatch(UpdateStatus())
+        log.debug("_show_last_update: ok=%s available=%s latest=%s",
+                  r.ok, r.update_available, r.latest_version)
+        self._show_update(r.ok and r.update_available, r.latest_version)
 
-    def _on_update_result(self, latest: str):
-        """Handle version check result (runs on main thread via signal)."""
+    def on_update_checked(self, event: object) -> None:
+        """``UpdateChecked``: the App's newest answer, on the GUI thread."""
+        available = bool(getattr(event, "ok", False)
+                         and getattr(event, "update_available", False))
+        latest = str(getattr(event, "latest_version", ""))
+        log.info("on_update_checked: available=%s latest=%s", available,
+                 latest)
+        self._show_update(available, latest)
+
+    def _show_update(self, available: bool, latest: str) -> None:
+        """Show the update button when *latest* is newer than this TRCC."""
         from trcc.__version__ import __version__
-        if parse_version(latest) > parse_version(__version__):
-            self._latest_version = latest
-            self._update_tooltip = f"Version {latest} available — click to update"
-            self._update_overlay.show()
-            log.info("Update available: %s → %s", __version__, latest)
+        if not (available and latest
+                and parse_version(latest) > parse_version(__version__)):
+            log.debug("_show_update: nothing newer than %s", __version__)
+            return
+        self._latest_version = latest
+        self._update_tooltip = f"Version {latest} available — click to update"
+        self._update_overlay.show()
+        log.info("Update available: %s → %s", __version__, latest)
 
     def _on_update_clicked(self):
         """Perform update based on install method."""
         if not self._latest_version:
             return
 
-        self._update_overlay.hide()
-        self._update_tooltip = "Updating..."
-        log.info("Starting %s upgrade to %s",
+        log.info("_on_update_clicked: %s install, %s available",
                  self._install_method, self._latest_version)
-        Thread(target=self._run_upgrade, daemon=True).start()
-
-    def _run_upgrade(self):
-        """Background thread: dispatch RunUpgrade via the App."""
         if self._app is None:
-            log.error("_run_upgrade: no App — widget constructed without it")
-            self._upgrade_finished.emit(False)
+            log.error("_on_update_clicked: no App — widget constructed without it")
             return
         from ...core.commands import RunUpgrade
         result = self._app.dispatch(RunUpgrade())
-        if result.ok:
-            log.info("%s", result.message)
-        else:
-            log.error("Upgrade failed: %s", result.message)
-        self._upgrade_finished.emit(result.ok)
+        # The command for THIS install, to run -- TRCC no longer runs a
+        # package manager that upgraded everything but itself.
+        box = QMessageBox(QMessageBox.Icon.Information, "Upgrade TRCC",
+                          f"Version {self._latest_version} is available.\n\n"
+                          f"{result.message}", parent=self)
+        box.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        box.exec()
 
     # --- Diagnostics ---
 
@@ -605,25 +630,9 @@ class UCAbout(BasePanel):
             log.error("Diagnostic report failed: %s", r.message)
             QToolTip.showText(center, f"Report failed: {r.message}")
 
-    def _on_upgrade_done(self, success: bool):
-        """Post-upgrade: show restart message or re-enable button on failure."""
-        log.info("_on_upgrade_done: success=%s", success)
-        if success:
-            self._update_tooltip = "Updated — restart to apply"
-        else:
-            self._update_tooltip = (
-                f"Version {self._latest_version} available — click to retry")
-            self._update_overlay.show()
-
     # --- Close ---
 
     def _on_close(self):
         """Handle close/back button."""
         log.info("_on_close")
         self.close_requested.emit()
-
-    # --- Public API ---
-
-    def sync_language(self):
-        """Sync background to current settings.lang."""
-        self._apply_localized_background()

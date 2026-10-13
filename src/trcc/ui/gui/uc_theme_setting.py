@@ -20,11 +20,22 @@ plus backward-compatible re-exports.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
+from functools import partial
+from typing import Any
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QStackedWidget
 
+from ...core.commands import (
+    AddOverlayElement,
+    Command,
+    DeleteOverlayElement,
+    UpdateOverlayElement,
+)
+from ...core.logs import per_frame
 from ...core.models import OverlayElementConfig, OverlayMode
+from ..presentation.overlay_serialization import config_fields
 from .base import BasePanel
 from .color_and_add_panels import AddElementPanel, ColorPickerPanel
 from .constants import Layout, Sizes
@@ -51,6 +62,7 @@ from .overlay_element import (  # noqa: F401
 from .overlay_grid import OverlayGridPanel
 
 log = logging.getLogger(__name__)
+frame_log = per_frame(__name__)
 
 # ============================================================================
 # Main settings container
@@ -76,32 +88,25 @@ class UCThemeSetting(BasePanel):
     CMD_MASK_POSITION = 100
     CMD_MASK_VISIBILITY = 101
     CMD_VIDEO_LOAD = 10
+    CMD_VIDEO_URL = 11     # ours: a web source for the media player
     CMD_OVERLAY_CHANGED = 128
+    CMD_COLOR_REMEMBER = 130   # info = (r, g, b) an edit ended on
     CMD_EYEDROPPER = 112  # Matches Windows cmd for FormGetColor
 
     overlay_changed = Signal(dict)
     background_changed = Signal(bool)
     screencast_changed = Signal(bool)
-    screencast_params_changed = Signal(int, int, int, int)  # x, y, w, h
     eyedropper_requested = Signal()  # launch eyedropper color picker
-    # Per-format-pref change — emitted alongside UiState persistence
-    # so trcc_app can mirror the user's choice onto every connected
-    # device's DeviceSettings via SetTimeFormat / SetDateFormat
-    # Commands.  Without this, the UiState-side update never reaches
-    # DisplayService's compute_clock which reads from per-device
-    # DeviceSettings.{time,date}_format (default "24h" / "yyyy/MM/dd"
-    # forever).  ``kind`` is "time" / "date" / "temp_unit"; ``value``
-    # is the GUI's int code, translated to a literal by the slot.
-    format_pref_changed = Signal(str, int)
-    capture_requested = Signal()     # launch screen capture
 
-    def __init__(self, parent=None, ui_state=None):
-        # ``ui_state`` is an optional :class:`UiStateStore` for persisting
-        # global format defaults (time / date / temp_unit).  trcc_app
-        # injects its store; legacy callers leave it ``None``.
-        self._ui_state = ui_state
+    def __init__(self, parent=None):
         super().__init__(parent, width=Sizes.SETTING_W, height=Sizes.SETTING_H)
         self._setup_ui()
+
+    def update_metrics(self, readings: Any, temp_unit: str) -> None:
+        """A metrics tick for the overlay grid's tiles (#301)."""
+        frame_log.debug("UCThemeSetting.update_metrics: %d reading(s)",
+                        len(readings))
+        self.overlay_grid.update_metrics(readings, temp_unit)
 
     def _setup_ui(self):
         """Build UI with absolute positioning matching Windows."""
@@ -110,8 +115,8 @@ class UCThemeSetting(BasePanel):
         self.overlay_grid.move(*Layout.OVERLAY_GRID)
         self.overlay_grid.element_selected.connect(self._on_element_selected)
         self.overlay_grid.add_requested.connect(self._on_add_requested)
+        self.overlay_grid.element_added.connect(self._on_grid_element_added)
         self.overlay_grid.element_deleted.connect(self._on_element_deleted)
-        self.overlay_grid.elements_changed.connect(self._on_elements_changed)
 
         # Right panel stack — Color picker and Add element share this spot
         self.right_stack = QStackedWidget(self)
@@ -119,6 +124,7 @@ class UCThemeSetting(BasePanel):
 
         self.color_panel = ColorPickerPanel()
         self.color_panel.color_changed.connect(self._on_color_changed)
+        self.color_panel.edit_finished.connect(self._on_color_edit_finished)
         self.color_panel.position_changed.connect(self._on_position_changed)
         self.color_panel.font_changed.connect(self._on_font_changed)
         self.color_panel.eyedropper_requested.connect(self.eyedropper_requested.emit)
@@ -152,10 +158,8 @@ class UCThemeSetting(BasePanel):
         self.screencast_panel = ScreenCastPanel(self)
         self.screencast_panel.move(*Layout.SCREENCAST_PANEL)
         self.screencast_panel.mode_changed.connect(self._on_mode_changed)
-        self.screencast_panel.screencast_params_changed.connect(self._on_screencast_params)
-        self.screencast_panel.capture_requested.connect(self.capture_requested.emit)
 
-        self.video_panel = DisplayModePanel("video", ["VideoLoad"], self)
+        self.video_panel = DisplayModePanel("video", ["VideoLoad", "VideoUrl"], self)
         self.video_panel.move(*Layout.VIDEO_PANEL)
         self.video_panel.mode_changed.connect(self._on_mode_changed)
         self.video_panel.action_requested.connect(self._on_action_requested)
@@ -164,8 +168,22 @@ class UCThemeSetting(BasePanel):
 
     def _on_element_selected(self, index, config: OverlayElementConfig):
         """Element was clicked — show its properties in color panel."""
-        log.info("_on_element_selected: index=%s", index)
+        log.info("_on_element_selected: index=%s id=%s", index, config.id)
         self.right_stack.setCurrentWidget(self.color_panel)
+        self._show_element(config)
+
+    def _on_color_edit_finished(self, r: int, g: int, b: int) -> None:
+        """The last element's colour edit ended: the App remembers it."""
+        log.info("_on_color_edit_finished: (%d,%d,%d)", r, g, b)
+        self.invoke_delegate(self.CMD_COLOR_REMEMBER, (r, g, b))
+
+    def _show_element(self, config: OverlayElementConfig) -> None:
+        """Put one element's properties on the side panel.  Sends nothing
+        but the colour an edit on the previous element ended on -- the C#
+        saves it right here, before showing the next (UCThemeSetting.cs:179)."""
+        log.debug("_show_element: %s %s at (%d, %d)", config.id,
+                  config.mode.name, config.x, config.y)
+        self.color_panel.end_edit()
         self.color_panel.set_position(config.x, config.y)
         self.color_panel.set_color_hex(config.color)
         self.color_panel.set_font_display(config.font_name, config.font_size,
@@ -190,22 +208,27 @@ class UCThemeSetting(BasePanel):
         if cfg:
             self._on_element_selected(idx, cfg)
 
-    def _on_element_deleted(self, index):
-        """Element was deleted."""
-        log.info("_on_element_deleted: index=%s", index)
+    def _on_grid_element_added(self, config: OverlayElementConfig) -> None:
+        """A cell was added — the App gains that element, under the cell's id."""
+        fields = config_fields(config)
+        log.info("_on_grid_element_added: %s %s", config.id, config.mode.name)
+        if fields is not None:
+            self._send_edit(AddOverlayElement, element_id=config.id, **fields)
+
+    def _on_element_deleted(self, config: OverlayElementConfig) -> None:
+        """A cell was deleted — the App drops that element, by id."""
+        log.info("_on_element_deleted: %s", config.id)
         self.right_stack.setCurrentWidget(self.color_panel)
+        self._send_edit(DeleteOverlayElement, element_id=config.id)
 
-    def _on_elements_changed(self):
-        """Any change to elements list — notify parent via delegate.
+    def _send_edit(self, command: Callable[..., Command], **fields: Any) -> None:
+        """Hand ONE element edit to the window, which adds the device key.
 
-        Dispatches the next/ ``OverlayElement`` shape (id + flat font + type)
-        so ``SetOverlayConfig`` accepts it; the legacy keyed shape carried no
-        id and was rejected, so colour/font/drag edits never persisted.
+        The panel is shared by every LCD and knows no key; the active
+        handler does (``LCDHandler.on_overlay_edit``).
         """
-        elements = self.overlay_grid.to_next_elements()
-        log.info("_on_elements_changed: %d element(s) → CMD_OVERLAY_CHANGED",
-                 len(elements))
-        self.invoke_delegate(self.CMD_OVERLAY_CHANGED, elements)
+        log.info("_send_edit: %s %s", command.__name__, fields)
+        self.invoke_delegate(self.CMD_OVERLAY_CHANGED, partial(command, **fields))
 
     def _update_selected(self, require_mode: OverlayMode | None = None, **fields):
         """Update selected overlay element config fields and propagate.
@@ -225,6 +248,7 @@ class UCThemeSetting(BasePanel):
                      "%s skipped", cfg.mode.name, require_mode.name, fields)
             return
         before = {k: getattr(cfg, k, None) for k in fields}
+        was = config_fields(cfg) or {}
         for k, v in fields.items():
             setattr(cfg, k, v)
         # The transition the user actually wants to see in the log, e.g.
@@ -236,7 +260,13 @@ class UCThemeSetting(BasePanel):
             ", ".join(f"{k} {before[k]} → {v}" for k, v in fields.items()),
         )
         self.overlay_grid.update_element(idx, cfg)
-        self._on_elements_changed()
+        # Only what differs: a field this cell cannot represent (a format
+        # outside the table, bold AND italic) is never rewritten by an edit
+        # to something else.
+        changed = {k: v for k, v in (config_fields(cfg) or {}).items()
+                   if was.get(k) != v}
+        if changed:
+            self._send_edit(UpdateOverlayElement, element_id=cfg.id, **changed)
 
     def _on_color_changed(self, r, g, b):
         log.debug("_on_color_changed: r=%d, g=%d, b=%d", r, g, b)
@@ -253,26 +283,11 @@ class UCThemeSetting(BasePanel):
 
     def _on_format_changed(self, mode, mode_sub):
         log.debug("_on_format_changed: mode=%s, mode_sub=%s", mode, mode_sub)
+        # The selected element's format and nothing else: the C# keeps it per
+        # element (myModeSub) with no global one.  This used to also set a
+        # global preference on EVERY device.  HARDWARE's button0 is the same
+        # per-element field, the unit switch.
         self._update_selected(require_mode=mode, mode_sub=mode_sub)
-        # Persist format preference so it carries across theme changes.
-        # Global format defaults are GUI-only state — stored in UiState,
-        # not app.settings.  ``_ui_state`` is injected by the window;
-        # if absent (e.g. legacy callers) we skip persistence.
-        #
-        # HARDWARE (button0) is the C# per-element unit-switch (show/hide the
-        # unit glyph) — it lives on the element as ``mode_sub`` (persisted just
-        # above via ``_update_selected``), NOT a global preference.  The global
-        # temperature unit (C/F) is owned by the About panel's celsius/
-        # fahrenheit radios (the C# buttonC/buttonF), so button0 must not write
-        # it here.
-        if self._ui_state is None:
-            return
-        if mode == OverlayMode.TIME:
-            self._ui_state.set_format_pref('time_format', mode_sub)
-            self.format_pref_changed.emit('time', mode_sub)
-        elif mode == OverlayMode.DATE:
-            self._ui_state.set_format_pref('date_format', mode_sub)
-            self.format_pref_changed.emit('date', mode_sub)
 
     def _on_text_changed(self, text):
         log.info("_on_text_changed: text=%s", text)
@@ -302,11 +317,6 @@ class UCThemeSetting(BasePanel):
         elif mode_id == "mask":
             self.invoke_delegate(self.CMD_MASK_TOGGLE, enabled)
 
-    def _on_screencast_params(self, x, y, w, h):
-        """Forward screencast coordinate changes."""
-        log.info("_on_screencast_params: x=%s y=%s w=%s h=%s", x, y, w, h)
-        self.screencast_params_changed.emit(x, y, w, h)
-
     def _on_mask_position(self, x, y):
         """Forward mask position change to main app."""
         log.info("_on_mask_position: x=%s y=%s", x, y)
@@ -325,6 +335,7 @@ class UCThemeSetting(BasePanel):
             "Load": self.CMD_MASK_LOAD,
             "Upload": self.CMD_MASK_UPLOAD,
             "VideoLoad": self.CMD_VIDEO_LOAD,
+            "VideoUrl": self.CMD_VIDEO_URL,
         }
         cmd = action_map.get(action_name)
         if cmd:
@@ -336,13 +347,12 @@ class UCThemeSetting(BasePanel):
         return self.overlay_grid.get_all_configs()
 
     def load_configs(self, configs):
+        """Show a layout; a still-selected element re-shows its properties,
+        which another UI may just have changed."""
+        log.debug("load_configs: %d cell(s)", len(configs))
         self.overlay_grid.load_configs(configs)
-
-    def to_overlay_config(self):
-        return self.overlay_grid.to_overlay_config()
-
-    def load_from_overlay_config(self, overlay_config):
-        self.overlay_grid.load_from_overlay_config(overlay_config)
+        if (selected := self.overlay_grid.get_selected_config()) is not None:
+            self._show_element(selected)
 
     def set_overlay_enabled(self, enabled: bool):
         self.overlay_grid.set_overlay_enabled(enabled)
@@ -355,6 +365,15 @@ class UCThemeSetting(BasePanel):
         """Update mask panel eye toggle state."""
         self.mask_panel.set_mask_visible(visible)
 
-    def set_resolution(self, width: int, height: int):
-        """Delegate resolution to screencast panel."""
-        self.screencast_panel.set_resolution(width, height)
+    def show_sources(self, source: str, background_drawn: bool) -> None:
+        """Show which display source is on the panel, sending nothing.
+
+        The C#'s one UI-mode choice (``FormCZTV.ThemeSetting``): background,
+        screencast or video player, one at a time.  *source* is the App's
+        ``LcdSnapshot.display_source``; the background switch is also off
+        when no background is drawn (``background_mode == 'transparent'``).
+        """
+        log.info("show_sources: %s background_drawn=%s", source, background_drawn)
+        self.background_panel.set_enabled(source == "background" and background_drawn)
+        self.screencast_panel.set_enabled(source == "screencast")
+        self.video_panel.set_enabled(source == "media")

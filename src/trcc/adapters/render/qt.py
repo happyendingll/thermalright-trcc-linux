@@ -21,11 +21,9 @@ from PySide6.QtGui import (
     QImage,
     QPainter,
     QPen,
-    QPixmap,
     QTransform,
 )
 
-from ...core._frames import unpad_rows
 from ...core.errors import TrccError
 from ...core.logs import per_frame
 from ...core.models import RawFrame
@@ -80,11 +78,21 @@ def _ensure_qt_app() -> None:
     QApplication is already running (GUI mode).
     """
     if QGuiApplication.instance() is None:
-        # Offscreen platform plugin = no window system needed
-        import os
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        log.info("QtRenderer: bootstrapping offscreen QGuiApplication (headless mode)")
-        QGuiApplication(sys.argv)
+        # Offscreen, and no desktop platform theme, on Qt's own command line
+        # — which beats the environment for this one app and changes nothing
+        # a child process inherits.  It used to ``setdefault`` the env var,
+        # so an inherited ``QT_QPA_PLATFORM=wayland`` WON: a daemon or CLI
+        # with no reachable compositor dumped core on its first render, and
+        # one started from a Wayland gui bound itself to that session (#311).
+        # An inherited platform theme loaded too: gtk3 alone is +19 MB, and
+        # a KDE one pulls in the Quick and Wayland libraries #299 measured.
+        # Measured on PySide6 6.11: both inherited, this gives offscreen,
+        # 49 MB, Core/Gui/DBus only.
+        argv = [sys.argv[0] if sys.argv else "trcc",
+                "-platform", "offscreen", "-platformtheme", "none"]
+        log.info("QtRenderer: bootstrapping offscreen QGuiApplication "
+                 "(headless mode) argv=%s", argv[1:])
+        QGuiApplication(argv)
     else:
         log.debug("QtRenderer: reusing existing QGuiApplication")
     _register_bundled_fonts()
@@ -170,7 +178,7 @@ class QtRenderer(Renderer):
         return result
 
     def resize(self, surface: Any, width: int, height: int) -> Any:
-        log.debug("resize: width=%d height=%d", width, height)
+        frame_log.debug("resize: width=%d height=%d", width, height)
         return surface.scaled(
             width, height,
             Qt.AspectRatioMode.IgnoreAspectRatio,
@@ -183,11 +191,6 @@ class QtRenderer(Renderer):
             return QImage(surface)
         xform = QTransform().rotate(degrees)
         return surface.transformed(xform, Qt.TransformationMode.SmoothTransformation)
-
-    def flip_horizontal(self, surface: Any) -> Any:
-        """Mirror surface across the vertical axis (X → -X)."""
-        log.debug("flip_horizontal: called")
-        return surface.mirrored(horizontal=True, vertical=False)
 
     # ── Adjustments ───────────────────────────────────────────────────
 
@@ -209,7 +212,7 @@ class QtRenderer(Renderer):
         composite black at that alpha.  ``percent >= 100`` is a no-op
         (legacy doesn't implement brightness boost above 100% either).
         """
-        log.debug("apply_brightness: percent=%d", percent)
+        frame_log.debug("apply_brightness: percent=%d", percent)
         if percent >= 100:
             return surface
         result = surface.copy()
@@ -342,12 +345,20 @@ class QtRenderer(Renderer):
             return words.tobytes()
         return data
 
+    def raw_argb32(self, surface: Any) -> tuple[bytes, int, int, int]:
+        """QImage → its ARGB32 bytes, converted only if it is not already."""
+        frame_log.debug("raw_argb32: format=%s", surface.format())
+        if surface.format() != QImage.Format.Format_ARGB32:
+            surface = surface.convertToFormat(QImage.Format.Format_ARGB32)
+        return (bytes(surface.constBits()), surface.width(), surface.height(),
+                surface.bytesPerLine())
+
     def encode_jpeg(self, surface: Any, quality: int = 95,
                     max_size: int = 0) -> bytes:
         """Encode QImage → JPEG bytes.  Optionally retry lower quality until ≤ max_size."""
-        log.debug("encode_jpeg: quality=%d max_size=%d", quality, max_size)
+        frame_log.debug("encode_jpeg: quality=%d max_size=%d", quality, max_size)
         def _save(q: int) -> bytes:
-            log.debug("_save: q=%s", q)
+            frame_log.debug("_save: q=%s", q)
             from PySide6.QtCore import QBuffer, QIODevice
             qbuf = QBuffer()
             qbuf.open(QIODevice.OpenModeFlag.WriteOnly)
@@ -361,7 +372,7 @@ class QtRenderer(Renderer):
         # Shrink-quality loop
         for q in (85, 75, 60, 45, 30):
             data = _save(q)
-            log.debug("QtRenderer.encode_jpeg: q=%d size=%d (target ≤%d)",
+            frame_log.debug("QtRenderer.encode_jpeg: q=%d size=%d (target ≤%d)",
                       q, len(data), max_size)
             if len(data) <= max_size:
                 return data
@@ -375,7 +386,7 @@ class QtRenderer(Renderer):
         Used by ``GET /devices/{key}/display/preview`` for dashboard
         snapshots — JPEG would chew up overlay text + small CJK glyphs.
         """
-        log.debug("encode_png: called")
+        frame_log.debug("encode_png: called")
         from PySide6.QtCore import QBuffer, QIODevice
         qbuf = QBuffer()
         qbuf.open(QIODevice.OpenModeFlag.WriteOnly)
@@ -425,19 +436,17 @@ class QtRenderer(Renderer):
     # ── Legacy boundary (raw RGB24 video frame → QImage) ──────────────
 
     def from_raw_rgb24(self, frame: RawFrame) -> Any:
-        log.debug("from_raw_rgb24: %dx%d", frame.width, frame.height)
-        qimg = QImage(
+        # Per frame on a screen cast: the per-frame family, never the file.
+        frame_log.debug("from_raw_rgb24: %dx%d", frame.width, frame.height)
+        # No ``.copy()``: converting to another format already returns an
+        # image with its own pixels, so the copy only duplicated the whole
+        # grab -- 6.5 ms of a 1920x1080 frame's 6.5, measured 2026-10-07,
+        # against 1.36 ms without it.
+        return QImage(
             frame.data, frame.width, frame.height,
             frame.width * 3,
             QImage.Format.Format_RGB888,
-        ).copy()  # .copy() detaches from input buffer
-        return qimg.convertToFormat(QImage.Format.Format_ARGB32)
-
-    def to_raw_rgb24(self, surface: Any) -> RawFrame:
-        """Port method — the work lives in the module-level function, which the
-        Qt UI also calls without needing a ``Renderer`` (or an ``App``)."""
-        frame_log.debug("to_raw_rgb24: delegating to qimage_to_raw_rgb24")
-        return qimage_to_raw_rgb24(surface)
+        ).convertToFormat(QImage.Format.Format_ARGB32)
 
     # ── Fonts ─────────────────────────────────────────────────────────
 
@@ -457,38 +466,3 @@ class QtRenderer(Renderer):
         log.info("QtRenderer.list_fonts: %d families", len(families))
         return families
 
-    # ── Convenience: QPixmap export for GUI preview ───────────────────
-
-    @staticmethod
-    def to_pixmap(surface: Any) -> QPixmap:
-        """Convert a QImage surface to a QPixmap (for GUI display)."""
-        log.debug("to_pixmap: called")
-        return QPixmap.fromImage(surface)
-
-
-def qimage_to_raw_rgb24(image: Any) -> RawFrame:
-    """A ``QImage`` as packed RGB24 — the shape the wire speaks.
-
-    A module-level function, not just a ``Renderer`` method, because the Qt UI
-    layer needs it WITHOUT an ``App``: the gui's screencast tick produces a
-    ``QImage`` and ``SendScreencastFrame`` wants a ``RawFrame``, and reaching
-    ``app.renderer`` to convert was the last thing in ``ui/`` that raised under
-    ``TRCC_DAEMON=1`` (``AttributeError: AppProxy has no attribute 'renderer'``,
-    measured at 39 occurrences in ~7 seconds of a driven screencast — the timer
-    fires every 150 ms).
-
-    Duplicating the conversion in the GUI would have scored BETTER on the
-    contract audit, which counts imports rather than duplication.
-
-    ``constBits()`` spans the whole buffer INCLUDING per-line padding — Qt
-    aligns each scanline to 4 bytes, so any width whose ``*3`` is not a
-    multiple of 4 carries junk at the end of every row.  Stripping it is
-    ``core._frames.unpad_rows``, shared with both screencast adapters.
-    """
-    img = image.convertToFormat(QImage.Format.Format_RGB888)
-    width, height = img.width(), img.height()
-    stride = img.bytesPerLine()
-    log.debug("qimage_to_raw_rgb24: %dx%d (stride=%d packed=%d)",
-              width, height, stride, width * 3)
-    data = unpad_rows(bytes(img.constBits()), width, height, stride)
-    return RawFrame(data=data, width=width, height=height)

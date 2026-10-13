@@ -5,6 +5,7 @@ is why they sit together and away from the live readouts.
 """
 from __future__ import annotations
 
+import html
 import logging
 
 from PySide6.QtCore import Qt
@@ -13,7 +14,6 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFormLayout,
     QLabel,
-    QMessageBox,
     QPushButton,
 )
 
@@ -23,8 +23,10 @@ from .....core.commands import (
     EnableAutostart,
     GetAutostartStatus,
     RunUpgrade,
+    UpdateStatus,
 )
 from .....core.models import AUTOSTART_TARGETS, DEFAULT_AUTOSTART_TARGET
+from ....qt_background import dispatch_in_background
 from ._base import SystemBox
 
 log = logging.getLogger(__name__)
@@ -65,6 +67,10 @@ class MaintenanceBox(SystemBox):
         form.addRow(self._update_btn)
         form.addRow(self._upgrade_btn)
         form.addRow(self._status)
+        # The App checks for updates (at session start, then hourly); this
+        # shows each answer it publishes, as the classic window does.
+        self._bus.update_checked.connect(
+            self._show_update, type=Qt.ConnectionType.QueuedConnection)
         self.refresh()
 
     def refresh(self) -> None:
@@ -90,6 +96,9 @@ class MaintenanceBox(SystemBox):
             self._autostart_target.blockSignals(True)
             self._autostart_target.setCurrentIndex(index)
             self._autostart_target.blockSignals(False)
+        update = self.dispatch(UpdateStatus())      # the App's last answer
+        if update.ok:
+            self._show_update(update)
 
     def _on_autostart_toggled(self, checked: bool) -> None:
         target = self._autostart_target.currentData()
@@ -98,7 +107,8 @@ class MaintenanceBox(SystemBox):
             EnableAutostart(target=target) if checked else DisableAutostart(),
         )
         self._status.setText(r.message)
-        self.refresh()
+        if not r.ok:   # refused: no AutostartChanged follows to put it back
+            self.refresh()
 
     def _on_autostart_target_changed(self, index: int) -> None:
         """Re-install for the newly chosen target, but only if it is ON.
@@ -115,51 +125,46 @@ class MaintenanceBox(SystemBox):
         self._status.setText(r.message)
 
     def _on_check_update(self) -> None:
+        """Ask now -- off the GUI thread, which used to freeze while GitHub
+        answered."""
         log.info("_on_check_update")
-        r = self.dispatch(CheckForUpdate())
-        if not r.ok:
-            log.warning("_on_check_update: failed — %s", r.message)
-            self._status.setText(f"Update check failed: {r.message}")
+        self._status.setText("Checking for updates…")
+        dispatch_in_background(self._app, CheckForUpdate(), self._show_update)
+
+    def _show_update(self, answer: object) -> None:
+        """An answer -- the button's, the App's last, or ``UpdateChecked``:
+        all carry ok / update_available / the versions / the release URL."""
+        ok = bool(getattr(answer, "ok", False))
+        local = str(getattr(answer, "local_version", ""))
+        latest = str(getattr(answer, "latest_version", ""))
+        if not ok:
+            message = str(getattr(answer, "message", ""))
+            log.warning("_show_update: failed — %s", message)
+            self._status.setText(f"Update check failed: {html.escape(message)}")
             return
-        if r.latest_version and r.latest_version != r.local_version:
-            log.info("_on_check_update: %s available (have %s)",
-                     r.latest_version, r.local_version)
+        if getattr(answer, "update_available", False) and latest:
+            url = str(getattr(answer, "release_url", ""))
+            log.info("_show_update: %s available (have %s)", latest, local)
             self._status.setText(
-                f"Update available: {r.latest_version} "
-                f"(you have {r.local_version}). "
-                f'<a href="{r.release_url}">Release notes</a> — '
+                f"Update available: {html.escape(latest)} "
+                f"(you have {html.escape(local)}). "
+                f'<a href="{html.escape(url)}">Release notes</a> — '
                 'press "Upgrade now…" to install it.',
             )
         else:
-            self._status.setText(f"Up to date ({r.local_version}).")
+            log.info("_show_update: up to date at %s", local)
+            self._status.setText(f"Up to date ({html.escape(local)}).")
 
     def _on_upgrade(self) -> None:
-        """Run the package-manager upgrade, after showing exactly what runs.
+        """Show the command that upgrades this install (nothing is run).
 
-        ``RunUpgrade`` shells out through the system package manager under
-        sudo, so it is confirmed first -- the CLI refuses the same Command
-        without ``--yes`` for this reason.  ``dry_run`` asks the Command
-        itself what it WOULD run, so the confirmation quotes the real command
-        line instead of a UI's guess at it.
+        It used to confirm, then run the package manager as root -- which
+        upgraded everything but TRCC.  ``RunUpgrade`` now answers with the
+        right command for how TRCC was installed.
         """
-        log.info("_on_upgrade: asking the Command what it would run")
-        preview = self.dispatch(RunUpgrade(dry_run=True))
-        if not preview.ok:
-            log.warning("_on_upgrade: unavailable — %s", preview.message)
-            self._status.setText(f"Upgrade unavailable: {preview.message}")
-            return
-        answer = QMessageBox.question(
-            self, "Upgrade TRCC",
-            f"{preview.message}\n\nThis runs as root. Continue?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer is not QMessageBox.StandardButton.Yes:
-            log.info("_on_upgrade: declined by the user")
-            self._status.setText("Upgrade cancelled.")
-            return
-        log.info("_on_upgrade: confirmed — running")
-        r = self.dispatch(RunUpgrade(dry_run=False))
-        self._status.setText(
-            r.message if r.ok else f"Upgrade failed: {r.message}",
-        )
+        r = self.dispatch(RunUpgrade())
+        log.info("_on_upgrade: %s", r.message)
+        self._status.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        # The label renders rich text (release links); the command has "&&".
+        self._status.setText(html.escape(r.message).replace("\n", "<br>"))

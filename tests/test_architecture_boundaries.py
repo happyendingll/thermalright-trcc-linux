@@ -40,6 +40,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dev" / "tools"))
 
 import ui_contract  # noqa: E402  # pyright: ignore[reportMissingImports]
 
+from trcc.core.ports import CommandBus  # noqa: E402
+
 _GUARDED_TREES = ("trcc/core", "trcc/services")
 
 # The Presentation Model layer (``ui/presentation``) is the Qt-free precursor to
@@ -332,6 +334,74 @@ def test_no_shell_true_subprocess_anywhere() -> None:
     )
 
 
+def _static_font_dialog_calls(source: str) -> list[int]:
+    """Lines calling ``QFontDialog.getFont`` -- the static form."""
+    return [node.lineno for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "getFont"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "QFontDialog"]
+
+
+def test_no_static_font_dialog() -> None:
+    """PySide6's static ``QFontDialog.getFont`` holds the GIL while it is open.
+
+    Measured: a background thread ran 2 ticks in 1.6 s under it, ~150 under
+    every other static dialog TRCC uses.  It froze the daemon event reader, the
+    App evicted the stalled window, and the gui preview stopped for good while
+    the panel played on (#301).  Open a ``QFontDialog`` instance and ``exec()``.
+    """
+    offenders = [f"  {path.relative_to(_SRC)}:{line}"
+                 for path in _files_under("trcc")
+                 for line in _static_font_dialog_calls(
+                     path.read_text(encoding="utf-8"))]
+    assert not offenders, (
+        "QFontDialog.getFont freezes every other Python thread -- use "
+        "QFontDialog(font, parent).exec():\n" + "\n".join(offenders))
+
+
+def test_selftest_static_font_dialog_detector_sees_one() -> None:
+    assert _static_font_dialog_calls(
+        "ok, f = QFontDialog.getFont(QFont(), None)\n"
+        "d = QFontDialog(QFont()); d.exec()\n") == [1]
+
+
+def _transport_constructions(source: str) -> list[int]:
+    """Lines constructing a concrete ``*Transport`` class."""
+    return [node.lineno for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call)
+            and (name := node.func.id if isinstance(node.func, ast.Name)
+                 else node.func.attr if isinstance(node.func, ast.Attribute)
+                 else "").endswith("Transport") and name != "Transport"]
+
+
+def test_only_the_platform_builds_a_transport() -> None:
+    """Every transport comes from ``Platform.open_transport``.
+
+    A stand-in platform (``MockPlatform``, the dev mock) scripts the USB seam by
+    overriding the platform's openers, so a transport built anywhere else
+    reaches REAL hardware from a mock run.  ``App.attach`` built the HID
+    output-report transport itself: a dev mock whose ordinary handshake failed
+    on a firmware-4.07 panel retried on a real hidapi handle.
+    """
+    offenders = [f"  {path.relative_to(_SRC)}:{line}"
+                 for path in _files_under("trcc")
+                 if "adapters/system" not in path.as_posix()
+                 for line in _transport_constructions(
+                     path.read_text(encoding="utf-8"))]
+    assert not offenders, (
+        "build transports through Platform.open_transport, never directly:\n"
+        + "\n".join(offenders))
+
+
+def test_selftest_transport_detector_sees_one() -> None:
+    assert _transport_constructions(
+        "t = HidApiTransport(vid, pid)\n"
+        "u = platform.open_transport(wire, vid, pid)\n"
+        "x: Transport = t\n") == [1]
+
+
 def test_core_and_services_never_call_print() -> None:
     """CLAUDE.md Code Style: never ``print()`` — use the logger.
 
@@ -368,6 +438,35 @@ def test_configure_logging_has_one_call_site() -> None:
     assert not offenders, (
         "configure_logging called outside the CLI root (silently resets the "
         "log level — route launch through the CLI):\n" + "\n".join(offenders)
+    )
+
+
+def test_commands_invalidate_the_scene_only_through_the_seam() -> None:
+    """``app.display`` RAISES on an App with no Renderer, so a Command that
+    busts the scene cache does it through ``_invalidate_scene``, which checks.
+
+    Eight Commands called ``app.display.invalidate`` directly and so saved an
+    edit and then raised; the seek, overlay-element, background-mode and
+    clock-format edits among them (found 2026-10-01).
+    """
+    offenders: list[str] = []
+    for path in _files_under("trcc/core/commands"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+        seam = {n for f in ast.walk(tree)
+                if isinstance(f, ast.FunctionDef) and f.name == "_invalidate_scene"
+                for n in ast.walk(f)}
+        offenders += [
+            f"  {path.relative_to(_SRC)}:{node.lineno}"
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and node not in seam
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "invalidate"
+            and isinstance(node.func.value, ast.Attribute)
+            and node.func.value.attr == "display"
+        ]
+    assert not offenders, (
+        "app.display.invalidate outside _invalidate_scene -- raises with no "
+        "Renderer:\n" + "\n".join(offenders)
     )
 
 
@@ -461,7 +560,14 @@ MAX_CROSS_SKIN = 4
 #: nine are in ``ui/presentation`` and all nine serve gui, 1361 of that
 #: package's 1756 lines.  Deleting ``ui/gui`` takes this to zero; until then it
 #: may not grow.
-MAX_SINGLE_SKIN_SHARED = 9
+#:
+#: 9 again (2026-10-10), not ground given back: the count now follows use
+#: THROUGH shared modules.  Direct-only, a module reached solely via another
+#: shared module had zero consumers and was never listed -- preview_geometry
+#: (gui, via lcd_presentation_model) was always gui-only and always hidden.
+#: The same blind spot misread the new qt_background as qtgui's alone, when
+#: both skins reach it through qt_rgb_page and qt_ram_access.
+MAX_SINGLE_SKIN_SHARED = 9     # 9 → 8 (2026-10-02): qtgui picks LED pages via led_display
 
 
 def test_no_skin_reaches_into_another_skin() -> None:
@@ -524,6 +630,28 @@ def test_shared_ui_modules_really_are_shared() -> None:
         f"MAX_SINGLE_SKIN_SHARED to {len(stranded)} so the ground is not "
         f"given back"
     )
+
+
+def test_a_module_reached_through_a_shared_module_serves_its_skins(
+        tmp_path: Path) -> None:
+    """``mislocated`` follows use through shared modules: a helper only a
+    shared module imports serves every skin that module serves.  Counted
+    direct-only it read as one skin's (or as nobody's, and went unlisted)."""
+    ui = tmp_path / "trcc" / "ui"
+    for d in ("gui", "qtgui"):
+        (ui / d).mkdir(parents=True)
+        (ui / d / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "trcc" / "__init__.py").write_text("", encoding="utf-8")
+    (ui / "__init__.py").write_text("", encoding="utf-8")
+    (ui / "helper.py").write_text("X = 1\n", encoding="utf-8")
+    (ui / "page.py").write_text("from .helper import X\n", encoding="utf-8")
+    (ui / "gui" / "a.py").write_text("from ..page import X\n", encoding="utf-8")
+    (ui / "qtgui" / "b.py").write_text("from ..page import X\n", encoding="utf-8")
+    assert ui_contract.mislocated(ui, frozenset({"gui", "qtgui"})) == []
+    (ui / "qtgui" / "b.py").write_text("", encoding="utf-8")       # gui only now
+    assert [(m, s) for m, _lines, s in ui_contract.mislocated(
+        ui, frozenset({"gui", "qtgui"}))] == [
+        ("trcc.ui.helper", "gui"), ("trcc.ui.page", "gui")]
 
 
 def test_presentation_layer_is_qt_app_and_adapter_free() -> None:
@@ -987,18 +1115,21 @@ KNOWN_FS_IO: dict[str, int] = {
     # existence check ``LoadVideo`` two definitions above already makes, and
     # the alternative is a worker thread failing on it after the caller has
     # returned.
-    "trcc/core/commands/theme.py": 25,
+    # 25 -> 23 on 2026-10-06: ExportConfig / ImportConfig DELETED (their
+    # json.dump write and json.load read went with them) -- the import was a
+    # local file-read hole through the theme download.
+    "trcc/core/commands/theme.py": 23,
     "trcc/core/libraries.py": 1,
     "trcc/core/toolchain.py": 2,
     "trcc/services/_dc.py": 3,
     "trcc/services/cloud_theme.py": 5,
     "trcc/services/display.py": 4,
     "trcc/services/first_run.py": 5,
-    "trcc/services/media.py": 5,
+    "trcc/services/media.py": 3,  # _ffmpeg_available probed PATH by hand (2026-10-06)
     "trcc/services/migration.py": 13,
     "trcc/services/overlay.py": 2,
     "trcc/services/settings.py": 4,
-    "trcc/services/theme_directories.py": 2,
+    "trcc/services/theme_directories.py": 1,
     # +2 on 2026-08-27, and NOT a regression: ``theme_directories`` moved INTO
     # services from ``ui/presentation`` so a core Query could call it, bringing
     # its two ``.exists()`` probes (the #136 portrait fallback, and the
@@ -1006,6 +1137,13 @@ KNOWN_FS_IO: dict[str, int] = {
     # the ``services/theme.py`` row that LEFT this table when it was re-homed
     # to an adapter: this ratchet counts the inner rings, so what it measures
     # moves when a file does.
+    # -1 on 2026-09-23: the same-name variant lookup was
+    # ``oriented_theme_reload_target``, a SECOND answer to the question
+    # ``oriented_theme_path`` already answers on ``OrientationChanged`` -- and
+    # a worse one (user-tree-first, and its callers reloaded with the default
+    # ``reset_overrides=True``, persist-clearing the user's overlay edits).
+    # Deleted with both its skin callers; the #136 portrait fallback is the
+    # one probe left.
     "trcc/services/video_export.py": 7,
 }
 
@@ -1115,9 +1253,22 @@ def test_filesystem_io_baseline_has_no_slack() -> None:
 # ``dispatch`` is the whole point and is never counted.
 _APP_ATTRS = frozenset({"_app", "app", "_trcc"})
 
-#: Functions whose return annotation is ``App`` — the only way a local name gets
-#: bound to one.  Gated by ``test_app_factories_still_return_app`` below, so this
-#: cannot rot into folklore.
+#: Annotations that bind a name to the bus: the ``App`` itself, or the
+#: ``CommandBus`` port UI code now holds instead (a ``UserInterface`` or an App).
+#: Tracking only ``App`` went blind the day the UIs were retyped to the port.
+_BUS_TYPES = frozenset({"App", "CommandBus"})
+
+#: What a UI may touch on the bus — DERIVED from the port, not listed here:
+#: ``dispatch``, ``events`` (observing is the other half of the bus),
+#: ``remote`` and ``on_app_gone``.  Every public member, abstract or not: a
+#: concrete one is still the contract every implementer answers, ``AppProxy``
+#: included.  Anything else is App internals, absent on an ``AppProxy``.
+_PORT_MEMBERS = frozenset(name for name in vars(CommandBus)
+                          if not name.startswith("_"))
+
+#: Functions whose return annotation is a bus type — the only way a local name
+#: gets bound to one.  Gated by ``test_app_factories_still_return_app`` below,
+#: so this cannot rot into folklore.
 _APP_FACTORIES = frozenset({"trcc", "_build_local_app", "get_app", "build_qt_app",
                             "compose"})
 
@@ -1138,7 +1289,12 @@ KNOWN_APP_REACHES: dict[str, int] = {
     # holds one dispatches AND observes — so ``display export-video`` follows
     # a daemon-side encode from a terminal that is not doing the encoding.
     # Subscribing is half the bus, not a reach around it.
-    "ui/cli/display.py": 2,          # .events x2 — follow an export's progress
+    # 2026-09-28: cli 2 -> 0, and ui/gui/trcc_app.py + ui/qtgui/app.py 1 -> 0,
+    # ui/_base.py 2 -> 1 — all five were ``.events``.  Observing is now DECLARED
+    # on the ``CommandBus`` port the UIs hold, and the collector derives what a
+    # UI may touch from that port, so a subscription stops being a "reach".
+    # Measured before and after: 7 reaches -> 2, and the 5 that left were
+    # exactly the ``events`` reads, none hidden.
     # gui/qtgui lifecycle — deliberately OUT of burn-down.  A GUI running as a
     # daemon *client* must not own app lifecycle, and an event stream over a
     # socket is a different problem from a data read.
@@ -1174,7 +1330,7 @@ KNOWN_APP_REACHES: dict[str, int] = {
     # only ``events`` (an event subscription, not a state read).  This is the
     # trade the row below buys: 2 reaches in ONE reviewable file instead of 5
     # scattered across two.
-    "ui/_base.py": 2,                # start_session / close, for every face
+    "ui/_base.py": 1,                # start_session, for every face
     "ui/gui/splash.py": 1,           # discover_and_connect — lifecycle
     # 2026-09-05: 5 -> 4.  The tray's ``minimize_on_close`` comes off
     # ``GetPlatformInfo``, the Query this file already dispatches ten lines
@@ -1182,7 +1338,6 @@ KNOWN_APP_REACHES: dict[str, int] = {
     # 4 -> 3 the same day: ``app.first_run.is_first_run()`` picking the opening
     # panel was a STALE bypass, not a gap — ``GetFirstRunStatus`` exists and
     # this very file already dispatched it in ``_show_platform_info``.
-    "ui/qtgui/app.py": 1,            # events (subscription, not a state read)
     # 11 -> 9 on 2026-08-30: UCThemeMask stopped being handed a Paths port and
     # a ContentStore.  It composed "which masks does this device have" out of
     # both; ``ListMasks`` had answered that all along for cli/api/qtgui.  What
@@ -1233,11 +1388,10 @@ KNOWN_APP_REACHES: dict[str, int] = {
     # picked yet.  cli and api could not pre-download at all until now.
     # What is left is ``services.AudioCapture`` (screencast), which belongs
     # with the RawFrame signature question, not here.
-    "ui/gui/trcc_app.py": 1,
     # led/_base.py and led_panel.py reached ZERO on 2026-08-31: the six LED
     # tabs take a ``LedSnapshotResult`` instead of a live ``LedDeviceSettings``.
     # Same rule as UCThemeMask before them — the Result was short four fields
-    # (segment_on, clock_24h, week_sunday, memory_ratio), and a
+    # (a segment mask since deleted, clock_24h, week_sunday, memory_ratio), and a
     # panel holds a domain object exactly as long as the Result does not
     # answer it.
 }
@@ -1253,13 +1407,9 @@ KNOWN_APP_REACHES: dict[str, int] = {
 #: COUNTS live in ``KNOWN_APP_REACHES`` above, so the ratchet and its no-slack
 #: twin force any future one down; this dict holds the reasons.
 CLI_API_REACH_EXCEPTIONS: dict[str, str] = {
-    "ui/cli/display.py": (
-        "scoped: ``app.events`` is IMPLEMENTED on AppProxy (0729d7db), so "
-        "unlike every other row here this one does not raise in daemon mode "
-        "— it is how a terminal watches an encode happening inside the "
-        "daemon.  Observing is the other half of the bus; the invariant is "
-        "'do not read App STATE', and an event subscription is not state"
-    ),
+    # Empty since 2026-09-28: the one row was ``ui/cli/display.py``'s
+    # ``app.events`` — a subscription, which the ``CommandBus`` port now
+    # declares, so it is no longer a reach at all.
 }
 
 
@@ -1305,7 +1455,7 @@ def _is_self_app(node: ast.expr) -> bool:
 
 
 class _AppReachVisitor(ast.NodeVisitor):
-    """Collect reads of an App attribute other than ``dispatch``.
+    """Collect reads of a bus attribute the ``CommandBus`` port does not declare.
 
     Tracks, per scope, which local NAMES are bound to the App — by parameter
     annotation, by assignment from an ``-> App`` factory, from the FastAPI
@@ -1323,7 +1473,7 @@ class _AppReachVisitor(ast.NodeVisitor):
         bound = {
             a.arg
             for a in (*args.posonlyargs, *args.args, *args.kwonlyargs)
-            if _annotation_name(a.annotation) == "App"
+            if _annotation_name(a.annotation) in _BUS_TYPES
         }
         self._scopes.append(self._scopes[-1] | bound)
         self.generic_visit(node)
@@ -1346,7 +1496,7 @@ class _AppReachVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
-        if node.attr != "dispatch":
+        if node.attr not in _PORT_MEMBERS:
             value = node.value
             if isinstance(value, ast.Name) and value.id in self._scopes[-1]:
                 self.hits.append((node.lineno, f"{value.id}.{node.attr}"))
@@ -1387,7 +1537,7 @@ def test_app_factories_still_return_app() -> None:
         if "__pycache__" not in path.parts
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and _annotation_name(node.returns) == "App"
+        and _annotation_name(node.returns) in _BUS_TYPES
     }
     missing = _APP_FACTORIES - actual
     assert not missing, (
@@ -1607,15 +1757,6 @@ KNOWN_UI_ADAPTER_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     # a launch site, but it is still system information the ``Platform`` port
     # could answer, so it stays visible rather than being called a root.
     ("trcc/ui/cli/main.py", "trcc.adapters.infra.network"),
-    # 2026-09-08: ``qimage_to_raw_rgb24`` — the gui's screencast tick holds a
-    # QImage and ``SendScreencastFrame`` wants a RawFrame.  ``ui/gui`` IS the
-    # Qt adapter family, so reusing the Qt adapter's conversion is not a layer
-    # jump; reaching ``app.renderer`` for it WAS, and raised under
-    # TRCC_DAEMON=1 (39 AttributeErrors in ~7 s of driven screencast).
-    # Deliberately an import rather than a copy: duplicating the scanline
-    # stride handling would have scored BETTER here — this audit counts
-    # imports, not duplication — and been worse code.
-    ("trcc/ui/gui/lcd_handler.py", "trcc.adapters.render.qt"),
     # 2026-09-14 → 2026-09-18: ``trcc_app.py → trcc.adapters.screencast`` sat
     # here for the screencast CAPTURE source, with the right reason -- the
     # screen being captured belongs to the session the WINDOW is in, which
@@ -1624,7 +1765,10 @@ KNOWN_UI_ADAPTER_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     # for that reason already existed: the gui launcher builds the host
     # Platform, the UI bus holds it, and ``Platform.screen_capture()`` on THAT
     # object is the window's own session.  The window now takes it there, and
-    # this row is gone.
+    # this row is gone.  (2026-09-29: the window captures nothing at all now --
+    # ``StartScreencast`` drives the App's capture loop for every face -- so the
+    # ``lcd_handler.py -> adapters.render.qt`` row for its frame conversion
+    # went too.)
 })
 
 
@@ -2050,13 +2194,18 @@ def test_path_home_baseline_has_no_slack() -> None:
 # calls `Other(...).execute(app)` directly skips all three, so an inner command
 # that fails leaves NOTHING in the log.  22 sites did that; they now dispatch.
 #
-# The 13 survivors are the ones whose caller already logs the inner outcome
+# The 12 survivors are the ones whose caller already logs the inner outcome
 # itself (`SleepDevice` failing is a benign "blank skipped" at DEBUG, and
 # routing it through the bus would turn that into a WARNING in every report).
-# Listed at their real count so a fourteenth fails.
+# Listed at their real count so a thirteenth fails.
+#
+# -1 on 2026-09-23: the thirteenth was `OrientedThemeTarget`, which called
+# `ResolveThemeDirectories(...).execute(app)` to answer a question the core
+# already answers on `OrientationChanged`.  Both its callers were Qt skins
+# re-deciding a rotation the App had just decided, so the Query went with them.
 KNOWN_DIRECT_EXECUTE: dict[str, int] = {
-    "trcc/core/commands/device.py": 6,
-    "trcc/core/commands/theme.py": 7,
+    "trcc/core/commands/device.py": 5,
+    "trcc/core/commands/theme.py": 6,
 }
 
 
@@ -2149,17 +2298,22 @@ def test_linux_platform_module_has_no_linux_only_toplevel_imports() -> None:
 #: exactly 15 of 39, which reads as parity and is not — they share only 11.
 #:
 #: Ratcheted as a SET, not a count, because the count is the thing that lied.
-MISSING_IN_QTGUI = {
-    "BrightnessChanged",
-    "ScreencastStarted",
-    "ScreencastStopped",
-    "SystemSuspending",
-}
+MISSING_IN_QTGUI: set[str] = set()
+# Emptied 2026-09-30.  12 left when qtgui's settings pages began following the
+# App; ScreencastStarted/Stopped when its screencast page did; SystemSuspending
+# because gui stopped observing it -- it stopped the active device's cast on
+# suspend, which the C# never does (Form1.cs:636 pauses and resumes) and which
+# threw the cast away, since StopScreencast clears its saved region.
 
 #: Event types ``BusBridge`` never forwards, so no Qt widget can observe them
 #: however much it wants to.  A missing WIRE, distinct from a capability that is
 #: offered and declined.  May not grow.
-MAX_UNBRIDGED_EVENTS = 17
+MAX_UNBRIDGED_EVENTS = 3     # 5 → 3 (2026-10-02): ThemeSaved, ThemeImported bridged
+
+#: Events a FACE reads and no widget should: the App's last line on a stream,
+#: which ``CommandBus.on_app_gone`` turns into "close" for the whole UI.
+#: Classified by name, not absorbed into the ceiling above.
+FACE_EVENTS = frozenset({"AppStopping"})
 
 
 def test_qtgui_observes_what_gui_observes() -> None:
@@ -2192,6 +2346,8 @@ def test_unbridged_events_do_not_grow() -> None:
     missing wire, the second is a choice. The tool splits them for that reason.
     """
     unbridged, _declined = ui_contract.unheard_split(ui_contract.event_reach())
+    assert set(ui_contract.event_types()) >= FACE_EVENTS, "a face event was renamed"
+    unbridged = [name for name in unbridged if name not in FACE_EVENTS]
     assert len(unbridged) <= MAX_UNBRIDGED_EVENTS, (
         f"{len(unbridged)} Event type(s) reach no Qt skin, over the ceiling of "
         f"{MAX_UNBRIDGED_EVENTS} — a new event was published with no bridge "
@@ -2201,3 +2357,88 @@ def test_unbridged_events_do_not_grow() -> None:
         f"only {len(unbridged)} unbridged — lower MAX_UNBRIDGED_EVENTS to "
         f"{len(unbridged)}"
     )
+
+
+#: Where a UI uses its OWN App instead of handing itself on.  The daemon's
+#: socket server dispatches for its clients (their names ride the envelope);
+#: gui's splash runs the coldplug before any window exists.
+_UI_OWN_APP_USES = frozenset({("DaemonUI", "bring_up"), ("GuiUI", "bring_up")})
+
+
+def test_every_ui_hands_itself_on_not_its_app() -> None:
+    """A UI hands its code ITSELF — the bus that names it — never ``self._app``.
+
+    ``UserInterface.dispatch`` is what writes ``[api] dispatch …``; a route or
+    window handed the raw App dispatched around it, and the log could not tell
+    a CLI command from an API poll.  Every one of the five did, until
+    2026-09-28.  Derived from the registry, so a new UI is gated the day it
+    registers.  Exact both ways: a use that goes away must leave the set.
+    """
+    import inspect
+    import textwrap
+
+    import trcc.ui._uis  # noqa: F401 — importing registers the UIs
+    from trcc.ui._base import UIS, UserInterface
+
+    classes = {
+        base for key in UIS for base in UIS[key].__mro__
+        if issubclass(base, UserInterface) and base is not UserInterface
+    }
+    found = {
+        (cls.__name__, fn.name)
+        for cls in classes
+        for fn in ast.parse(textwrap.dedent(inspect.getsource(cls))).body[0].body
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Attribute) and node.attr == "_app"
+        and isinstance(node.value, ast.Name) and node.value.id == "self"
+    }
+    assert found == _UI_OWN_APP_USES, (
+        f"hand the UI itself on (``self``), not ``self._app``: "
+        f"unexpected {sorted(found - _UI_OWN_APP_USES)}, "
+        f"gone {sorted(_UI_OWN_APP_USES - found)}"
+    )
+
+
+def _threads_holding_self(tree: ast.AST) -> list[int]:
+    """Lines of every ``Thread(target=self.<x>)`` / ``threading.Thread(...)``."""
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = (func.id if isinstance(func, ast.Name)
+                else func.attr if isinstance(func, ast.Attribute) else "")
+        if name != "Thread":
+            continue
+        for kw in node.keywords:
+            target = kw.value
+            if (kw.arg == "target" and isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "self"):
+                found.append(node.lineno)
+    return found
+
+
+def test_no_ui_thread_holds_its_widget() -> None:
+    """A UI never hands a worker thread its own bound method.
+
+    ``Thread(target=self._work)`` keeps the widget alive on the worker; a
+    window dropped mid-wait then loses its LAST reference on that thread and
+    PySide tears Qt objects down off the GUI thread -- a SIGSEGV (2026-10-08)
+    and a GIL vs Qt-mutex deadlock that hung the suite, locally and three
+    times on CI (2026-10-09/10).  Three windows did it.  Work that waits goes
+    through ``ui/qt_background.dispatch_in_background``, whose worker holds
+    the App connection and the Command, never a widget.
+
+    MUTATION CHECK: put ``threading.Thread(target=self._x).start()`` back in
+    any ui/ module -- this names the file and line.
+    """
+    offenders = [
+        f"{path.relative_to(_SRC)}:{line}"
+        for path in sorted((_SRC / "trcc" / "ui").rglob("*.py"))
+        for line in _threads_holding_self(ast.parse(path.read_text(encoding="utf-8")))
+    ]
+    assert offenders == [], (
+        "a UI thread holds its widget -- use qt_background.dispatch_in_background:\n  "
+        + "\n  ".join(offenders))

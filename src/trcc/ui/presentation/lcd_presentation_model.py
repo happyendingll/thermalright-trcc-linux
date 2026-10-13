@@ -18,9 +18,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-from ...core.logs import per_frame
 from .preview_geometry import (
     rotated_lcd_size,
 )
@@ -29,7 +28,6 @@ if TYPE_CHECKING:
     pass
 
 log = logging.getLogger(__name__)
-frame_log = per_frame(__name__)
 
 # Default brightness % before the user picks one (legacy default).
 _DEFAULT_BRIGHTNESS = 100
@@ -57,7 +55,6 @@ class DeviceState:
     is_rotated: bool = False                     # 90° / 270° → True
     overlay_enabled: bool = False
     current_theme_path: Path | None = None
-    last_metrics: Any = None                     # cached for video-overlay updates
 
 
 class LcdPresentationModel:
@@ -82,7 +79,6 @@ class LcdPresentationModel:
         # (distinguishes first activation from a read-only re-select).
         self.configured = False
         # Per-device display state mirrored from DeviceSettings on restore.
-        self.background_active = False
         self.brightness_level = _DEFAULT_BRIGHTNESS
         self.split_mode = 0
         self.ldd_is_split = False
@@ -113,42 +109,17 @@ class LcdPresentationModel:
                  self.device_key, degrees, self.state.is_rotated,
                  *self.state.lcd_size)
 
-    # ── Video math (B5) ────────────────────────────────────────────────
-    # Pure per-tick arithmetic lifted off the handler's video path; the
-    # QTimer + MediaService playback stay in the View, which feeds primitives.
-
-    @staticmethod
-    def video_interval_ms(fps: float | None) -> int:
-        """ms-per-frame for a playback fps (None / 0 → 30 fps → 33 ms)."""
-        log.debug("video_interval_ms: fps=%s", fps)
-        return max(1, int(1000 / (fps or 30)))
-
-    @staticmethod
-    def seek_frame(percent: float, total: int) -> int:
-        """Clamp a 0..1 seek fraction to a valid frame index in ``total``."""
-        log.debug("seek_frame: percent=%s total=%s", percent, total)
-        return max(0, min(total - 1, int(percent * total)))
-
-    @staticmethod
-    def progress_fraction(cursor: int, total: int) -> float:
-        """Playback progress as 0..1 (0.0 when there are no frames)."""
-        frame_log.debug("progress_fraction: cursor=%s total=%s",
-                        cursor, total)
-        return (cursor / total) if total else 0.0
-
     def apply_split_mode(
-        self, persisted_mode: int, lcd_size: tuple[int, int],
-    ) -> int:
-        """Resolve persisted split mode for a geometry; return the dispatch mode.
+        self, app_mode: int, lcd_size: tuple[int, int],
+    ) -> None:
+        """Show the App's split mode, and whether this panel has the editor.
 
-        Sets ``split_mode`` (default 2 when unset) and ``ldd_is_split`` (whether
-        this panel's resolution supports the split editor), and returns the mode
-        to send the device: the chosen mode on a split-capable panel, else 0.
+        READ only.  It used to default 0 to 2 and hand back a mode for the gui to
+        WRITE on open; the default now lives in ``DeviceSettings`` (2, as the C#
+        starts), so 0 here is a user's "off" and is shown as off.  The App's
+        render already ignores split mode on a panel that is not widescreen.
         """
-        self.split_mode = persisted_mode or 2
+        self.split_mode = app_mode
         self.ldd_is_split = lcd_size in SPLIT_MODE_RESOLUTIONS
-        dispatch_mode = self.split_mode if self.ldd_is_split else 0
-        log.info("apply_split_mode: %s persisted=%d size=%dx%d → split_mode=%d "
-                 "ldd_is_split=%s dispatch=%d", self.device_key, persisted_mode,
-                 *lcd_size, self.split_mode, self.ldd_is_split, dispatch_mode)
-        return dispatch_mode
+        log.info("apply_split_mode: %s mode=%d size=%dx%d ldd_is_split=%s",
+                 self.device_key, app_mode, *lcd_size, self.ldd_is_split)
