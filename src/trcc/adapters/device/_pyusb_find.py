@@ -23,11 +23,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from ...core.logs import per_frame
-
 log = logging.getLogger(__name__)
-#: ``find`` runs once per known id on every hotplug poll (macOS, each second).
-frame_log = per_frame(__name__)
 
 try:
     from libusb_package import find as _find  # pyright: ignore[reportMissingImports]
@@ -44,7 +40,7 @@ def find(*args: Any, **kwargs: Any) -> Any:
     where it's installed (Windows, via the bundled DLL) and falls back to
     ``usb.core.find`` everywhere else (Linux/macOS/BSD system libusb).
     """
-    frame_log.debug("find: %s", kwargs)
+    log.debug("find")
     return _find(*args, **kwargs)
 
 
