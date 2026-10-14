@@ -67,6 +67,7 @@ jobs:
           path: dist/*
 
       - name: Publish to PyPI
+        if: github.repository == 'Lexonight1/thermalright-trcc-linux'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           verbose: true
