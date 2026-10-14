@@ -700,11 +700,6 @@
   came back on their own. They now keep running, the way a video theme already
   did, and pause while the panel is away so nothing is captured for a panel
   that is not there. Disconnecting a panel yourself still stops them.
-- **A panel that is slow to come back after the computer wakes is
-  reconnected.** TRCC reconnects every panel when the computer wakes from
-  sleep, but only tried once: if the panel was not ready yet, it stayed dark
-  until TRCC was restarted. It now keeps trying, the same way it does for a
-  panel that lost its connection.
 - **A panel that is not ready yet says why it could not connect.** On Linux a
   panel's device file appears a moment after it is plugged in, and a panel a
   virtual machine holds has none. Connecting to it then failed with an internal

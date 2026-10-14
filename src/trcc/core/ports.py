@@ -470,14 +470,14 @@ class Device(ABC, Generic[T]):
             try:
                 ok = write()
             except Exception as e:
-                if attempt == 0 and not self._quirks.single_session:
+                if attempt == 0 and not self._quirks.keepalive_stream:
                     log.warning(
                         "%s: send attempt 1 failed (%s) — reconnecting and retrying",
                         self.key, e,
                     )
                     self._reconnect()
                     continue
-                if self._quirks.single_session:
+                if self._quirks.keepalive_stream:
                     # Single-session firmware: a close→reopen wedges the panel
                     # until a physical replug (#228), so NEVER reconnect — soft-
                     # fail and let the next keepalive tick resend the frame.
