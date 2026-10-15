@@ -160,11 +160,17 @@ class _LinuxPowerListener:
         self._thread: threading.Thread | None = None
         self._loop: Any = None
         self._bus: EventBus | None = None
+        self._system_bus: Any = None
+        self._signal_match: Any = None
+        self._ready = threading.Event()
 
     def start(self, bus: EventBus) -> None:
         if self._thread is not None:
-            log.debug("_LinuxPowerListener: already running — start() ignored")
-            return
+            if self._thread.is_alive():
+                log.debug("_LinuxPowerListener: already running — start() ignored")
+                return
+            log.warning("logind power listener: thread exited — restarting")
+            self.stop()
         deps = _import_dbus_glib()
         if deps is None:
             log.info(
@@ -185,11 +191,14 @@ class _LinuxPowerListener:
         self._loop = glib.MainLoop()
 
         try:
-            system_bus.add_signal_receiver(
+            # The interface, signal and object path identify logind's event.
+            # Do not additionally pin the well-known sender name: resolving
+            # it to a unique owner at registration can leave a stale match if
+            # that owner changes while this long-lived process is running.
+            signal_match = system_bus.add_signal_receiver(
                 self._on_prepare_for_sleep,
                 signal_name="PrepareForSleep",
                 dbus_interface="org.freedesktop.login1.Manager",
-                bus_name="org.freedesktop.login1",
                 path="/org/freedesktop/login1",
             )
         except Exception as e:
@@ -201,10 +210,39 @@ class _LinuxPowerListener:
             self._bus = None
             return
 
+        # Keep both objects alive until stop(): the callback must remain
+        # subscribed for the whole session, not only while start() is on stack.
+        self._system_bus = system_bus
+        self._signal_match = signal_match
+        self._ready.clear()
+        # This runs only once the GLib context actually dispatches a source.
+        # Starting a Python thread alone does not establish that the D-Bus
+        # connection has a working event loop.
+        try:
+            glib.idle_add(self._ready.set)
+        except Exception:
+            log.exception("logind power listener: could not schedule GLib readiness check")
+            try:
+                signal_match.remove()
+            except Exception:
+                log.exception("logind power listener: removing D-Bus match failed")
+            self._signal_match = None
+            self._system_bus = None
+            self._loop = None
+            self._bus = None
+            return
         self._thread = threading.Thread(
             target=self._run_loop, daemon=True, name="trcc-power",
         )
         self._thread.start()
+        if not self._ready.wait(timeout=2.0):
+            log.warning("logind power listener: GLib mainloop did not start")
+            self.stop()
+            return
+        if not self._thread.is_alive():
+            log.warning("logind power listener: GLib mainloop exited at startup")
+            self.stop()
+            return
         log.info("logind power listener: PrepareForSleep active")
 
     def stop(self) -> None:
@@ -218,18 +256,33 @@ class _LinuxPowerListener:
         except Exception as e:
             log.debug("_LinuxPowerListener: loop.quit raised: %s", e)
         self._thread.join(timeout=2.0)
+        if self._thread.is_alive():
+            log.warning("logind power listener: mainloop did not stop")
+            return
+        if self._signal_match is not None:
+            try:
+                self._signal_match.remove()
+            except Exception:
+                log.exception("logind power listener: removing D-Bus match failed")
+            self._signal_match = None
+        self._system_bus = None
         self._thread = None
         self._loop = None
         self._bus = None
+        self._ready.clear()
 
     def _run_loop(self) -> None:
         try:
             self._loop.run()
         except Exception:
             log.exception("logind power listener: mainloop crashed")
+        else:
+            log.info("logind power listener: mainloop exited")
 
     def _on_prepare_for_sleep(self, sleeping: bool) -> None:
+        log.info("logind: PrepareForSleep received sleeping=%s", sleeping)
         if self._bus is None:
+            log.warning("logind: PrepareForSleep ignored — no event bus")
             return
         if bool(sleeping):
             log.info("logind: system suspending")

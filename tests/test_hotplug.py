@@ -17,12 +17,15 @@ import pytest
 from trcc.adapters.system._hotplug import (
     LinuxHotplugMonitor,
     NoopHotplugMonitor,
+    _LinuxPowerListener,
 )
 from trcc.app import App
 from trcc.core.events import (
     DeviceAttached,
     DeviceDetached,
     EventBus,
+    SystemResumed,
+    SystemSuspending,
 )
 
 from .conftest import FakePlatform
@@ -263,6 +266,80 @@ def test_linux_monitor_skips_when_pyudev_missing(
     monitor.start(EventBus())
 
     assert monitor.is_running is False
+
+
+def test_linux_power_listener_keeps_subscription_and_delivers_both_edges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live GLib loop must deliver both logind signal values to the App bus."""
+    from trcc.adapters.system import _hotplug as hotplug_mod
+
+    stopped = threading.Event()
+    ready: list[Any] = []
+
+    class FakeLoop:
+        def run(self) -> None:
+            ready.pop()()
+            stopped.wait()
+
+        def quit(self) -> None:
+            stopped.set()
+
+    class FakeMatch:
+        removed = False
+
+        def remove(self) -> None:
+            self.removed = True
+
+    class FakeSystemBus:
+        def __init__(self) -> None:
+            self.callback: Any = None
+            self.match = FakeMatch()
+
+        def add_signal_receiver(self, callback: Any, **kwargs: Any) -> FakeMatch:
+            assert kwargs == {
+                "signal_name": "PrepareForSleep",
+                "dbus_interface": "org.freedesktop.login1.Manager",
+                "path": "/org/freedesktop/login1",
+            }
+            self.callback = callback
+            return self.match
+
+    system_bus = FakeSystemBus()
+
+    class FakeDbus:
+        @staticmethod
+        def SystemBus() -> FakeSystemBus:
+            return system_bus
+
+    class FakeGlib:
+        MainLoop = FakeLoop
+
+        @staticmethod
+        def idle_add(callback: Any) -> None:
+            ready.append(callback)
+
+    monkeypatch.setattr(hotplug_mod, "_import_dbus_glib",
+                        lambda: (FakeDbus, FakeGlib))
+    bus = EventBus()
+    events: list[Any] = []
+    bus.subscribe(SystemSuspending, events.append)
+    bus.subscribe(SystemResumed, events.append)
+
+    listener = _LinuxPowerListener()
+    listener.start(bus)
+    try:
+        assert listener._thread is not None and listener._thread.is_alive()
+        assert listener._system_bus is system_bus
+        assert listener._signal_match is system_bus.match
+
+        system_bus.callback(True)
+        system_bus.callback(False)
+        assert [type(event) for event in events] == [SystemSuspending, SystemResumed]
+    finally:
+        listener.stop()
+    assert system_bus.match.removed
+    assert listener._thread is None
 
 
 # ── App reaction to hotplug events (#254, #246) ──────────────────────
