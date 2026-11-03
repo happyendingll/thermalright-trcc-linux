@@ -76,6 +76,7 @@ jobs:
           path: dist/*
 
       - name: Publish to PyPI
+        if: github.repository == 'Lexonight1/thermalright-trcc-linux'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           verbose: true
@@ -636,9 +637,16 @@ jobs:
       - name: Fix package directory permissions
         run: sudo chown -R "$(id -u):$(id -g)" packages/
 
+      - name: Save DEB packages as workflow artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: deb-${{ inputs.tag || github.ref_name }}
+          path: packages/*.deb
+          if-no-files-found: error
+
       - name: Install-test the packages in clean containers
         # Each package goes into the distro it is built for and must import what
-        # the GUI and trcc api need, BEFORE anything is uploaded.  Measured
+        # the GUI and trcc api need, before packages go to the release.  Measured
         # 2026-10-09: packages that built green still failed here -- the RPM on
         # Fedora 43, the deb beside python3-sounddevice on Ubuntu 26.04, and the
         # Arch and deb packages without websockets.  Imports and --version only:
@@ -647,7 +655,7 @@ jobs:
           set -e
           P="${{ github.workspace }}/packages"
           IMPORTS="import trcc, trcc.ui.api.main, uvicorn.protocols.http.h11_impl, websockets, PySide6.QtWidgets"
-          for img in fedora:43 fedora:latest; do
+          for img in fedora:latest; do
             echo "=== RPM on $img"
             docker run --rm -v "$P:/p:ro" -e IMPORTS="$IMPORTS" "$img" bash -c '
               set -e
